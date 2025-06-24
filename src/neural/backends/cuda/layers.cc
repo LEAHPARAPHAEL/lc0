@@ -1468,7 +1468,7 @@ Conv1Layer<DataType>::~Conv1Layer() {
 
 
 
-
+#ifdef USE_CUDNN
 template<typename DataType>
 FusedDWPWLayer<DataType>::FusedDWPWLayer(int C, int H, int W,
                                  int C_in)
@@ -1561,7 +1561,7 @@ FusedDWPWLayer<DataType>::FusedDWPWLayer(int C, int H, int W,
     ReportCUDAErrors(cudaFree(weights2));
     ReportCUDAErrors(cudaFree(biases));
   }
-
+#endif
 
 
 
