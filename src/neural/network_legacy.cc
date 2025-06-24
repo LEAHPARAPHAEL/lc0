@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cmath>
 #include <utility>
+#include <iostream>
 
 #include "utils/exception.h"
 #include "utils/weights_adapter.h"
@@ -32,6 +33,7 @@ static constexpr float kEpsilon = 1e-5f;
 
 BaseWeights::BaseWeights(const pblczero::Weights& weights)
     : input(weights.input()),
+      conv1block(weights.conv1block()),
       ip_emb_preproc_w(LayerAdapter(weights.ip_emb_preproc_w()).as_vector()),
       ip_emb_preproc_b(LayerAdapter(weights.ip_emb_preproc_b()).as_vector()),
       ip_emb_w(LayerAdapter(weights.ip_emb_w()).as_vector()),
@@ -57,6 +59,9 @@ BaseWeights::BaseWeights(const pblczero::Weights& weights)
   for (const auto& res : weights.residual()) {
     residual.emplace_back(res);
   }
+  for (const auto& res : weights.bottleneck()) {
+    bottleneck.emplace_back(res);
+  }
   encoder_head_count = weights.headcount();
   for (const auto& enc : weights.encoder()) {
     encoder.emplace_back(enc);
@@ -74,6 +79,12 @@ BaseWeights::Residual::Residual(const pblczero::Weights::Residual& residual)
       conv2(residual.conv2()),
       se(residual.se()),
       has_se(residual.has_se()) {}
+
+BaseWeights::Bottleneck::Bottleneck(const pblczero::Weights::Bottleneck& bottleneck)
+    : conv1(bottleneck.conv1()),
+      d_conv(bottleneck.d_conv()),
+      conv2(bottleneck.conv2()),
+      se(bottleneck.se()) {}
 
 BaseWeights::ConvBlock::ConvBlock(const pblczero::Weights::ConvBlock& block)
     : weights(LayerAdapter(block.weights()).as_vector()),
@@ -131,6 +142,154 @@ BaseWeights::ConvBlock::ConvBlock(const pblczero::Weights::ConvBlock& block)
   bn_betas.clear();
   bn_gammas.clear();
 }
+
+
+
+
+BaseWeights::DepthwiseConvBlock::DepthwiseConvBlock(
+  const pblczero::Weights::DepthwiseConvBlock& block)
+    : weights(LayerAdapter(block.weights()).as_vector()),
+      biases(LayerAdapter(block.biases()).as_vector()),
+      bn_gammas(LayerAdapter(block.bn_gammas()).as_vector()),
+      bn_betas(LayerAdapter(block.bn_betas()).as_vector()),
+      bn_means(LayerAdapter(block.bn_means()).as_vector()),
+      bn_stddivs(LayerAdapter(block.bn_stddivs()).as_vector()) {
+
+  if (weights.size() == 0) {
+    // Empty ConvBlock.
+    return;
+  }
+
+
+
+  if (weights.size() == 0) return;
+
+  if (bn_betas.size() == 0) {
+    for (size_t i = 0; i < bn_means.size(); i++) {
+      bn_betas.emplace_back(0.0f);
+      bn_gammas.emplace_back(1.0f);
+    }
+  }
+  if (biases.size() == 0) {
+    for (size_t i = 0; i < bn_means.size(); i++) {
+      biases.emplace_back(0.0f);
+    }
+  }
+
+  if (bn_means.size() == 0) {
+    return;  // No BN
+  }
+
+  for (auto i = size_t{0}; i < bn_stddivs.size(); i++) {
+    bn_gammas[i] *= 1.0f / std::sqrt(bn_stddivs[i] + kEpsilon);
+    bn_means[i] -= biases[i];
+  }
+
+  auto channels = biases.size(); 
+
+  auto kernel_size_per_channel = weights.size() / channels;
+
+  //std::cout << "Kernel size" << kernel_size_per_channel << std::endl;
+
+  for (auto c = size_t{0}; c < channels; c++) {
+    //if (c == 0 || c == 270 || c == 570) {
+    //  std::cout << "Beginning to load weights--------------------" <<std::endl;
+    //}
+    for (auto k = size_t{0}; k < kernel_size_per_channel; k++) {
+      weights[c * kernel_size_per_channel + k] *= bn_gammas[c];
+      //if (c == 0 || c == 270 || c == 570) {
+      //  std::cout << weights[c * kernel_size_per_channel + k] << "|";
+      //}
+    }
+    //if (c == 0 || c == 270 || c == 570) {
+    //  std::cout << std::endl;
+
+    biases[c] = -bn_gammas[c] * bn_means[c] + bn_betas[c];
+    
+  }
+
+  // Batch norm weights are not needed anymore.
+  bn_stddivs.clear();
+  bn_means.clear();
+  bn_betas.clear();
+  bn_gammas.clear();
+}
+
+
+
+
+BaseWeights::Conv1Block::Conv1Block(const pblczero::Weights::Conv1Block& block)
+    : weights(LayerAdapter(block.weights()).as_vector()),
+      biases(LayerAdapter(block.biases()).as_vector()),
+      bn_gammas(LayerAdapter(block.bn_gammas()).as_vector()),
+      bn_betas(LayerAdapter(block.bn_betas()).as_vector()),
+      bn_means(LayerAdapter(block.bn_means()).as_vector()),
+      bn_stddivs(LayerAdapter(block.bn_stddivs()).as_vector()) {
+  if (weights.size() == 0) {
+    // Empty ConvBlock.
+    return;
+  }
+
+  /*
+  std::cout << "bn_betas " << bn_betas.size() << std::endl;
+  std::cout << "bn_gammas " << bn_gammas.size() << std::endl;
+  std::cout << "bn_stddivs " << bn_stddivs.size() << std::endl;
+  std::cout << "bn_means " << bn_means.size() << std::endl;
+  std::cout << "biases " << biases.size() << std::endl;
+  */
+
+  if (bn_betas.size() == 0) {
+    // Old net without gamma and beta.
+    for (auto i = size_t{0}; i < bn_means.size(); i++) {
+      bn_betas.emplace_back(0.0f);
+      bn_gammas.emplace_back(1.0f);
+    }
+  }
+  if (biases.size() == 0) {
+    for (auto i = size_t{0}; i < bn_means.size(); i++) {
+      biases.emplace_back(0.0f);
+    }
+  }
+
+  if (bn_means.size() == 0) {
+    // No batch norm.
+    return;
+  }
+
+  // Fold batch norm into weights and biases.
+  // Variance to gamma.
+  for (auto i = size_t{0}; i < bn_stddivs.size(); i++) {
+    bn_gammas[i] *= 1.0f / std::sqrt(bn_stddivs[i] + kEpsilon);
+    bn_means[i] -= biases[i];
+  }
+
+  auto outputs = biases.size();
+
+  // We can treat the [inputs, filter_size, filter_size] dimensions as one.
+  auto inputs = weights.size() / outputs;
+
+  for (auto o = size_t{0}; o < outputs; o++) {
+    for (auto c = size_t{0}; c < inputs; c++) {
+      weights[o * inputs + c] *= bn_gammas[o];
+    }
+
+    biases[o] = -bn_gammas[o] * bn_means[o] + bn_betas[o];
+  }
+
+  // Batch norm weights are not needed anymore.
+  bn_stddivs.clear();
+  bn_means.clear();
+  bn_betas.clear();
+  bn_gammas.clear();
+}
+
+
+
+
+
+
+
+
 
 BaseWeights::MHA::MHA(const pblczero::Weights::MHA& mha)
     : q_w(LayerAdapter(mha.q_w()).as_vector()),

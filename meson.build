@@ -66,6 +66,14 @@ has_backends = false
 # Third party files.
 includes += include_directories('third_party', is_system: true)
 
+
+# protobuf_inc = include_directories('C:\Program Files (x86)\protobuf\include')
+# protobuf_lib = cc.find_library('protobuf', dirs : ['C:\Program Files (x86)\protobuf\lib'])
+
+# includes += [protobuf_inc]
+# deps += [protobuf_lib]
+
+
 # Compiling protobufs.
 compile_proto = find_program('scripts/compile_proto.py')
 gen = generator(compile_proto, output: ['@BASENAME@.pb.h'],
@@ -491,6 +499,13 @@ if get_option('build_backends')
   nvcc = find_program('nvcc', '/usr/local/cuda/bin/nvcc', '/opt/cuda/bin/nvcc',
                       required: false)
 
+  message('cudnn option: ' + get_option('cudnn').to_string())
+  message('plain_cuda option: ' + get_option('plain_cuda').to_string())
+  message('cu_blas found: ' + cu_blas.found().to_string())
+  message('cu_dart found: ' + cu_dart.found().to_string())
+  message('nvcc found: ' + nvcc.found().to_string())
+
+
   if (get_option('cudnn') or get_option('plain_cuda')) and cu_blas.found() and cu_dart.found() and nvcc.found()
     deps += [cu_blas, cu_dart]
     cuda_files = ['src/neural/backends/cuda/layers.cc']
@@ -531,7 +546,7 @@ if get_option('build_backends')
     cuda_cc = get_option('cc_cuda') # Unfortunately option cuda_cc is reserved.
     nvcc_extra_args = []
     if cuda_cc != ''
-      nvcc_extra_args = ['-arch=compute_' + cuda_cc, '-code=sm_' + cuda_cc]
+      nvcc_extra_args = ['-arch=compute_' + cuda_cc, '-code=sm_' + cuda_cc, '--fmad=false']
     elif get_option('native_cuda') and nvcc_help.contains('-arch=native')
       nvcc_extra_args = ['-arch=native']
     elif nvcc_help.contains('-arch=all-major')

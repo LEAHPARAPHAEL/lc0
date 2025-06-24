@@ -127,6 +127,89 @@ class ConvLayer : public BaseLayer<DataType> {
   void init();
 };
 
+
+template <typename DataType>
+class FusedDWPWLayer : public BaseLayer<DataType> {
+  using BaseLayer<DataType>::C;
+  using BaseLayer<DataType>::H;
+  using BaseLayer<DataType>::W;
+  using BaseLayer<DataType>::GetC;
+  using BaseLayer<DataType>::GetH;
+  using BaseLayer<DataType>::GetW;
+  using BaseLayer<DataType>::nhwc_;
+
+ public:
+  FusedDWPWLayer(int C, int H, int W, int C_in);
+
+  ~FusedDWPWLayer();
+
+  void LoadWeights(float* pfilter1, float* pBias1, float* pfilter2, void* scratch);
+  void Eval(int N, DataType* output, const DataType* input,
+            const DataType* input2, void* scratch, size_t scratch_size,
+            cudnnHandle_t cudnn, cublasHandle_t cublas, cudaStream_t stream,
+            DataType*** = nullptr) override;
+
+ private:
+  const int c_input_;
+
+  //DataType* biases = nullptr;
+  //DataType* weights1 = nullptr;
+  //DataType* weights2 = nullptr;
+  half2* biases = nullptr;
+  half2* weights1 = nullptr;
+  half2* weights2 = nullptr;
+
+
+  void init();
+};
+
+
+
+template <typename DataType>
+class DepthwiseConvLayer : public BaseLayer<DataType> {
+  using BaseLayer<DataType>::C;
+  using BaseLayer<DataType>::H;
+  using BaseLayer<DataType>::W;
+  using BaseLayer<DataType>::GetC;
+  using BaseLayer<DataType>::GetH;
+  using BaseLayer<DataType>::GetW;
+  using BaseLayer<DataType>::nhwc_;
+
+ public:
+  DepthwiseConvLayer(BaseLayer<DataType>* ip, int C, int H, int W, int size,
+            ActivationFunction activation = ACTIVATION_NONE, bool bias = false);
+
+  DepthwiseConvLayer(bool nhwc, int C, int H, int W, int size,
+            ActivationFunction activation = ACTIVATION_NONE, bool bias = false);
+
+  ~DepthwiseConvLayer();
+  void LoadWeights(float* pfilter, float* pBias, void* scratch);
+  void Eval(int N, DataType* output, const DataType* input,
+            const DataType* input2, void* scratch, size_t scratch_size,
+            cudnnHandle_t cudnn, cublasHandle_t cublas, cudaStream_t stream,
+            DataType*** = nullptr) override;
+
+ private:
+  const int c_input_;
+  const int filter_size_;
+  const ActivationFunction act_;
+  const bool use_bias_;
+
+  DataType* biases = nullptr;
+  DataType* weights = nullptr;
+
+  cudnnFilterDescriptor_t filter_desc_;
+  cudnnConvolutionDescriptor_t conv_desc_;
+  cudnnConvolutionFwdAlgo_t conv_algo_;
+
+  cudnnTensorDescriptor_t bias_desc_;
+  cudnnTensorDescriptor_t in_tensor_desc_;
+  cudnnTensorDescriptor_t out_tensor_desc_;
+  cudnnActivationDescriptor_t activation_;
+
+  void init();
+};
+
 #endif
 
 template <typename DataType>
@@ -332,6 +415,7 @@ class ResidualBlock : public BaseLayer<DataType> {
   DataType* b1_;
   DataType* b2_;
 };
+
 
 template <typename DataType>
 class EncoderBlock {

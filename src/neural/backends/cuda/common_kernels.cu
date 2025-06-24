@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <iostream>
 
 #include "cuda_common.h"
 #include "neural/tables/activation_function.h"
@@ -331,10 +332,17 @@ __global__ void addBias_NCHW_kernel(T* c, T* a, T* b, int N, int C, int H,
 template <typename T>
 void addBias_NCHW(T* c, T* a, T* b, int N, int C, int H, int W,
                   ActivationFunction activation, cudaStream_t stream) {
+
+  //std::cout << "N " << N <<std::endl;
+  //std::cout << "C " << C <<std::endl;
+  //std::cout << "H " << H <<std::endl;
+  //std::cout << "W " << W <<std::endl;
+
   int size = N * C * H * W;
+  //std::cout << "Size " << size <<std::endl;
   const int kBlockSize = 256;
   int blocks = DivUp(size, kBlockSize);
-
+  //std::cout << "blocks " << blocks <<std::endl;
   addBias_NCHW_kernel<<<blocks, kBlockSize, 0, stream>>>(c, a, b, N, C, H, W,
                                                          activation);
   ReportCUDAErrors(cudaGetLastError());
@@ -405,6 +413,45 @@ void copyTypeConverted(DstType* op, SrcType* ip, int N, cudaStream_t stream) {
   int blocks = DivUp(N, kBlockSize);
   copyTypeConverted_kernel<<<blocks, kBlockSize, 0, stream>>>(op, ip, N);
 }
+
+
+template <typename DstType, typename SrcType>
+__global__ void copyTypeConvertedMask_kernel(DstType* op, SrcType* ip, int N, int C_in) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= N) return;
+  int pos = tid % 25;
+  int channel = tid / 25;
+
+  DstType el;
+  if (channel < C_in / 3 && pos != 2 && pos != 7 && pos != 10 && pos != 11 
+    && pos != 12 && pos != 13 && pos != 14 && pos != 17 && pos != 22){
+      el = (DstType)0;
+  }
+  else if (channel < 2 * C_in / 3 && channel >= C_in / 3 && pos != 0 && pos != 4 && pos != 6 && pos != 8 
+    && pos != 12 && pos != 16 && pos != 18 && pos != 20 && pos != 24){
+      el = (DstType)0;
+  }
+  else if (channel >= 2 * C_in / 3 && pos != 1 && pos != 3 && pos != 5 && pos != 9 
+    && pos != 12 && pos != 15 && pos != 19 && pos != 21 && pos != 23){
+      el = (DstType)0;
+  }
+
+  else {
+    el = (DstType)ip[tid];
+  }
+  op[tid] = el;
+}
+
+template <typename DstType, typename SrcType>
+void copyTypeConvertedMask(DstType* op, SrcType* ip, int N, int C_in, cudaStream_t stream) {
+  const int kBlockSize = 256;
+  int blocks = DivUp(N, kBlockSize);
+  copyTypeConvertedMask_kernel<<<blocks, kBlockSize, 0, stream>>>(op, ip, N, C_in);
+}
+
+
+
+
 
 template <typename T>
 __global__ void batchNorm_kernel(T* output, const T* input, const T* skipInput,
@@ -1318,6 +1365,17 @@ template void copyTypeConverted<float, float>(float* op, float* ip, int N,
                                               cudaStream_t stream);
 template void copyTypeConverted<half, half>(half* op, half* ip, int N,
                                             cudaStream_t stream);
+
+template void copyTypeConvertedMask<half, float>(half* op, float* ip, int N, int C_in,
+                                             cudaStream_t stream);
+template void copyTypeConvertedMask<float, half>(float* op, half* ip, int N, int C_in,
+                                             cudaStream_t stream);
+template void copyTypeConvertedMask<float, float>(float* op, float* ip, int N, int C_in,
+                                              cudaStream_t stream);
+template void copyTypeConvertedMask<half, half>(half* op, half* ip, int N, int C_in,
+                                            cudaStream_t stream);
+                                           
+
 
 template void batchNorm<float>(float* output, const float* input,
                                const float* skipInput, int N, int C, int H,

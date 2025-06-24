@@ -24,15 +24,46 @@
   terms of the respective license agreement, the licensors of this
   Program grant you additional permission to convey the resulting work.
 */
+#include <iostream>
+#include <stdio.h>
+#include <cuda_fp16.h>
+
 
 #include "cuda_common.h"
 #include "neural/tables/activation_function.h"
 
+
+
 // Allow building on an old architecture.
 #if __CUDA_ARCH__ < 530
+#pragma message("Architecture < 530")
 #define SKIP_FP16_BITS 1
 #endif
 #include "winograd_helper.inc"
+
+
+#define N_THREADS 384
+
+
+#define TILE_W 4
+#define TILE_H 4
+
+
+#define THREAD_H 1
+#define THREAD_W 1
+#define PARALLEL_H 4
+#define PARALLEL_W 4
+#define PARALLEL_D 24
+
+/*
+#define THREAD_H 1
+#define THREAD_W 1
+#define PARALLEL_H 4
+#define PARALLEL_W 4
+#define PARALLEL_D 24
+*/
+
+
 
 namespace lczero {
 namespace cudnn_backend {
@@ -40,6 +71,968 @@ namespace cudnn_backend {
 /////////////////////////////////////////////////////////////////////////////
 //          fp16-specific kernels used by certain layers                   //
 /////////////////////////////////////////////////////////////////////////////
+
+
+
+
+/*
+Weights layout for chess masks (from top to bottom, then left to right): 
+     [w0, w1, w2, w3, w4, w5, w6, w7, w8]
+
+- Rook :
+     [ 0, 0,w0, 0, 0,
+       0, 0,w1, 0, 0,
+      w2,w3,w4,w5,w6,
+       0, 0,w7, 0, 0,
+       0, 0,w8, 0, 0]
+- Bishop :
+     [w0, 0, 0, 0,w1,
+       0,w2, 0,w3, 0,
+       0, 0,w4, 0, 0,
+       0,w5, 0,w6, 0,
+      w7, 0, 0, 0,w8]
+- Knight :
+     [ 0,w0, 0,w1, 0,
+      w2, 0, 0, 0, w3,
+       0, 0,w4, 0, 0,
+      w5, 0, 0, 0, w6,
+       0,w7, 0,w8, 0]
+*/
+
+inline __device__ float get_input_at(const half* ip, const int index_h,
+    const int index_w, const int global_index) {
+      if (index_h >= 0 && index_h < 8 && index_w >= 0
+          && index_w < 8) {
+        return __half2float(__ldg(&ip[global_index]));
+      }
+      return 0.0f;
+  }
+
+inline __device__ half2 get_input_half2_at(const half2* ip, const int index_h,
+    const int index_w, const int global_index) {
+      if (index_h >= 0 && index_h < 8 && index_w >= 0
+          && index_w < 8) {
+        return __ldg(&ip[global_index]);
+      }
+      return make_half2(0.0f, 0.0f);
+  }
+
+
+__device__ inline float2 fma_half2(half2 a, half2 b, float2 acc) {
+    acc.x = __fmaf_rn(__half2float(__low2half(a)),
+                    __half2float(__low2half(b)),
+                    acc.x);
+    acc.y = __fmaf_rn(__half2float(__high2half(a)),
+                    __half2float(__high2half(b)),
+                    acc.y);
+    return acc;
+}
+
+__device__ inline float2 operator+(float2 a, float2 b) {
+    return make_float2(a.x + b.x, a.y + b.y);
+}
+
+
+__device__ inline float2 operator*(float2 a, float2 b) {
+    return make_float2(a.x * b.x, a.y * b.y);
+}
+
+
+  __global__ void convert_float_to_half2_kernel(const float* __restrict__ input,
+                                              half2* __restrict__ output,
+                                              int C, int H, int W) {
+    // Total number of half2 elements is (C / 2) * H * W
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_half2 = (C / 2) * H * W;
+
+    if (tid >= total_half2) return;
+
+    // Compute (c2, h, w) from flat index
+    int w = tid % W;
+    int h = (tid / W) % H;
+    int c2 = (tid / (H * W)); // c2 = c / 2
+
+    int c0 = c2 * 2;
+    int c1 = c0 + 1;
+
+    // Flat indices in (C, H, W) format
+    int offset0 = (c0 * H + h) * W + w;
+    int offset1 = (c1 * H + h) * W + w;
+
+    // Load, convert, and pack
+    float f0 = input[offset0];
+    float f1 = input[offset1];
+
+    half2 packed;
+    packed.x = __float2half(f0);
+    packed.y = __float2half(f1);
+
+    output[tid] = packed;
+}
+
+void convert_float_to_half2(const float* input, half2* output, int C, int H, int W) {
+
+  int num_half2 = (C / 2) * H * W;
+  int threads = 256;
+  int blocks = (num_half2 + threads - 1) / threads;
+
+  convert_float_to_half2_kernel<<<blocks, threads>>>(input, output, C, H, W);
+}
+
+
+__global__ void convert_half_to_half2_kernel_nchw(const half* __restrict__ input,
+                                                  half2* __restrict__ output,
+                                                  int N, int C, int H, int W) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_half2 = N * (C / 2) * H * W;
+    if (tid >= total_half2) return;
+
+    // Decompose flat index
+    int w = tid % W;
+    int h = (tid / W) % H;
+    int c2 = (tid / (H * W)) % (C / 2);
+    int n = tid / ((C / 2) * H * W);
+
+    int c0 = c2 * 2;
+    int c1 = c0 + 1;
+
+    // Compute flat indices in NCHW format
+    int offset0 = ((n * C + c0) * H + h) * W + w;
+    int offset1 = ((n * C + c1) * H + h) * W + w;
+
+    // Load and pack
+    half2 packed;
+    packed.x = input[offset0];
+    packed.y = input[offset1];
+
+    output[tid] = packed;
+}
+
+void convert_half_to_half2_nchw(const half* input, half2* output,
+                                int N, int C, int H, int W) {
+    int total_half2 = N * (C / 2) * H * W;
+    int threads = 256;
+    int blocks = (total_half2 + threads - 1) / threads;
+
+    convert_half_to_half2_kernel_nchw<<<blocks, threads>>>(input, output, N, C, H, W);
+}
+
+
+__global__ void FusedDWPWKernelRow(int C_in, int C, half* output, const half* input,
+                              const half* w1, const half* b1, const half* w2, int dw_thread_d, int pw_thread_d) {
+    extern __shared__ half intermediate_output[];
+
+    const int thread_w = threadIdx.x;
+    const int thread_h = threadIdx.y;
+    const int thread_d = threadIdx.z;
+
+    const int block_n = blockIdx.x;
+    const int block_w = blockIdx.y;
+    const int block_h = blockIdx.z;
+
+    // Column number of the beginning of the thread
+    const int abs_w = block_w * TILE_W + thread_w * THREAD_W;
+
+    // Channel number of the beginning of the thread
+    const int abs_d = dw_thread_d * thread_d;
+
+    // Row number of the beginning of the thread
+    const int abs_h = block_h * TILE_H + thread_h * THREAD_H;
+
+    // Specificaly for this configuration : must be generalized later
+    int warp_offset = thread_d % 2 == 0 ? 0 : 16;
+
+    if (abs_w < 8) {
+        float dweight0, dweight1, dweight2, dweight3, dweight4,
+              dweight5, dweight6, dweight7, dweight8, dbias;
+        for (int c = 0; c < dw_thread_d ; c++){
+
+            const int current_d = abs_d + c;
+            // Shared memory is in (C,H,W) layout. 
+            // This computes the number of indices in all channels before this one
+            // Plus the column offset
+            // What remains is the offset linked to the row, which is done in the inner loop 
+            const int offset_d_w = current_d * TILE_H * TILE_W + thread_w;
+            float my_weight;
+
+            if (thread_h < 3 && thread_w < 3){
+                my_weight = __half2float(w1[current_d * 9 + thread_h * 3 + thread_w]);
+            }
+            if (thread_h == 3 && thread_w == 3){
+                my_weight = __half2float(b1[current_d]);
+            }
+            unsigned active_threads_mask = __activemask();
+
+
+            dweight0 = __shfl_sync(active_threads_mask, my_weight, warp_offset);
+            dweight1 = __shfl_sync(active_threads_mask, my_weight, warp_offset + 1);
+            dweight2 = __shfl_sync(active_threads_mask, my_weight, warp_offset + 2 );
+            dweight3 = __shfl_sync(active_threads_mask, my_weight, warp_offset + PARALLEL_W );
+            dweight4 = __shfl_sync(active_threads_mask, my_weight, warp_offset + PARALLEL_W + 1);
+            dweight5 = __shfl_sync(active_threads_mask, my_weight, warp_offset + PARALLEL_W + 2);
+            dweight6 = __shfl_sync(active_threads_mask, my_weight, warp_offset + 2 * PARALLEL_W );
+            dweight7 = __shfl_sync(active_threads_mask, my_weight, warp_offset + 2 * PARALLEL_W  + 1);
+            dweight8 = __shfl_sync(active_threads_mask, my_weight, warp_offset + 2 * PARALLEL_W + 2);
+
+            dbias = __shfl_sync(active_threads_mask, my_weight, warp_offset + 3 * PARALLEL_W + 3);
+            
+
+            const int offset_d = (block_n * C_in + current_d)* 8 * 8;
+            // Threads can span multiple channels and rows, but only one column
+            // This is why we only loop on the channels and the rows
+            for (int h = 0; h < THREAD_H; h ++) {
+                // Row in this tile
+                const int row_in_tile = (thread_h * THREAD_H + h);
+
+                // Row offset for shared memory
+                const int offset_h = row_in_tile * TILE_W;
+
+                // Row in the 8 x 8 input of the channel : substract 2 for top padding
+                const int abs_h_input = block_h * TILE_H + row_in_tile - 2;
+
+                // Column in the 8 x 8 input of the channel : substract 2 for left padding
+                const int abs_w_input = block_w * TILE_W + thread_w * THREAD_W - 2;
+
+                const int index_input = offset_d + abs_h_input * 8 + abs_w_input;
+
+                // Accumulator
+                float sum;
+                
+                // Rook filter
+                if (current_d < (C_in / 3)) {
+                    sum = dweight0 * get_input_at(input, abs_h_input, abs_w_input + 2, index_input + 2) +
+                          dweight1 * get_input_at(input, abs_h_input + 1, abs_w_input + 2, index_input + 10) +
+                          dweight2 * get_input_at(input, abs_h_input + 2, abs_w_input, index_input + 16) +
+                          dweight3 * get_input_at(input, abs_h_input + 2 , abs_w_input + 1, index_input + 17) +
+                          dweight4 * get_input_at(input, abs_h_input + 2, abs_w_input + 2, index_input + 18) +
+                          dweight5 * get_input_at(input, abs_h_input + 2, abs_w_input + 3, index_input + 19) +
+                          dweight6 * get_input_at(input, abs_h_input + 2, abs_w_input + 4, index_input + 20) +
+                          dweight7 * get_input_at(input, abs_h_input + 3, abs_w_input + 2, index_input + 26) + 
+                          dweight8 * get_input_at(input, abs_h_input + 4, abs_w_input + 2, index_input + 34) +
+                          dbias;
+                }
+
+                // Bishop filter
+                else if (current_d < (2 * C_in / 3)) {
+                    sum = dweight0 * get_input_at(input, abs_h_input, abs_w_input, index_input) +
+                          dweight1 * get_input_at(input, abs_h_input, abs_w_input + 4, index_input + 4) +
+                          dweight2 * get_input_at(input, abs_h_input + 1, abs_w_input + 1, index_input + 9) +
+                          dweight3 * get_input_at(input, abs_h_input + 1 , abs_w_input + 3, index_input + 12) +
+                          dweight4 * get_input_at(input, abs_h_input + 2, abs_w_input + 2, index_input + 18) +
+                          dweight5 * get_input_at(input, abs_h_input + 3, abs_w_input + 1, index_input + 25) +
+                          dweight6 * get_input_at(input, abs_h_input + 3, abs_w_input + 3, index_input + 27) +
+                          dweight7 * get_input_at(input, abs_h_input + 4, abs_w_input, index_input + 32) + 
+                          dweight8 * get_input_at(input, abs_h_input + 4, abs_w_input + 4, index_input + 36)+ 
+                          dbias;
+                }
+
+                // Knight filter
+                else {
+                    sum = dweight0 * get_input_at(input, abs_h_input, abs_w_input + 1, index_input + 1) +
+                          dweight1 * get_input_at(input, abs_h_input, abs_w_input + 3, index_input + 3) +
+                          dweight2 * get_input_at(input, abs_h_input + 1, abs_w_input, index_input + 8) +
+                          dweight3 * get_input_at(input, abs_h_input + 1 , abs_w_input + 4, index_input + 12) +
+                          dweight4 * get_input_at(input, abs_h_input + 2, abs_w_input + 2, index_input + 18) +
+                          dweight5 * get_input_at(input, abs_h_input + 3, abs_w_input, index_input + 24) +
+                          dweight6 * get_input_at(input, abs_h_input + 3, abs_w_input + 4, index_input + 28) +
+                          dweight7 * get_input_at(input, abs_h_input + 4, abs_w_input + 1, index_input + 33) + 
+                          dweight8 * get_input_at(input, abs_h_input + 4, abs_w_input + 3, index_input + 35) + 
+                          dbias; 
+                }
+
+                //ReLU !!
+                if (sum < 0.0f){
+                    sum = 0.0f;
+                }
+
+                if (block_n == 0 && block_h == 1 && block_w == 1 && (offset_d_w + offset_h == 16 * 141 + 15)){
+                  printf("Depthwise convolution result at position (0, 140-141, 7, 7): %f\n", sum);
+                }
+                if (block_n == 0 && block_h == 0 && block_w == 0 && (offset_d_w + offset_h == 16 * 560 + 3)){
+                  printf("Depthwise convolution result at position (0, 560, 0, 3): %f\n", sum);
+                }
+
+                intermediate_output[offset_d_w + offset_h] = __float2half(sum);
+            }
+            
+        }
+
+
+    }
+
+
+    __syncthreads();
+
+    int pw_abs_d = thread_d * pw_thread_d;
+
+    for (int c_out = 0; c_out < pw_thread_d; c_out++) {
+
+        const int current_d = pw_abs_d + c_out;
+
+        const int offset_d = (block_n * C + current_d) * 8 * 8 + current_d * 8 * 8;
+
+        for (int h = 0; h < THREAD_H; h++){
+
+          const int output_index = offset_d + (abs_h + h) * 8 + abs_w;
+                                        
+          float sum = 0.0f;
+
+          int offset_h_w = (thread_h * THREAD_H + h) * TILE_W + thread_w;
+
+          for (int c_in = 0; c_in < C_in; c_in++) {
+
+            float pointwise_weight = __half2float(w2[current_d * C_in + c_in]);
+
+            float input_val = __half2float(intermediate_output[c_in * TILE_H * TILE_W + offset_h_w]);
+
+            sum += input_val * pointwise_weight;
+
+          }
+
+          output[output_index] = __float2half(sum); 
+          
+          if (block_n == 0 && block_h == 0 && block_w == 0 && output_index == 66 * 64 + 25){
+              printf("Pointwise convolution result at position (0, 66, 3, 1): %f\n", sum);
+          }
+          if (block_n == 0 && block_h == 0 && block_w == 0 && output_index == 24 * 64 + 25){
+              printf("Pointwise convolution result at positions converted (0, 24, 3, 1): %f\n", sum);
+          }
+           
+        }
+    }
+}
+
+
+
+
+__global__ void FusedDWPWKernelFullHalf2(int C_in, int C, half* output, const half2* input,
+                              const half2* w1, const half2* b1, const half2* w2, int dw_thread_d, int pw_thread_d) {
+#if __CUDA_ARCH__ >= 800   
+    extern __shared__ half2 intermediate[];
+
+    const int thread_w = threadIdx.x;
+    const int thread_h = threadIdx.y;
+    const int thread_d = threadIdx.z;
+
+    const int block_n = blockIdx.x;
+    const int block_w = blockIdx.y;
+    const int block_h = blockIdx.z;
+
+    // Column number of the beginning of the thread
+    const int abs_w = block_w * TILE_W + thread_w * THREAD_W;
+
+    // Channel number of the beginning of the thread
+    const int abs_d = dw_thread_d * thread_d;
+
+    // Row number of the beginning of the thread
+    const int abs_h = block_h * TILE_H + thread_h * THREAD_H;
+
+    // Specificaly for this configuration : must be generalized later
+    // 16 threads before cycling to the same spatial position
+    int warp_offset = thread_d % 2 == 0 ? 0 : 16;
+
+    if (abs_w < 8) {
+        half2 dweight0, dweight1, dweight2, dweight3, dweight4,
+              dweight5, dweight6, dweight7, dweight8, dbias;
+        for (int c = 0; c < dw_thread_d ; c+=2){
+
+            const int current_d = abs_d + c;
+            // Shared memory is in (C,H,W) layout. 
+            // This computes the number of indices in all channels before this one
+            // Plus the column offset
+            // What remains is the offset linked to the row, which is done in the inner loop 
+            const int offset_d_w = current_d / 2 * TILE_H * TILE_W + thread_w;
+            
+            half2 my_weight;
+
+            if (thread_h < 3 && thread_w < 3){
+                my_weight = __ldg(&w1[current_d / 2 * 9 + thread_h * 3 + thread_w]);
+            }
+            if (thread_h == 0 && thread_w == 3){
+                my_weight = __ldg(&b1[current_d / 2]);
+            }
+
+            unsigned active_threads_mask = __activemask();
+
+
+            dweight0 = __shfl_sync(active_threads_mask, my_weight, warp_offset);
+            dweight1 = __shfl_sync(active_threads_mask, my_weight, warp_offset + 1);
+            dweight2 = __shfl_sync(active_threads_mask, my_weight, warp_offset + 2 );
+            dweight3 = __shfl_sync(active_threads_mask, my_weight, warp_offset + PARALLEL_W );
+            dweight4 = __shfl_sync(active_threads_mask, my_weight, warp_offset + PARALLEL_W + 1);
+            dweight5 = __shfl_sync(active_threads_mask, my_weight, warp_offset + PARALLEL_W + 2);
+            dweight6 = __shfl_sync(active_threads_mask, my_weight, warp_offset + 2 * PARALLEL_W );
+            dweight7 = __shfl_sync(active_threads_mask, my_weight, warp_offset + 2 * PARALLEL_W  + 1);
+            dweight8 = __shfl_sync(active_threads_mask, my_weight, warp_offset + 2 * PARALLEL_W + 2);
+
+            dbias = __shfl_sync(active_threads_mask, my_weight, warp_offset + 3);
+            
+
+            const int offset_d = (block_n * C_in + current_d) / 2 * 8 * 8;
+
+            for (int h = 0; h < THREAD_H; h++) {
+                // Row in this tile
+                const int row_in_tile = (thread_h * THREAD_H + h);
+
+                // Row offset for shared memory
+                const int offset_h = row_in_tile * TILE_W;
+
+                // Row in the 8 x 8 input of the channel : substract 2 for top padding
+                const int abs_h_input = block_h * TILE_H + row_in_tile - 2;
+
+                // Column in the 8 x 8 input of the channel : substract 2 for left padding
+                const int abs_w_input = block_w * TILE_W + thread_w * THREAD_W - 2;
+
+                const int index_input = offset_d + abs_h_input * 8 + abs_w_input;
+
+                // Accumulator
+                half2 sum = __float2half2_rn(0.0f);
+
+                // Rook filter
+                if (current_d < (C_in / 3)) {
+                    /*
+                    sum = sum + __half22float2(__hmul2(dweight0, get_input_half2_at(input, abs_h_input, abs_w_input + 2, index_input + 2)));
+                    sum = sum + __half22float2(__hmul2(dweight1, get_input_half2_at(input, abs_h_input + 1, abs_w_input + 2, index_input + 10)));
+                    sum = sum + __half22float2(__hmul2(dweight2, get_input_half2_at(input, abs_h_input + 2, abs_w_input, index_input + 16)));
+                    sum = sum + __half22float2(__hmul2(dweight3, get_input_half2_at(input, abs_h_input + 2 , abs_w_input + 1, index_input + 17)));
+                    sum = sum + __half22float2(__hmul2(dweight4, get_input_half2_at(input, abs_h_input + 2, abs_w_input + 2, index_input + 18)));
+                    sum = sum + __half22float2(__hmul2(dweight5, get_input_half2_at(input, abs_h_input + 2, abs_w_input + 3, index_input + 19)));
+                    sum = sum + __half22float2(__hmul2(dweight6, get_input_half2_at(input, abs_h_input + 2, abs_w_input + 4, index_input + 20)));
+                    sum = sum + __half22float2(__hmul2(dweight7, get_input_half2_at(input, abs_h_input + 3, abs_w_input + 2, index_input + 26)));
+                    sum = sum + __half22float2(__hmul2(dweight8, get_input_half2_at(input, abs_h_input + 4, abs_w_input + 2, index_input + 34)));
+                    */
+
+                    sum = __hfma2(dweight0, get_input_half2_at(input, abs_h_input, abs_w_input + 2, index_input + 2), sum);
+                    sum = __hfma2(dweight1, get_input_half2_at(input, abs_h_input + 1, abs_w_input + 2, index_input + 10), sum);
+                    sum = __hfma2(dweight2, get_input_half2_at(input, abs_h_input + 2, abs_w_input, index_input + 16), sum);
+                    sum = __hfma2(dweight3, get_input_half2_at(input, abs_h_input + 2 , abs_w_input + 1, index_input + 17), sum);
+                    sum = __hfma2(dweight4, get_input_half2_at(input, abs_h_input + 2, abs_w_input + 2, index_input + 18), sum);
+                    sum = __hfma2(dweight5, get_input_half2_at(input, abs_h_input + 2, abs_w_input + 3, index_input + 19), sum);
+                    sum = __hfma2(dweight6, get_input_half2_at(input, abs_h_input + 2, abs_w_input + 4, index_input + 20), sum);
+                    sum = __hfma2(dweight7, get_input_half2_at(input, abs_h_input + 3, abs_w_input + 2, index_input + 26), sum);
+                    sum = __hfma2(dweight8, get_input_half2_at(input, abs_h_input + 4, abs_w_input + 2, index_input + 34), sum);
+                    
+
+                }
+
+                // Bishop filter
+                else if (current_d < (2 * C_in / 3)) {
+                  /*
+                    sum = sum + __half22float2(__hmul2(dweight0, get_input_half2_at(input, abs_h_input, abs_w_input, index_input)));
+                    sum = sum + __half22float2(__hmul2(dweight1, get_input_half2_at(input, abs_h_input, abs_w_input + 4, index_input + 4)));
+                    sum = sum + __half22float2(__hmul2(dweight2, get_input_half2_at(input, abs_h_input + 1, abs_w_input + 1, index_input + 9)));
+                    sum = sum + __half22float2(__hmul2(dweight3, get_input_half2_at(input, abs_h_input + 1 , abs_w_input + 3, index_input + 12)));
+                    sum = sum + __half22float2(__hmul2(dweight4, get_input_half2_at(input, abs_h_input + 2, abs_w_input + 2, index_input + 18)));
+                    sum = sum + __half22float2(__hmul2(dweight5, get_input_half2_at(input, abs_h_input + 3, abs_w_input + 1, index_input + 25)));
+                    sum = sum + __half22float2(__hmul2(dweight6, get_input_half2_at(input, abs_h_input + 3, abs_w_input + 3, index_input + 27)));
+                    sum = sum + __half22float2(__hmul2(dweight7, get_input_half2_at(input, abs_h_input + 4, abs_w_input, index_input + 32)));
+                    sum = sum + __half22float2(__hmul2(dweight8, get_input_half2_at(input, abs_h_input + 4, abs_w_input + 4, index_input + 36)));
+                  */
+                    sum = __hfma2(dweight0, get_input_half2_at(input, abs_h_input, abs_w_input, index_input), sum);
+                    sum = __hfma2(dweight1, get_input_half2_at(input, abs_h_input, abs_w_input + 4, index_input + 4), sum);
+                    sum = __hfma2(dweight2, get_input_half2_at(input, abs_h_input + 1, abs_w_input + 1, index_input + 9), sum);
+                    sum = __hfma2(dweight3, get_input_half2_at(input, abs_h_input + 1 , abs_w_input + 3, index_input + 12), sum);
+                    sum = __hfma2(dweight4, get_input_half2_at(input, abs_h_input + 2, abs_w_input + 2, index_input + 18), sum);
+                    sum = __hfma2(dweight5, get_input_half2_at(input, abs_h_input + 3, abs_w_input + 1, index_input + 25), sum);
+                    sum = __hfma2(dweight6, get_input_half2_at(input, abs_h_input + 3, abs_w_input + 3, index_input + 27), sum);
+                    sum = __hfma2(dweight7, get_input_half2_at(input, abs_h_input + 4, abs_w_input, index_input + 32), sum);
+                    sum = __hfma2(dweight8, get_input_half2_at(input, abs_h_input + 4, abs_w_input + 4, index_input + 36), sum);
+                }
+
+                // Knight filter
+                else {
+                  /*
+                    sum = sum + __half22float2(__hmul2(dweight0, get_input_half2_at(input, abs_h_input, abs_w_input + 1, index_input + 1)));
+                    sum = sum + __half22float2(__hmul2(dweight1, get_input_half2_at(input, abs_h_input, abs_w_input + 3, index_input + 3)));
+                    sum = sum + __half22float2(__hmul2(dweight2, get_input_half2_at(input, abs_h_input + 1, abs_w_input, index_input + 8)));
+                    sum = sum + __half22float2(__hmul2(dweight3, get_input_half2_at(input, abs_h_input + 1 , abs_w_input + 4, index_input + 12)));
+                    sum = sum + __half22float2(__hmul2(dweight4, get_input_half2_at(input, abs_h_input + 2, abs_w_input + 2, index_input + 18)));
+                    sum = sum + __half22float2(__hmul2(dweight5, get_input_half2_at(input, abs_h_input + 3, abs_w_input, index_input + 24)));
+                    sum = sum + __half22float2(__hmul2(dweight6, get_input_half2_at(input, abs_h_input + 3, abs_w_input + 4, index_input + 28)));
+                    sum = sum + __half22float2(__hmul2(dweight7, get_input_half2_at(input, abs_h_input + 4, abs_w_input + 1, index_input + 33)));
+                    sum = sum + __half22float2(__hmul2(dweight8, get_input_half2_at(input, abs_h_input + 4, abs_w_input + 3, index_input + 35)));
+                  */
+                    sum = __hfma2(dweight0, get_input_half2_at(input, abs_h_input, abs_w_input + 1, index_input + 1), sum);
+                    sum = __hfma2(dweight1, get_input_half2_at(input, abs_h_input, abs_w_input + 3, index_input + 3), sum);
+                    sum = __hfma2(dweight2, get_input_half2_at(input, abs_h_input + 1, abs_w_input, index_input + 8), sum);
+                    sum = __hfma2(dweight3, get_input_half2_at(input, abs_h_input + 1 , abs_w_input + 4, index_input + 12), sum);
+                    sum = __hfma2(dweight4, get_input_half2_at(input, abs_h_input + 2, abs_w_input + 2, index_input + 18), sum);
+                    sum = __hfma2(dweight5, get_input_half2_at(input, abs_h_input + 3, abs_w_input, index_input + 24), sum);
+                    sum = __hfma2(dweight6, get_input_half2_at(input, abs_h_input + 3, abs_w_input + 4, index_input + 28), sum);
+                    sum = __hfma2(dweight7, get_input_half2_at(input, abs_h_input + 4, abs_w_input + 1, index_input + 33), sum);
+                    sum = __hfma2(dweight8, get_input_half2_at(input, abs_h_input + 4, abs_w_input + 3, index_input + 35), sum);
+                }
+                
+                /*
+                sum = sum + __half22float2(dbias);
+                sum.x = fmaxf(sum.x, 0.0f); 
+                sum.y = fmaxf(sum.y, 0.0f);
+
+                intermediate[offset_d_w + offset_h] = __float22half2_rn(sum);
+                                
+                sum = __half22float2(__float22half2_rn(sum));
+          
+              
+                */
+               /*
+                if (block_n == 0 && block_h == 0 && block_w == 0 && (offset_d_w + offset_h == 16 * 3 + 13)){
+                  printf("thread_h : %d, thread_w : %d, thread_d : %d \n", thread_h, thread_w, thread_d);
+                  printf("[%f,%f],\n", __half2float(dweight0.y), __half2float(get_input_half2_at(input, abs_h_input, abs_w_input + 2, index_input + 2).y));
+                  printf("[%f,%f],\n", __half2float(dweight1.y), __half2float(get_input_half2_at(input, abs_h_input + 1, abs_w_input + 2, index_input + 10).y));
+                  printf("[%f,%f],\n", __half2float(dweight3.y), __half2float(get_input_half2_at(input, abs_h_input + 2 , abs_w_input + 1, index_input + 17).y));
+                  printf("[%f,%f],\n", __half2float(dweight4.y), __half2float(get_input_half2_at(input, abs_h_input + 2, abs_w_input + 2, index_input + 18).y));
+                  printf("[%f,%f],\n", __half2float(dweight5.y), __half2float(get_input_half2_at(input, abs_h_input + 2, abs_w_input + 3, index_input + 19).y));
+                  printf("[%f,%f],\n", __half2float(dweight6.y), __half2float(get_input_half2_at(input, abs_h_input + 2, abs_w_input + 4, index_input + 20).y));
+                  printf("[%f,%f],\n", __half2float(dweight7.y), __half2float(get_input_half2_at(input, abs_h_input + 3, abs_w_input + 2, index_input + 26).y));
+                  printf("[%f,%f],\n", __half2float(dweight8.y), __half2float(get_input_half2_at(input, abs_h_input + 4, abs_w_input + 2, index_input + 34).y));
+                  printf("Bias : %f \n", __half2float(dbias.y));
+              }
+              */
+                  
+
+                  sum = __hadd2(sum, dbias);
+                  sum = __hmax2(sum, __float2half2_rn(0.0f));
+                  intermediate[offset_d_w + offset_h] = sum;
+
+
+                
+                
+            }
+            
+        }
+
+      }
+
+    __syncthreads();
+
+    int pw_abs_d = thread_d * pw_thread_d;
+
+    for (int c_out = 0; c_out < pw_thread_d; c_out++) {
+
+        const int current_d = pw_abs_d + c_out;
+
+        const int offset_d = block_n * C * 8 * 8 + current_d * 8 * 8;
+
+        for (int h = 0; h < THREAD_H; h++){
+
+          const int output_index = offset_d + (abs_h + h) * 8 + abs_w;
+               
+          
+          float sum = 0.0f;
+          //half sum = __float2half_rn(0.0f);
+
+          int offset_h_w = (thread_h * THREAD_H + h) * TILE_W + thread_w;
+
+          for (int c_in = 0; c_in < C_in / 2; c_in++) {
+
+            half2 pointwise_weight = __ldg(&w2[current_d * C_in / 2 + c_in]);
+
+            half2 input_val = intermediate[c_in * TILE_H * TILE_W + offset_h_w];
+
+            /*
+            if (block_n == 0 && block_h == 0 && block_w == 0 && output_index == 66 * 64 + 25) {
+              printf("[%f,%f],\n", __half2float(pointwise_weight.x), __half2float(input_val.x));
+              printf("[%f,%f],\n", __half2float(pointwise_weight.y), __half2float(input_val.y));
+            }
+            */
+            
+
+            float2 result = __half22float2(__hmul2(pointwise_weight, input_val));
+
+
+            sum += result.x;
+            sum += result.y;
+
+            //sum = __hfma(pointwise_weight.x, input_val.x, sum);
+            //sum = __hfma(pointwise_weight.y, input_val.y, sum);
+            //sum = __hadd(__hmul(pointwise_weight.x, input_val.x), sum);
+            //sum = __hadd(__hmul(pointwise_weight.y, input_val.y), sum);
+            //sum = sum + (__half22float2(pointwise_weight) * __half22float2(input_val));
+
+            //sum = __fmaf_rn(__half2float(pointwise_weight.x), __half2float(input_val.x), sum);
+            //sum = __fmaf_rn(__half2float(pointwise_weight.y), __half2float(input_val.y), sum);
+
+          }
+
+          output[output_index] = __float2half_rn(sum);
+          //output[output_index] = sum;
+
+          
+          if (output_index == 138 * 64 + 36 || output_index == 139 * 64 + 36 
+            || output_index == 534 * 64 + 36 || output_index == 535 * 64 + 36){
+              printf("%f\n", __half2float(__float2half_rn(sum)));
+          }
+          
+         /*
+          if (block_n == 0 && block_h == 0 && block_w == 0 && output_index == 66 * 64 + 25){
+              printf("Pointwise convolution result at positions converted (0, 66, 3, 1): %f\n", __half2float(sum));
+          }
+        */
+          
+          
+          /*
+          if (block_n == 0 && block_h == 0 && block_w == 0 && output_index == 66 * 64 + 25){
+              printf("Pointwise convolution result at positions converted (0, 66, 3, 1): %f\n", __half2float(sum));
+          }
+          if (block_n == 0 && block_h == 0 && block_w == 0 && output_index == 24 * 64 + 25){
+              printf("Pointwise convolution result at positions converted (0, 24, 3, 1): %f\n", __half2float(sum));
+          }
+          */
+           
+        }
+    }
+#endif
+}
+
+
+
+
+
+
+
+void FusedDWPWeval(int N, int C_in, int C, half* output, const half* input,
+                              const half* w1, const half* b1, const half* w2, cudaStream_t stream) {
+
+    int dw_thread_d = C_in / PARALLEL_D;
+    int pw_thread_d = C / PARALLEL_D;
+
+
+    dim3 threads(PARALLEL_W, PARALLEL_H, PARALLEL_D);
+
+    dim3 blocks(N, 8 / TILE_W, 8 / TILE_H);
+
+    //FusedDWPWKernelRowCol<<<blocks, threads, C_in * TILE_W * TILE_H * sizeof(half), stream>>>(C_in, C, output, input, w1,
+    //                   b1, w2, dw_thread_d, pw_thread_d);
+
+    FusedDWPWKernelRow<<<blocks, threads, C_in * TILE_W * TILE_H * sizeof(half), stream>>>(C_in, C, output, input, w1,
+                       b1, w2, dw_thread_d, pw_thread_d);
+
+    cudaDeviceSynchronize();
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+    std::cerr << "Kernel launch failed: " << cudaGetErrorString(err) << "\n";
+    }
+
+    std::exit(0);
+    
+
+}
+
+void FusedDWPWevalHalf2(int N, int C_in, int C, half* output, const half* input, void* scratch,
+                              const half2* w1, const half2* b1, const half2* w2, cudaStream_t stream) {
+
+    int dw_thread_d = C_in / PARALLEL_D;
+    int pw_thread_d = C / PARALLEL_D;
+
+
+    dim3 threads(PARALLEL_W, PARALLEL_H, PARALLEL_D);
+
+    dim3 blocks(N, 8 / TILE_W, 8 / TILE_H);
+
+    convert_half_to_half2_nchw(input, (half2*)scratch,
+                         N, C_in, 8, 8); 
+    FusedDWPWKernelFullHalf2<<<blocks, threads, C_in / 2 * TILE_W * TILE_H * sizeof(half2), stream>>>(C_in, C, output, (half2*)scratch, w1,
+                     b1, w2, dw_thread_d, pw_thread_d);
+
+
+    cudaDeviceSynchronize();
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+    std::cerr << "Kernel launch failed: " << cudaGetErrorString(err) << "\n";
+    }
+
+    std::exit(0);
+    
+
+}
+
+
+
+
+__global__ void pack_weights_float_to_half2(
+    const float* __restrict__ input,  
+    half2* __restrict__ output,       
+    int C_out, int C_in)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = C_out * (C_in / 2);
+
+    if (idx < total) {
+        int oc = idx / (C_in / 2);     
+        int ic_pair = idx % (C_in / 2); 
+
+        int in_idx0 = oc * C_in + 2 * ic_pair;
+        int in_idx1 = in_idx0 + 1;
+
+        float f0 = input[in_idx0];
+        float f1 = input[in_idx1];
+
+        half2 h2 = __halves2half2(__float2half(f0), __float2half(f1));
+        output[idx] = h2;
+    }
+}
+
+void pack_pointwise_weights(float* input, half2* output, const int C_in, const int C_out){
+
+  int total_elements = C_out * (C_in / 2);
+  int threads_per_block = 256;
+  int blocks = (total_elements + threads_per_block - 1) / threads_per_block;
+
+  pack_weights_float_to_half2<<<blocks, threads_per_block>>>(
+      input, output, C_out, C_in);
+
+}
+
+
+
+
+/*
+__global__ void FusedDWPWKernelRowCol(int C_in, int C, half* output, const half* input,
+                              const half* w1, const half* b1, const half* w2, int dw_thread_d, int pw_thread_d) {
+    extern __shared__ half intermediate_output[];
+
+    const int thread_w = threadIdx.x;
+    const int thread_h = threadIdx.y;
+    const int thread_d = threadIdx.z;
+
+    const int block_n = blockIdx.x;
+    const int block_w = blockIdx.y;
+    const int block_h = blockIdx.z;
+
+    // Column number of the beginning of the thread
+    const int abs_w = block_w * TILE_W + thread_w * THREAD_W;
+
+    // Channel number of the beginning of the thread
+    const int abs_d = dw_thread_d * thread_d;
+
+    // Row number of the beginning of the thread
+    const int abs_h = block_h * TILE_H + thread_h * THREAD_H;
+
+    if (abs_w < 8) {
+        float dweight0, dweight1, dweight2, dweight3, dweight4,
+              dweight5, dweight6, dweight7, dweight8, dbias;
+        for (int c = 0; c < dw_thread_d ; c++){
+
+            const int current_d = abs_d + c;
+            // Shared memory is in (C,H,W) layout. 
+            // This computes the number of indices in all channels before this one
+            // Plus the column offset
+            // What remains is the offset linked to the row, which is done in the inner loop 
+            const int offset_d = current_d * TILE_H * TILE_W;
+            
+            dweight0 = __half2float(w1[current_d * 9]);
+            dweight1 = __half2float(w1[current_d * 9 + 1]);
+            dweight2 = __half2float(w1[current_d * 9 + 2]);
+            dweight3 = __half2float(w1[current_d * 9 + 3]);
+            dweight4 = __half2float(w1[current_d * 9 + 4]);
+            dweight5 = __half2float(w1[current_d * 9 + 5]);
+            dweight6 = __half2float(w1[current_d * 9 + 6]);
+            dweight7 = __half2float(w1[current_d * 9 + 7]);
+            dweight8 = __half2float(w1[current_d * 9 + 8]);
+
+            dbias = __half2float(b1[current_d]);
+
+            const int index_input_d = (block_n * C_in + current_d) * 8 * 8;
+
+            for (int h = 0; h < THREAD_H; h++) {
+                // Row in this tile
+                const int row_in_tile = thread_h * THREAD_H + h;
+
+                // Row offset for shared memory
+                const int offset_h = row_in_tile * TILE_W;
+
+                // Row in the 8 x 8 input of the channel : substract 2 for top padding
+                const int abs_h_input = block_h * TILE_H + row_in_tile - 2;
+
+                const int index_input_dh = index_input_d + abs_h_input * 8;
+
+                for (int w = 0; w < THREAD_W; w++) {
+
+                    const int col_in_tile = thread_w * THREAD_W + w;
+
+                    // Column in the 8 x 8 input of the channel : substract 2 for left padding
+                    const int abs_w_input = block_w * TILE_W + col_in_tile - 2;
+
+                    const int index_input = index_input_dh + abs_w_input;
+
+                    // Accumulator
+                    float sum;
+                    
+                    // Rook filter
+                    if (current_d < (C_in / 3)) {
+                        sum = dweight0 * get_input_at(input, abs_h_input, abs_w_input + 2, index_input + 2) +
+                              dweight1 * get_input_at(input, abs_h_input + 1, abs_w_input + 2, index_input + 10) +
+                              dweight2 * get_input_at(input, abs_h_input + 2, abs_w_input, index_input + 16) +
+                              dweight3 * get_input_at(input, abs_h_input + 2 , abs_w_input + 1, index_input + 17) +
+                              dweight4 * get_input_at(input, abs_h_input + 2, abs_w_input + 2, index_input + 18) +
+                              dweight5 * get_input_at(input, abs_h_input + 2, abs_w_input + 3, index_input + 19) +
+                              dweight6 * get_input_at(input, abs_h_input + 2, abs_w_input + 4, index_input + 20) +
+                              dweight7 * get_input_at(input, abs_h_input + 3, abs_w_input + 2, index_input + 26) + 
+                              dweight8 * get_input_at(input, abs_h_input + 4, abs_w_input + 2, index_input + 34) +
+                              dbias; 
+                    }
+
+                    // Bishop filter
+                    else if (current_d < (2 * C_in / 3)) {
+                        sum = dweight0 * get_input_at(input, abs_h_input, abs_w_input, index_input) +
+                              dweight1 * get_input_at(input, abs_h_input, abs_w_input + 4, index_input + 4) +
+                              dweight2 * get_input_at(input, abs_h_input + 1, abs_w_input + 1, index_input + 9) +
+                              dweight3 * get_input_at(input, abs_h_input + 1 , abs_w_input + 3, index_input + 12) +
+                              dweight4 * get_input_at(input, abs_h_input + 2, abs_w_input + 2, index_input + 18) +
+                              dweight5 * get_input_at(input, abs_h_input + 3, abs_w_input + 1, index_input + 25) +
+                              dweight6 * get_input_at(input, abs_h_input + 3, abs_w_input + 3, index_input + 27) +
+                              dweight7 * get_input_at(input, abs_h_input + 4, abs_w_input, index_input + 32) + 
+                              dweight8 * get_input_at(input, abs_h_input + 4, abs_w_input + 4, index_input + 36)+ 
+                              dbias; 
+                    }
+
+                    // Knight filter
+                    else {
+                        sum = dweight0 * get_input_at(input, abs_h_input, abs_w_input + 1, index_input + 1) +
+                              dweight1 * get_input_at(input, abs_h_input, abs_w_input + 3, index_input + 3) +
+                              dweight2 * get_input_at(input, abs_h_input + 1, abs_w_input, index_input + 8) +
+                              dweight3 * get_input_at(input, abs_h_input + 1 , abs_w_input + 4, index_input + 12) +
+                              dweight4 * get_input_at(input, abs_h_input + 2, abs_w_input + 2, index_input + 18) +
+                              dweight5 * get_input_at(input, abs_h_input + 3, abs_w_input, index_input + 24) +
+                              dweight6 * get_input_at(input, abs_h_input + 3, abs_w_input + 4, index_input + 28) +
+                              dweight7 * get_input_at(input, abs_h_input + 4, abs_w_input + 1, index_input + 33) + 
+                              dweight8 * get_input_at(input, abs_h_input + 4, abs_w_input + 3, index_input + 35) + 
+                              dbias;  
+                    }
+
+                    //ReLU !!
+                    if (sum < 0){
+                        sum = 0.0f;
+                    }
+
+                    intermediate_output[offset_d + offset_h + col_in_tile] = __float2half(sum);
+                }
+
+            }
+            
+        }
+
+
+    }
+
+
+    __syncthreads();
+
+    int pw_abs_d = thread_d * pw_thread_d;
+
+    for (int c_out = 0; c_out < pw_thread_d; c_out++) {
+
+        const int current_d = pw_abs_d + c_out;
+
+        const int output_index_d = (block_n * C + current_d) * 8 * 8; 
+
+        if (current_d < C) {
+
+            for (int h = 0; h < THREAD_H; h++){
+
+              if (abs_h + h < 8) {
+
+                const int output_index_dh = output_index_d + (abs_h + h) * 8;
+
+                int offset_h = (thread_h * THREAD_H + h) * TILE_W;
+
+                for (int w = 0; w < THREAD_W; w++) {
+
+                  if (abs_w + w < 8) {
+
+                    const int output_index = output_index_dh + abs_w + w; 
+
+                    int offset_w = thread_w * THREAD_W + w;
+
+                    float sum = 0;
+
+                    for (int c_in = 0; c_in < C_in; c_in++) {
+
+                        float pointwise_weight = __half2float(w2[current_d * C_in + c_in]);
+
+                        float input_val = __half2float(intermediate_output[c_in * TILE_H * TILE_W + offset_h + offset_w]);
+
+                        sum += input_val * pointwise_weight;
+
+                    }
+
+                    output[output_index] = __float2half(sum);
+                  }
+  
+                }
+
+
+              }
+               
+            }
+           
+        }
+    }
+}
+*/
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 // SE layer implementation using single fused kernel.
 
@@ -196,6 +1189,12 @@ bool Se_Fp16_NHWC(int N, int C, int numFc1Out, half* output, const half* skip,
       // TODO: support other channel counts.
       return false;
     }
+  } else if (numFc1Out == 48) {
+      if (C == 96) {
+        SE_Layer_NHWC<96,48>
+              <<<N, C>>>(output, skip, input, w1, b1, w2, b2, bPrev, activation);
+      }
+
   } else {
     // TODO: support other sizes.
     return false;

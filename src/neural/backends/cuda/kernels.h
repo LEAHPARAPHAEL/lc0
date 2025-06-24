@@ -157,5 +157,23 @@ void inputPreprocessForAttentionBody(T* output, const T* input,
 template <typename T>
 void applyInputGating(T* output, const T* input, const T* mult, const T* add,
                       int N, int HW, int C, cudaStream_t stream);
+
+void FusedDWPWeval(int N, int C_in, int C, half* output, const half* input,
+                              const half* w1, const half* b1, const half* w2, cudaStream_t stream);
+
+void convert_float_to_half2(const float* input, half2* output, int C, int H, int W);
+
+void FusedDWPWevalHalf2(int N, int C_in, int C, half* output, const half* input, void* scratch,
+                              const half2* w1, const half2* b1, const half2* w2, cudaStream_t stream);
+
+void convert_half_to_half2_nchw(const half* input, half2* output,
+                                int N, int C, int H, int W);
+
+void pack_pointwise_weights(float* input, half2* output, const int C_in, const int C_out);
+
+
+template <typename DstType, typename SrcType>
+void copyTypeConvertedMask(DstType* op, SrcType* ip, int N, int C_in, cudaStream_t stream);
+                    
 }  // namespace cudnn_backend
 }  // namespace lczero

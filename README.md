@@ -1,6 +1,10 @@
 [![CircleCI](https://circleci.com/gh/LeelaChessZero/lc0.svg?style=shield)](https://circleci.com/gh/LeelaChessZero/lc0)
 [![AppVeyor](https://ci.appveyor.com/api/projects/status/3245b83otdee7oj7?svg=true)](https://ci.appveyor.com/project/leelachesszero/lc0)
 
+# Proto
+protoc --proto_path=libs\lczero-common\proto --cpp_out=src\proto libs\lczero-common\proto\net.proto
+protoc --proto_path=libs\lczero-common\proto --cpp_out=src\proto libs\lczero-common\proto\chunk.proto
+
 # Lc0
 
 Lc0 is a UCI-compliant chess engine designed to play chess via neural network, specifically those of the [LeelaChessZero project](https://lczero.org).

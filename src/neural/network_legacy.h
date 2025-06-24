@@ -40,6 +40,28 @@ struct BaseWeights {
     Vec bn_stddivs;
   };
 
+  struct Conv1Block {
+    explicit Conv1Block(const pblczero::Weights::Conv1Block& block);
+
+    Vec weights;
+    Vec biases;
+    Vec bn_gammas;
+    Vec bn_betas;
+    Vec bn_means;
+    Vec bn_stddivs;
+  };
+
+  struct DepthwiseConvBlock{
+    explicit DepthwiseConvBlock(const pblczero::Weights::DepthwiseConvBlock& block);
+
+    Vec weights;
+    Vec biases;
+    Vec bn_gammas;
+    Vec bn_betas;
+    Vec bn_means;
+    Vec bn_stddivs;  
+  };
+
   struct SEunit {
     explicit SEunit(const pblczero::Weights::SEunit& se);
     Vec w1;
@@ -54,6 +76,22 @@ struct BaseWeights {
     ConvBlock conv2;
     SEunit se;
     bool has_se;
+  };
+
+  struct BatchNormalization {
+    explicit BatchNormalization(const pblczero::Weights::BatchNormalization& batchNormalization);
+    Vec bn_means;
+    Vec bn_stddivs;
+    Vec bn_gammas;
+    Vec bn_betas;
+  };
+
+  struct Bottleneck {
+    explicit Bottleneck(const pblczero::Weights::Bottleneck& bottleneck);
+    Conv1Block conv1;
+    DepthwiseConvBlock d_conv;
+    Conv1Block conv2;
+    SEunit se;
   };
 
   struct Smolgen {
@@ -104,6 +142,8 @@ struct BaseWeights {
   // Input convnet.
   ConvBlock input;
 
+  Conv1Block conv1block;
+
   // Embedding preprocess layer.
   Vec ip_emb_preproc_w;
   Vec ip_emb_preproc_b;
@@ -132,6 +172,10 @@ struct BaseWeights {
 
   // Residual tower.
   std::vector<Residual> residual;
+
+  // Bottleneck tower
+  std::vector<Bottleneck> bottleneck;
+
 
   // Moves left head
   ConvBlock moves_left;
