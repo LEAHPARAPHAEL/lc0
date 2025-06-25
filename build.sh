@@ -22,7 +22,7 @@ MESON=${MESON:?"Could not find meson. Is it installed and in PATH?"}
 
 if [ -f "${BUILDDIR}/build.ninja" ]
 then
-  "${MESON}" configure "${BUILDDIR}" -Dbuildtype="${BUILDTYPE}" -Dprefix="${INSTALL_PREFIX:-/usr/local}" "$@"
+  "${MESON}" configure "${BUILDDIR}" -Dbuildtype="${BUILDTYPE}" -Dprefix="${INSTALL_PREFIX:-/usr/local}" -Dcudnn=true "$@"
 else
   "${MESON}" "${BUILDDIR}" --buildtype "${BUILDTYPE}" --prefix "${INSTALL_PREFIX:-/usr/local}" "$@"
 fi
