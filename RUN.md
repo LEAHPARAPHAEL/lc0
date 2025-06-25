@@ -8,7 +8,7 @@ lc0.exe --weights=C:\Users\RAPHAL~1\Leela\Networks\FormatDWPW\mobile_net_brk-96x
 
 
 # mobile net 96x6 !
-lc0.exe --weights=C:\Users\RAPHAL~1\Leela\Networks\mobile_net-96x6\mobile_net-96x6-1000.pb.gz -o fuse_DWPW=false
+lc0.exe --weights=C:\Users\RAPHAL~1\Leela\Networks\mobile_net-96x6\mobile_net-96x6-100000.pb.gz -o fuse_DWPW=false
 
 # mobile net 96x18 !
 lc0.exe --weights=C:\Users\RAPHAL~1\Leela\Networks\mobile_net-96x18\mobile_net-96x18-1000.pb.gz -o fuse_DWPW=false

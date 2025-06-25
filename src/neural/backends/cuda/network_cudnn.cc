@@ -172,7 +172,7 @@ class CudnnNetwork : public Network {
 
     max_batch_size_ = options.GetOrDefault<int>("max_batch", 512);
 
-    fuse_DWPW_ = options.GetOrDefault<bool>("fuse_DWPW", true);
+    fuse_DWPW_ = options.GetOrDefault<bool>("fuse_DWPW", false);
     // min_batch_size_ is chosen as 4 as it is common that for sizes less than
     // 4 that there is no performance gain, but there is variance in the
     // outputs, which means that there is extra non-determinism in some
@@ -1018,11 +1018,9 @@ class CudnnNetwork : public Network {
           /*
           std::vector<DataType> weights_host2(c_expand_ * 64 * max_batch_size_);
           cudaMemcpy(weights_host2.data(), tensor_mem_[1], c_expand_ * 64 * max_batch_size_ * sizeof(DataType), cudaMemcpyDeviceToHost);
-          std::cout << "Pointwise convolution result at position (0, 138, 4, 4): " << weights_host2[138 * 64 + 36] << std::endl;
-          std::cout << "Pointwise convolution result at position (0, 139, 4, 4): " << weights_host2[139 * 64 + 36] << std::endl;
-          std::cout << "Pointwise convolution result at position (0, 534, 4, 4): " << weights_host2[534 * 64 + 36] << std::endl;
-          std::cout << "Pointwise convolution result at position (0, 535, 4, 4): " << weights_host2[535 * 64 + 36] << std::endl;
-          
+          for (int output = 3000; output < 3025; output++){
+            std::cout << "Output" << output << " : " << weights_host2[output] << std::endl;
+          }
 
           std::exit(0);
           */
