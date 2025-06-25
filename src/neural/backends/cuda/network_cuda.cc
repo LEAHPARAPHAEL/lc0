@@ -30,6 +30,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <iostream>
 
 #include "cuda_common.h"
 #include "inputs_outputs.h"
@@ -209,6 +210,8 @@ class CudaNetwork : public Network {
       throw Exception("Max batch must not be less than min_batch setting.");
 
     showInfo();
+
+    std::cout << "Not the right network constructor !" << std::endl;
 
     int total_gpus;
     ReportCUDAErrors(cudaGetDeviceCount(&total_gpus));

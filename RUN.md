@@ -35,7 +35,7 @@ lc0.exe --weights=C:\Users\RAPHAL~1\Leela\Networks\residual-3x3-96x18\residual_b
 lc0.exe --weights=C:\Users\RAPHAL~1\Leela\Networks\residual-3x3-192x6\residual_block-3x3-192x6-1000.pb.gz 
 
 # residual 5x5 96x6 !
-lc0.exe --weights=C:\Users\RAPHAL~1\Leela\Networks\residual-5x5-96x6\residual_block-5x5-96x6-1000.pb.gz 
+lc0.exe --weights=C:\Users\RAPHAL~1\Leela\Networks\residual-5x5-96x6\residual_block-5x5-96x6-100000.pb.gz 
 
 # residual 5x5 96x18 ! 
 lc0.exe --weights=C:\Users\RAPHAL~1\Leela\Networks\residual-5x5-96x18\residual_block-5x5-96x18-1000.pb.gz 

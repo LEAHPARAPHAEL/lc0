@@ -184,6 +184,8 @@ class CudnnNetwork : public Network {
 
     showInfo();
 
+    std::cout << "Cudnn network" << std::endl;
+
     int total_gpus;
     ReportCUDAErrors(cudaGetDeviceCount(&total_gpus));
 
