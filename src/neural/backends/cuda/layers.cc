@@ -486,10 +486,10 @@ void DepthwiseConvLayer<half>::LoadWeights(float* pfilter, float* pBias, void* s
                       filter_size_, filter_size_);
   } else {
     //std::cout << "Not NHWC" <<std::endl;
-    copyTypeConverted((half*)weights, (float*)scratch,
-                      C * filter_size_ * filter_size_, 0);
-    //copyTypeConvertedMask((half*)weights, (float*)scratch,
-    //                  C * filter_size_ * filter_size_, C, 0);
+    //copyTypeConverted((half*)weights, (float*)scratch,
+    //                  C * filter_size_ * filter_size_, 0);
+    copyTypeConvertedMask((half*)weights, (float*)scratch,
+                     C * filter_size_ * filter_size_, C, 0);
   }
 
   /*
@@ -498,12 +498,13 @@ void DepthwiseConvLayer<half>::LoadWeights(float* pfilter, float* pBias, void* s
   cudaMemcpy(weights_host.data(), weights, weights_host_size, cudaMemcpyDeviceToHost);
   std::cout<<"Printing weights" <<std::endl;
   for (int i = 0; i < 25; i++){
-    std::cout<< weights_host[7 * 25 + i] << "|";
+    std::cout<< weights_host[81 * 25 + i] << "|";
     if ((i+1)%5 == 0){
       std::cout<<std::endl;
     }
   }
   */
+  
   
   
   
@@ -1377,18 +1378,20 @@ void Conv1Layer<DataType>::LoadWeights(float* pfilter, float* pBias,
     copyTypeConverted((DataType*)biases_, (float*)scratch, C, 0);
   }
 
+  
   /*
   else {
       std::vector<DataType> weights_host(C * c_input_);
       size_t weights_host_size = C * c_input_ * sizeof(DataType);
       cudaMemcpy(weights_host.data(), weights_, weights_host_size, cudaMemcpyDeviceToHost);
       std::cout<<"Printing weights" <<std::endl;
-      std::cout<< weights_host[66 * c_input_ + 72] << "|";
-      std::cout<< weights_host[66 * c_input_ + 73] << std::endl;
-      std::cout<< weights_host[67 * c_input_ + 72] << "|";
-      std::cout<< weights_host[67 * c_input_ + 73] << std::endl;
+      for (int i = 0; i < 12; i ++){
+        std::cout<< weights_host[56 * c_input_ + i] << std::endl;
+      }
   }
   */
+  
+  
 
 }
 template <>
@@ -1475,7 +1478,7 @@ FusedDWPWLayer<DataType>::FusedDWPWLayer(int C, int H, int W,
     : BaseLayer<DataType>(C, H, W, nullptr, false, false),
       c_input_(C_in) {
   // Allocate memory for weights (filter tensor) and biases.
-  const size_t weight1_size = sizeof(half) * c_input_ * 9;
+  const size_t weight1_size = sizeof(half) * c_input_ * 10;
   ReportCUDAErrors(cudaMalloc(&weights1, weight1_size));
 
   const size_t weight2_size = sizeof(half) * c_input_ * C;
@@ -1490,14 +1493,14 @@ FusedDWPWLayer<DataType>::FusedDWPWLayer(int C, int H, int W,
   void FusedDWPWLayer<DataType>::LoadWeights(float* pfilter1, float* pBias, float* pfilter2,
                                        void* scratch) {
 
-    const size_t weight1_size = sizeof(float) * c_input_ * 9;
+    const size_t weight1_size = sizeof(float) * c_input_ * 10;
     const size_t bias_size = sizeof(float) * c_input_;
     const size_t weight2_size = sizeof(float) * c_input_ * C;
     assert(scratch);
     ReportCUDAErrors(
         cudaMemcpy(scratch, pfilter1, weight1_size, cudaMemcpyHostToDevice));
         //copyTypeConverted((half*)weights1, (float*)scratch, c_input_ * 9, 0);
-        convert_float_to_half2((float*)scratch, (half2*)weights1, c_input_, 9, 1);
+        convert_float_to_half2((float*)scratch, (half2*)weights1, c_input_, 10, 1);
 
     /*
     std::vector<half2> weights_host(c_input_ / 2 * 10);

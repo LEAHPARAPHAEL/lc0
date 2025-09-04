@@ -203,8 +203,8 @@ class CudnnNetwork : public Network {
     ReportCUBLASErrors(cublasCreate(&cublas_));
 
     // Default layout is nchw.
-    nhwc_ = true;
-    bool hasTensorCores = true;
+    nhwc_ = false;
+    bool hasTensorCores = false;
     constexpr bool fp16 = std::is_same<half, DataType>::value;
 
     if (fp16) {
@@ -687,12 +687,22 @@ class CudnnNetwork : public Network {
           network_.emplace_back(std::move(d_conv));
 
           // Second 1x1 convolution to get back to kNumFilters number of channels
+          
           auto conv2 = std::make_unique<Conv1Layer<DataType>>(getLastLayer(), 
             kNumFilters, 8, 8, c_expand_, ACTIVATION_NONE, false, use_gemm_ex);
           conv2->LoadWeights(&weights.bottleneck[block].conv2.weights[0],
                             nullptr,
                             scratch_mem_);
           network_.emplace_back(std::move(conv2));
+          
+          /*
+          auto conv2 = std::make_unique<ConvLayer<DataType>>(getLastLayer(), 
+            kNumFilters, 8, 8, 1, c_expand_, ACTIVATION_NONE, false);
+          conv2->LoadWeights(&weights.bottleneck[block].conv2.weights[0],
+                            nullptr,
+                            scratch_mem_);
+          network_.emplace_back(std::move(conv2));
+          */
         }
 
 
@@ -979,14 +989,15 @@ class CudnnNetwork : public Network {
           size_t input_host_size = c_expand_ * 64 * max_batch_size_ * sizeof(DataType);
           cudaMemcpy(input_host.data(), tensor_mem_[1], input_host_size, cudaMemcpyDeviceToHost);
           std::cout << "Inputs" << std::endl;
-          std::cout << input_host[7 * 64 + 9] << std::endl;
-          std::cout << input_host[7 * 64 + 17] << std::endl;
-          std::cout << input_host[7 * 64 + 24] << std::endl;
-          std::cout << input_host[7 * 64 + 25] << std::endl;
-          std::cout << input_host[7 * 64 + 26] << std::endl;
-          std::cout << input_host[7 * 64 + 27] << std::endl;
-          std::cout << input_host[7 * 64 + 33] << std::endl;
-          std::cout << input_host[7 * 64 + 41] << std::endl;
+          std::cout << input_host[81 * 64 + 9] << std::endl;
+          std::cout << input_host[81 * 64 + 16] << std::endl;
+          std::cout << input_host[81 * 64 + 17] << std::endl;
+          std::cout << input_host[81 * 64 + 24] << std::endl;
+          std::cout << input_host[81 * 64 + 25] << std::endl;
+          std::cout << input_host[81 * 64 + 26] << std::endl;
+          std::cout << input_host[81 * 64 + 27] << std::endl;
+          std::cout << input_host[81 * 64 + 33] << std::endl;
+          std::cout << input_host[81 * 64 + 41] << std::endl;
           */
 
           // Depthwise conv : c_expand_ -> c_expand_
@@ -1017,15 +1028,19 @@ class CudnnNetwork : public Network {
           network_[l++]->Eval(batchSize, tensor_mem_[1], tensor_mem_[0], nullptr,
             scratch_mem_, scratch_size_, cudnn_, cublas_, stream);
 
-          /*
+
+
+          
           std::vector<DataType> weights_host2(c_expand_ * 64 * max_batch_size_);
           cudaMemcpy(weights_host2.data(), tensor_mem_[1], c_expand_ * 64 * max_batch_size_ * sizeof(DataType), cudaMemcpyDeviceToHost);
           for (int output = 3000; output < 3025; output++){
-            std::cout << "Output" << output << " : " << weights_host2[output] << std::endl;
+            std::cout << "Cublas output " << output << " : " << weights_host2[output] << std::endl;
           }
+          
 
           std::exit(0);
-          */
+          
+          
           
           // SE : kNumFilters -> kNumFilters
           network_[l++]->Eval(batchSize, tensor_mem_[2], tensor_mem_[1],
