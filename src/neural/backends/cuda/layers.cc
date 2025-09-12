@@ -486,10 +486,10 @@ void DepthwiseConvLayer<half>::LoadWeights(float* pfilter, float* pBias, void* s
                       filter_size_, filter_size_);
   } else {
     //std::cout << "Not NHWC" <<std::endl;
-    //copyTypeConverted((half*)weights, (float*)scratch,
-    //                  C * filter_size_ * filter_size_, 0);
-    copyTypeConvertedMask((half*)weights, (float*)scratch,
-                     C * filter_size_ * filter_size_, C, 0);
+    copyTypeConverted((half*)weights, (float*)scratch,
+                      C * filter_size_ * filter_size_, 0);
+    //copyTypeConvertedMask((half*)weights, (float*)scratch,
+    //                 C * filter_size_ * filter_size_, C, 0);
   }
 
   /*
@@ -498,12 +498,13 @@ void DepthwiseConvLayer<half>::LoadWeights(float* pfilter, float* pBias, void* s
   cudaMemcpy(weights_host.data(), weights, weights_host_size, cudaMemcpyDeviceToHost);
   std::cout<<"Printing weights" <<std::endl;
   for (int i = 0; i < 25; i++){
-    std::cout<< weights_host[81 * 25 + i] << "|";
+    std::cout<< weights_host[13 * 25 + i] << "|";
     if ((i+1)%5 == 0){
       std::cout<<std::endl;
     }
   }
   */
+  
   
   
   
@@ -659,6 +660,88 @@ DepthwiseConvLayer<DataType>::~DepthwiseConvLayer() {
 
 
 
+#ifdef USE_CUDNN
+template<typename DataType>
+DepthwiseCustom<DataType>::DepthwiseCustom(int C_in, int H, int W
+                                 )
+    : BaseLayer<DataType>(C_in, H, W, nullptr, false, false),
+      c_input_(C_in) {
+  // Allocate memory for weights (filter tensor) and biases.
+  const size_t weight_size = sizeof(half) * c_input_ * 9;
+  ReportCUDAErrors(cudaMalloc(&weights, weight_size));
+
+
+  const size_t bias_size = sizeof(half) * c_input_;
+  ReportCUDAErrors(cudaMalloc(&biases, bias_size));
+  }
+
+  template <typename DataType>
+  void DepthwiseCustom<DataType>::LoadWeights(float* pfilter, float* pBias,
+                                       void* scratch) {
+
+    const size_t weight_size = sizeof(float) * c_input_ * 9;
+    const size_t bias_size = sizeof(float) * c_input_;
+    assert(scratch);
+    ReportCUDAErrors(
+        cudaMemcpy(scratch, pfilter, weight_size, cudaMemcpyHostToDevice));
+        //copyTypeConverted((half*)weights1, (float*)scratch, c_input_ * 9, 0);
+        convert_float_to_half2((float*)scratch, (half2*)weights, c_input_, 9, 1);
+
+    /*
+    std::vector<half2> weights_host(c_input_ / 2 * 10);
+    const size_t weights_host_size = c_input_ / 2 * 10 * sizeof(half2);
+    cudaMemcpy(weights_host.data(), weights1, weights_host_size, cudaMemcpyDeviceToHost);
+    std::cout<<"Printing weights" <<std::endl;
+    std::cout<< weights_host[250 * 10].x << "|";
+    std::cout<< weights_host[250 * 10].y << std::endl;
+    std::cout<< weights_host[250 * 10 + 9].x << "|";
+    std::cout<< weights_host[250 * 10 + 9].y << std::endl;
+    */
+
+    ReportCUDAErrors(
+        cudaMemcpy(scratch, pBias, bias_size, cudaMemcpyHostToDevice));
+        //copyTypeConverted((half*)biases, (float*)scratch, c_input_, 0);
+        convert_float_to_half2((float*)scratch, (half2*)biases, c_input_, 1, 1); 
+  }
+
+  template <>
+  void DepthwiseCustom<half>::Eval(int N, half* output, const half* input,
+            const half* input2, void* scratch, size_t scratch_size,
+            cudnnHandle_t cudnn, cublasHandle_t cublas, cudaStream_t stream,
+            half***) {
+    
+    try  {
+      //FusedDWPWeval(N, c_input_, C, output, input, weights1, biases,
+      //           weights2, stream);
+      DepthwiseEval(N, c_input_, output, input, scratch, weights, biases, stream);
+    }
+    catch (const std::runtime_error& e) {
+        std::cerr << "Runtime error: " << e.what() << std::endl;
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Standard exception: " << e.what() << std::endl;
+    }
+    catch (...) {
+        std::cerr << "Unknown exception occurred!" << std::endl;
+    }
+
+            
+  }
+
+  template <>
+  void DepthwiseCustom<float>::Eval(int N, float* output, const float* input,
+            const float* input2, void* scratch, size_t scratch_size,
+            cudnnHandle_t cudnn, cublasHandle_t cublas, cudaStream_t stream,
+            float***) {
+    return;      
+  }
+
+  template <typename DataType>
+  DepthwiseCustom<DataType>::~DepthwiseCustom() {
+    ReportCUDAErrors(cudaFree(weights));
+    ReportCUDAErrors(cudaFree(biases));
+  }
+#endif
 
 
 
@@ -2850,6 +2933,10 @@ template class DepthwiseConvLayer<float>;
 
 template class FusedDWPWLayer<half>;
 template class FusedDWPWLayer<float>;
+
+
+template class DepthwiseCustom<half>;
+template class DepthwiseCustom<float>;
 #endif
 
 

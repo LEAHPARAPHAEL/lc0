@@ -166,6 +166,9 @@ void convert_float_to_half2(const float* input, half2* output, int C, int H, int
 void FusedDWPWevalHalf2(int N, int C_in, int C, half* output, const half* input, void* scratch,
                               const half2* w1, const half2* b1, const half2* w2, cudaStream_t stream);
 
+void DepthwiseEval(int N, int C_in, half* output, const half* input, void* scratch,
+                              const half2* w1, const half2* b1, cudaStream_t stream);
+
 void convert_half_to_half2_nchw(const half* input, half2* output,
                                 int N, int C, int H, int W);
 

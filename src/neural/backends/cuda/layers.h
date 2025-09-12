@@ -163,6 +163,40 @@ class FusedDWPWLayer : public BaseLayer<DataType> {
   void init();
 };
 
+template <typename DataType>
+class DepthwiseCustom : public BaseLayer<DataType> {
+  using BaseLayer<DataType>::C;
+  using BaseLayer<DataType>::H;
+  using BaseLayer<DataType>::W;
+  using BaseLayer<DataType>::GetC;
+  using BaseLayer<DataType>::GetH;
+  using BaseLayer<DataType>::GetW;
+  using BaseLayer<DataType>::nhwc_;
+
+ public:
+  DepthwiseCustom(int C_in, int H, int W);
+
+  ~DepthwiseCustom();
+
+  void LoadWeights(float* pfilter, float* pBias, void* scratch);
+  void Eval(int N, DataType* output, const DataType* input,
+            const DataType* input2, void* scratch, size_t scratch_size,
+            cudnnHandle_t cudnn, cublasHandle_t cublas, cudaStream_t stream,
+            DataType*** = nullptr) override;
+
+ private:
+  const int c_input_;
+
+  //DataType* biases = nullptr;
+  //DataType* weights1 = nullptr;
+  //DataType* weights2 = nullptr;
+  half2* biases = nullptr;
+  half2* weights = nullptr;
+
+
+  void init();
+};
+
 
 
 template <typename DataType>

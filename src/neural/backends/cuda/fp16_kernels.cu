@@ -42,9 +42,8 @@
 #include "winograd_helper.inc"
 
 
+// For fused DWPW
 #define N_THREADS 384
-
-
 #define TILE_W 4
 #define TILE_H 4
 
@@ -56,6 +55,27 @@
 #define PARALLEL_D 24
 #define PW_THREAD_D 4
 #define DW_THREAD_D 24
+
+
+// For depthwise only 
+// Each block covers a quarter of the channels and the upper half of the board : 8 blocks required for one position.
+// 576 threads per block : each thread covers 1 square across 4 channels, which is 72 * 32 / 4 = 576 threads.
+#define DW_N_THREADS 384
+#define DW_BLOCK_W 8
+#define DW_BLOCK_H 4
+#define DW_BLOCK_D 72
+
+
+#define DW_THREAD_H 1
+#define DW_THREAD_W 1
+#define DW_PARALLEL_H 4
+#define DW_PARALLEL_W 8
+#define DW_PARALLEL_D 12
+#define PARALLEL_BLOCKS 4
+#define DEPTHWISE_THREAD_D 6
+
+
+
 
 /*
 #define THREAD_H 1
@@ -222,6 +242,308 @@ void convert_half_to_half2_nchw(const half* input, half2* output,
 }
 
 
+__global__ void DepthwiseKernel(int C_in, half* output, const half2* input,
+                              const half2* weights, const half2* biases) {
+#if __CUDA_ARCH__ >= 800   
+
+    /*   
+
+    8 blocks per chess position :
+    - a block covers half of the board (the upper half or the lower half), and spans
+      multiple channels (in the current design, a quarter of the total channels).
+    - so, in total, for an input of shape (N,C,H,W), 8N blocks are required to compute
+      the result of the depthwise convolution.
+    - the number of blocks must be high enough to occupy all the streaming multiprocessors
+      but at the same time not too high to avoid a long queue.
+    - as this number depends on the size of the batch N, a compromise must be made, efficient for
+      the most common batch sizes (between 5 and 40).
+
+                -----------------------
+               /          6          /|
+              /---------------------/ |
+          C  /          4          /| |
+            /---------------------/ |6|
+           /          2          /| | |
+          /---------------------/ |4|/|
+         /           0         /| | / |
+        ----------------------- |2|/|7|
+        |                     | | / | /
+        |          0          |0|/|5|/
+        |                     | / | /
+      H |_____________________|/|3|/
+        |                     | | / 
+        |                     |1|/
+        |          1          | /
+        |                     |/
+        -----------------------
+                   W
+
+    
+    384 threads per block : 
+    - each block computes one spatial position, but across several channels.
+    - each channel is therefore covered by 32 threads, which is exactly the number of
+      threads in a warp, allowing only 9 of them to load the 9 different weights and
+      share them through registers.
+    - as the values are in half2 format, two adjacent channels are computed simultaneously,
+      so the position is treated as if it only contained 576 / 2 = 288 channels.
+    - 12 threads in parallel cover the 72 channels of the block, so each thread is
+      responsible for 6 channels (12 in reality, as each channel is doubled).
+    
+              
+               ------------------------- 
+              /_ /_ /_ /_ /_ /_ /_ /_ /|
+             .  .  .  .  .  .  .  .  . |
+            .  .  .  .  .  .  .  .  .  |
+        D  /_ /_ /_ /_ /_ /_ /_ /_ /   |
+          /_ /_ /_ /_ /_ /_ /_ /_ /|   /
+         / 0/ 1/  /  /  /  /  /  /||  .
+        ------------------------- || .
+        | 0| 1|  |  |  |  |  |  | ||/
+      H |  |  |  |  |  |  |  |  | |/
+        |  |  |  |  |  |  |  |  | /
+        |  |  |  |  |  |  |  |31|/
+        -------------------------
+                    W
+                  
+
+    thread_w : the horizontal position of the thread, goes from 0 to 8
+    thread_h : the vertical position of the thread, goes from 0 to 4
+    thread_d : the first channel covered by this thread, with 0 being the
+    first channel of the block, not necessarily the first channel overall.
+    */
+    const int thread_w = threadIdx.x;
+    const int thread_h = threadIdx.y;
+    const int thread_d = threadIdx.z;
+
+    const int block_n = blockIdx.x;
+    const int block_d = blockIdx.y;
+    const int block_h = blockIdx.z;
+
+    // Absolute horizontal position of the thread
+    const int abs_w = thread_w * DW_THREAD_W;
+
+    // Absolute channel number of the beginning of the thread
+    const int abs_d = DW_BLOCK_D * block_d + DEPTHWISE_THREAD_D * thread_d;
+
+    // Absolute vertical position of the thread
+    const int abs_h = block_h * DW_BLOCK_H + thread_h * DW_THREAD_H;
+
+    // The nine depthwise weights and the bias
+    half2 w0, w1, w2, w3, w4, w5, w6, w7, w8, b;
+
+    // Loops over the 6 channels covered by the thread executing the kernel.
+    #pragma unroll
+    for (int c = 0; c < DEPTHWISE_THREAD_D ; c+=1){
+
+        // Current channel (beginning of the thread + offset)
+        const int current_d = abs_d + c;
+            
+        // Used to share the 9 weights among the threads of the same warp
+        half2 shared_weight;
+
+        /*
+          Each thread fetches at most one weight and shares it with the warp.
+          For the sake of simplicity, the 9 first threads fetch the 9 weights and
+          the 10th gets the bias. 
+        */ 
+        if (thread_h * DW_BLOCK_W + thread_w < 9){
+            shared_weight = weights[current_d * 9 + thread_h * DW_BLOCK_W + thread_w];
+        }
+        if (thread_h * DW_BLOCK_W + thread_w == 9){
+            shared_weight = biases[current_d];
+        }
+
+
+        /*
+          The threads of the warp share the 9 weights and the bias using registers.
+          For example, the first weight (w0) was fetched by the first thread of the warp
+          (the thread at index 0), so the last argument of the __shfl_sync function is 0.
+        */ 
+
+        unsigned active_threads_mask = __activemask();
+
+        w0 = __shfl_sync(active_threads_mask, shared_weight, 0);
+        w1 = __shfl_sync(active_threads_mask, shared_weight, 1);
+        w2 = __shfl_sync(active_threads_mask, shared_weight, 2);
+        w3 = __shfl_sync(active_threads_mask, shared_weight, 3);
+        w4 = __shfl_sync(active_threads_mask, shared_weight, 4);
+        w5 = __shfl_sync(active_threads_mask, shared_weight, 5);
+        w6 = __shfl_sync(active_threads_mask, shared_weight, 6);
+        w7 = __shfl_sync(active_threads_mask, shared_weight, 7);
+        w8 = __shfl_sync(active_threads_mask, shared_weight, 8);
+        b = __shfl_sync(active_threads_mask, shared_weight, 9);
+            
+
+        /*
+          Batch + channel index : 
+          - misses only the height and width offsets to have
+            the final index. 
+          - counts with packed channels, hence the C_in / 2, so will have to be doubled when
+            going back to half format for the output. 
+        */ 
+
+        const int offset_nc = (block_n * C_in / 2 + current_d) * 64;
+
+
+
+        // Row in the 8 x 8 input of the channel : substract 2 for top padding
+        const int abs_h_input = block_h * DW_BLOCK_H + thread_h - 2;
+
+        // Column in the 8 x 8 input of the channel : substract 2 for left padding
+        const int abs_w_input = thread_w * DW_THREAD_W - 2;
+
+        const int index_input = offset_nc + abs_h_input * 8 + abs_w_input;
+
+        // Accumulator
+        half2 sum = make_half2(0.0f, 0.0f);
+
+        /*
+        Weights layout for chess masks (from top to bottom, then left to right): 
+        [w0, w1, w2, w3, w4, w5, w6, w7, w8]
+
+        - Rook (first third of the input channels):
+          [0, 0,w0, 0, 0,
+           0, 0,w1, 0, 0,
+          w2,w3,w4,w5,w6,
+           0, 0,w7, 0, 0,
+           0, 0,w8, 0, 0]
+
+        - Bishop (second third of the input channels):
+          [w0, 0, 0, 0,w1,
+            0,w2, 0,w3, 0,
+            0, 0,w4, 0, 0,
+            0,w5, 0,w6, 0,
+           w7, 0, 0, 0,w8]
+
+        - Knight (last third of the input channels):
+          [0,w0, 0,w1, 0,
+          w2, 0, 0, 0, w3,
+           0, 0,w4, 0, 0,
+          w5, 0, 0, 0, w6,
+           0,w7, 0,w8, 0]
+
+
+
+        A same padding is applied, which means that 2 rows and columns are added at each end of the board
+        to keep the same size after the 5x5 convolution.
+        For example, consider the first thread of the first channel of the first position of the batch :
+        - block_n = block_d = block_h = thread_d = thread_w = thread_h = current_d = offset_nc = 0
+        - first third of the channels, so it's a rook kernel.
+        - we compute abs_h_input = -2, abs_w_input = -2, index_input = -18.
+        - -18 marks the index of the X mark in the padded board.
+        - as long as abs_h_input < 0 or abs_h_input > 7 or abs_w_input < 0 or abs_w_input > 7, the input
+          will be 0 because out of bounds. 
+        - so the first computation to be potentially non-zero is the one at the center of the kernel. We check
+          that it corresponds to index_input + 18 = 0, which is indeed the first position of the board. 
+
+       ----------------
+       |X  0  *  0  0 | 0  0  0  0  0  0  0                   
+       |0  0  *  0  0 | 0  0  0  0  0  0  0
+       |*  * [*][*][*]|[ ][ ][ ][ ][ ] 0  0
+       |0  0 [*][ ][ ]|[ ][ ][ ][ ][ ] 0  0
+       |0  0 [*][ ][ ]|[ ][ ][ ][ ][ ] 0  0
+       ----------------
+        0  0 [ ][ ][ ] [ ][ ][ ][ ][ ] 0  0
+        0  0 [ ][ ][ ] [ ][ ][ ][ ][ ] 0  0
+        0  0 [ ][ ][ ] [ ][ ][ ][ ][ ] 0  0
+        0  0 [ ][ ][ ] [ ][ ][ ][ ][ ] 0  0
+        0  0 [ ][ ][ ] [ ][ ][ ][ ][ ] 0  0
+        0  0  0  0  0   0  0  0  0  0  0  0
+        0  0  0  0  0   0  0  0  0  0  0  0
+
+      */
+      
+
+        // Rook filter
+        if (2 * current_d < (C_in / 3)) {
+            sum = __hfma2(w0, get_input_half2_at(input, abs_h_input, abs_w_input + 2, index_input + 2), sum);
+            sum = __hfma2(w1, get_input_half2_at(input, abs_h_input + 1, abs_w_input + 2, index_input + 10), sum);
+            sum = __hfma2(w2, get_input_half2_at(input, abs_h_input + 2, abs_w_input, index_input + 16), sum);
+            sum = __hfma2(w3, get_input_half2_at(input, abs_h_input + 2 , abs_w_input + 1, index_input + 17), sum);
+            sum = __hfma2(w4, get_input_half2_at(input, abs_h_input + 2, abs_w_input + 2, index_input + 18), sum);
+            sum = __hfma2(w5, get_input_half2_at(input, abs_h_input + 2, abs_w_input + 3, index_input + 19), sum);
+            sum = __hfma2(w6, get_input_half2_at(input, abs_h_input + 2, abs_w_input + 4, index_input + 20), sum);
+            sum = __hfma2(w7, get_input_half2_at(input, abs_h_input + 3, abs_w_input + 2, index_input + 26), sum);
+            sum = __hfma2(w8, get_input_half2_at(input, abs_h_input + 4, abs_w_input + 2, index_input + 34), sum);
+        }
+
+        // Bishop filter
+        else if (2 * current_d < (2 * C_in / 3)) {
+            sum = __hfma2(w0, get_input_half2_at(input, abs_h_input, abs_w_input, index_input), sum);
+            sum = __hfma2(w1, get_input_half2_at(input, abs_h_input, abs_w_input + 4, index_input + 4), sum);
+            sum = __hfma2(w2, get_input_half2_at(input, abs_h_input + 1, abs_w_input + 1, index_input + 9), sum);
+            sum = __hfma2(w3, get_input_half2_at(input, abs_h_input + 1 , abs_w_input + 3, index_input + 11), sum);
+            sum = __hfma2(w4, get_input_half2_at(input, abs_h_input + 2, abs_w_input + 2, index_input + 18), sum);
+            sum = __hfma2(w5, get_input_half2_at(input, abs_h_input + 3, abs_w_input + 1, index_input + 25), sum);
+            sum = __hfma2(w6, get_input_half2_at(input, abs_h_input + 3, abs_w_input + 3, index_input + 27), sum);
+            sum = __hfma2(w7, get_input_half2_at(input, abs_h_input + 4, abs_w_input, index_input + 32), sum);
+            sum = __hfma2(w8, get_input_half2_at(input, abs_h_input + 4, abs_w_input + 4, index_input + 36), sum);
+        }
+
+        // Knight filter
+        else {
+            sum = __hfma2(w0, get_input_half2_at(input, abs_h_input, abs_w_input + 1, index_input + 1), sum);
+            sum = __hfma2(w1, get_input_half2_at(input, abs_h_input, abs_w_input + 3, index_input + 3), sum);
+            sum = __hfma2(w2, get_input_half2_at(input, abs_h_input + 1, abs_w_input, index_input + 8), sum);
+            sum = __hfma2(w3, get_input_half2_at(input, abs_h_input + 1 , abs_w_input + 4, index_input + 12), sum);
+            sum = __hfma2(w4, get_input_half2_at(input, abs_h_input + 2, abs_w_input + 2, index_input + 18), sum);
+            sum = __hfma2(w5, get_input_half2_at(input, abs_h_input + 3, abs_w_input, index_input + 24), sum);
+            sum = __hfma2(w6, get_input_half2_at(input, abs_h_input + 3, abs_w_input + 4, index_input + 28), sum);
+            sum = __hfma2(w7, get_input_half2_at(input, abs_h_input + 4, abs_w_input + 1, index_input + 33), sum);
+            sum = __hfma2(w8, get_input_half2_at(input, abs_h_input + 4, abs_w_input + 3, index_input + 35), sum);
+        }
+                
+        // Adds the bias to the sum
+        sum = __hadd2(sum, b);
+
+        // ReLU ! 
+        sum = __hmax2(sum, __float2half2_rn(0.0f));
+
+        
+        /*
+          Writes the result in the output, splitting the two halves of the sums, which correspond to the channels 
+          at position 2*current_d and 2*current_d + 1, hence the 64 offset. 
+        */ 
+        output[2 * offset_nc * 64 + abs_h * 8 + abs_w] = __low2half(sum);
+        output[(2 * offset_nc + 1) * 64 + abs_h * 8 + abs_w] = __high2half(sum);
+     
+    }
+            
+#endif
+}
+
+
+
+void DepthwiseEval(int N, int C_in, half* output, const half* input, void* scratch,
+                              const half2* w1, const half2* b1, cudaStream_t stream) {
+
+    //std::cout << "Number of positions in the batch : " << N << std::endl;
+    convert_half_to_half2_nchw(input, (half2*)scratch,
+                         N, C_in, 8, 8); 
+
+    dim3 threads(DW_PARALLEL_W, DW_PARALLEL_H, DW_PARALLEL_D);
+
+    dim3 blocks(N, PARALLEL_BLOCKS, 8 / DW_BLOCK_H);
+    DepthwiseKernel<<<blocks, threads>>>(C_in, output, (half2*)scratch, w1, b1);
+
+
+    /*
+    cudaDeviceSynchronize();
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+    std::cerr << "Kernel launch failed: " << cudaGetErrorString(err) << "\n";
+    }
+  
+
+    std::exit(0);
+    */
+    
+
+}
+
+
+
+
 __global__ void FusedDWPWKernel(int C_in, int C, half* output, const half2* input,
                               const half2* w1, const half2* b1, const half2* w2) {
 #if __CUDA_ARCH__ >= 800   
@@ -254,7 +576,7 @@ __global__ void FusedDWPWKernel(int C_in, int C, half* output, const half2* inpu
 
     if (abs_w < 8) {
         half2 dweight0, dweight1, dweight2, dweight3, dweight4,
-              dweight5, dweight6, dweight7, dweight8, dbias, dummy_weight;
+              dweight5, dweight6, dweight7, dweight8, dbias;
 
         for (int c = 0; c < DW_THREAD_D ; c+=2){
 
@@ -269,15 +591,11 @@ __global__ void FusedDWPWKernel(int C_in, int C, half* output, const half2* inpu
 
             //Each thread fetches at most one weight and shares it with the warp
             if (thread_h < 3 && thread_w < 3){
-                my_weight = w1[current_d / 2 * 10 + thread_h * 3 + thread_w];
+                my_weight = w1[current_d / 2 * 9 + thread_h * 3 + thread_w];
             }
             if (thread_h == 0 && thread_w == 3){
                 my_weight = b1[current_d / 2];
             }
-            if (thread_h == 3 && thread_w == 3){
-                my_weight = w1[current_d / 2 * 10 + 9];
-            }
-
             unsigned active_threads_mask = __activemask();
 
 
@@ -290,8 +608,6 @@ __global__ void FusedDWPWKernel(int C_in, int C, half* output, const half2* inpu
             dweight6 = __shfl_sync(active_threads_mask, my_weight, warp_offset + 2 * PARALLEL_W );
             dweight7 = __shfl_sync(active_threads_mask, my_weight, warp_offset + 2 * PARALLEL_W  + 1);
             dweight8 = __shfl_sync(active_threads_mask, my_weight, warp_offset + 2 * PARALLEL_W + 2);
-            dummy_weight = __shfl_sync(active_threads_mask, my_weight, warp_offset + 3 * PARALLEL_W + 3);
-
             dbias = __shfl_sync(active_threads_mask, my_weight, warp_offset + 3);
             
 
@@ -568,11 +884,6 @@ __global__ void FusedDWPWKernel(int C_in, int C, half* output, const half2* inpu
               printf("Output %d : %f\n", output_index, __half2float(sum));
           }
           
-          
-          
-
-          
-           
         }
     }
 #endif
@@ -1147,6 +1458,7 @@ void OutputInputTransform(int N, int C, int se_K, T* output, const T* input,
   }
   ReportCUDAErrors(cudaGetLastError());
 }
+
 
 template void FilterTransform<half>(int N, int C, half* transformedFilter,
                                     const half* filter);

@@ -173,6 +173,8 @@ class CudnnNetwork : public Network {
     max_batch_size_ = options.GetOrDefault<int>("max_batch", 512);
 
     fuse_DWPW_ = options.GetOrDefault<bool>("fuse_DWPW", false);
+
+    custom_depthwise_ = options.GetOrDefault<bool>("custom_depthwise", false);
     // min_batch_size_ is chosen as 4 as it is common that for sizes less than
     // 4 that there is no performance gain, but there is variance in the
     // outputs, which means that there is extra non-determinism in some
@@ -679,12 +681,24 @@ class CudnnNetwork : public Network {
 
         else {
           // Depthwise convolution
-          auto d_conv = std::make_unique<DepthwiseConvLayer<DataType>>(getLastLayer(), 
-            c_expand_, 8, 8, 5, ACTIVATION_RELU, true);
-          d_conv->LoadWeights(&weights.bottleneck[block].d_conv.weights[0],
-                            &weights.bottleneck[block].d_conv.biases[0],
-                            scratch_mem_);
-          network_.emplace_back(std::move(d_conv));
+          
+          if (custom_depthwise_){
+            auto d_conv = std::make_unique<DepthwiseCustom<DataType>>(c_expand_, 8, 8);
+            d_conv->LoadWeights(&weights.bottleneck[block].d_conv.weights[0],
+                              &weights.bottleneck[block].d_conv.biases[0],
+                              scratch_mem_);
+            network_.emplace_back(std::move(d_conv));
+          }
+
+          else {
+            auto d_conv = std::make_unique<DepthwiseConvLayer<DataType>>(getLastLayer(), 
+              c_expand_, 8, 8, 5, ACTIVATION_RELU, true);
+            d_conv->LoadWeights(&weights.bottleneck[block].d_conv.weights[0],
+                              &weights.bottleneck[block].d_conv.biases[0],
+                              scratch_mem_);
+            network_.emplace_back(std::move(d_conv));
+          }
+
 
           // Second 1x1 convolution to get back to kNumFilters number of channels
           
@@ -1003,7 +1017,7 @@ class CudnnNetwork : public Network {
           // Depthwise conv : c_expand_ -> c_expand_
           network_[l++]->Eval(batchSize, tensor_mem_[0], tensor_mem_[1], nullptr,
             scratch_mem_, scratch_size_, cudnn_, cublas_, stream);
-
+          
           
           /*
           std::vector<DataType> weights_host(c_expand_ * 64 * max_batch_size_);
@@ -1014,9 +1028,9 @@ class CudnnNetwork : public Network {
           {
             std::cout << weights_host[i * 64 + 25] << std::endl;
           }
+          
+          std::exit(0);
           */
-
-
 
 
           
@@ -1030,7 +1044,7 @@ class CudnnNetwork : public Network {
 
 
 
-          
+          /*
           std::vector<DataType> weights_host2(c_expand_ * 64 * max_batch_size_);
           cudaMemcpy(weights_host2.data(), tensor_mem_[1], c_expand_ * 64 * max_batch_size_ * sizeof(DataType), cudaMemcpyDeviceToHost);
           for (int output = 3000; output < 3025; output++){
@@ -1039,6 +1053,7 @@ class CudnnNetwork : public Network {
           
 
           std::exit(0);
+          */
           
           
           
@@ -1298,6 +1313,7 @@ class CudnnNetwork : public Network {
   bool conv_policy_;
   bool attn_policy_;
   bool fuse_DWPW_;
+  bool custom_depthwise_; 
   std::vector<std::unique_ptr<BaseLayer<DataType>>> network_;
   BaseLayer<DataType>* getLastLayer() { return network_.back().get(); }
 
