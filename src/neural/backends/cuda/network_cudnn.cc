@@ -691,8 +691,12 @@ class CudnnNetwork : public Network {
           }
 
           else {
+            const int filter_size = (int)sqrt((double)(weights.bottleneck[block].d_conv.weights.size() /
+                                    weights.bottleneck[block].d_conv.biases.size()));
+            //std::cout << "Filter size : " << filter_size << std::endl;
+
             auto d_conv = std::make_unique<DepthwiseConvLayer<DataType>>(getLastLayer(), 
-              c_expand_, 8, 8, 5, ACTIVATION_RELU, true);
+              c_expand_, 8, 8, filter_size, ACTIVATION_RELU, true);
             d_conv->LoadWeights(&weights.bottleneck[block].d_conv.weights[0],
                               &weights.bottleneck[block].d_conv.biases[0],
                               scratch_mem_);

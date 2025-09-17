@@ -436,20 +436,19 @@ __global__ void DepthwiseKernel(int C_in, half* output, const half2* input,
         - so the first computation to be potentially non-zero is the one at the center of the kernel. We check
           that it corresponds to index_input + 18 = 0, which is indeed the first position of the board. 
 
-       ----------------
-       |X  0  *  0  0 | 0  0  0  0  0  0  0                   
-       |0  0  *  0  0 | 0  0  0  0  0  0  0
-       |*  * [*][*][*]|[ ][ ][ ][ ][ ] 0  0
-       |0  0 [*][ ][ ]|[ ][ ][ ][ ][ ] 0  0
-       |0  0 [*][ ][ ]|[ ][ ][ ][ ][ ] 0  0
-       ----------------
-        0  0 [ ][ ][ ] [ ][ ][ ][ ][ ] 0  0
-        0  0 [ ][ ][ ] [ ][ ][ ][ ][ ] 0  0
-        0  0 [ ][ ][ ] [ ][ ][ ][ ][ ] 0  0
-        0  0 [ ][ ][ ] [ ][ ][ ][ ][ ] 0  0
-        0  0 [ ][ ][ ] [ ][ ][ ][ ][ ] 0  0
-        0  0  0  0  0   0  0  0  0  0  0  0
-        0  0  0  0  0   0  0  0  0  0  0  0
+       
+        X  0  *  0  0  0  0  0  0  0  0  0                   
+        0  0  *  0  0  0  0  0  0  0  0  0
+        *  * [*][*][*][ ][ ][ ][ ][ ] 0  0
+        0  0 [*][ ][ ][ ][ ][ ][ ][ ] 0  0
+        0  0 [*][ ][ ][ ][ ][ ][ ][ ] 0  0
+        0  0 [ ][ ][ ][ ][ ][ ][ ][ ] 0  0
+        0  0 [ ][ ][ ][ ][ ][ ][ ][ ] 0  0
+        0  0 [ ][ ][ ][ ][ ][ ][ ][ ] 0  0
+        0  0 [ ][ ][ ][ ][ ][ ][ ][ ] 0  0
+        0  0 [ ][ ][ ][ ][ ][ ][ ][ ] 0  0
+        0  0  0  0  0  0  0  0  0  0  0  0
+        0  0  0  0  0  0  0  0  0  0  0  0
 
       */
       
@@ -504,8 +503,8 @@ __global__ void DepthwiseKernel(int C_in, half* output, const half2* input,
           Writes the result in the output, splitting the two halves of the sums, which correspond to the channels 
           at position 2*current_d and 2*current_d + 1, hence the 64 offset. 
         */ 
-        output[2 * offset_nc * 64 + abs_h * 8 + abs_w] = __low2half(sum);
-        output[(2 * offset_nc + 1) * 64 + abs_h * 8 + abs_w] = __high2half(sum);
+        output[2 * offset_nc + abs_h * 8 + abs_w] = __low2half(sum);
+        output[2 * offset_nc + 64 + abs_h * 8 + abs_w] = __high2half(sum);
      
     }
             

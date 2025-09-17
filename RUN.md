@@ -74,6 +74,6 @@ lc0.exe --weights=C:\Users\RAPHAL~1\Leela\Networks\mobile_net_brk-96x6\mobile_ne
 lc0.exe backendbench --weights=C:\Users\RAPHAL~1\Leela\Networks\mobile_net_brk-96x6\mobile_net_brk-96x6-100000.pb.gz 
 
 # mobile net brk 96x6 with custom depthwise
-lc0.exe --weights=C:\Users\RAPHAL~1\Leela\Networks\FormatDWPW\mobile_net_brk-96x6-latest.pb.gz -o custom_depthwise=true
-lc0.exe backendbench --weights=C:\Users\RAPHAL~1\Leela\Networks\FormatDWPW\mobile_net_brk-96x6-latest.pb.gz -o custom_depthwise=true
+lc0.exe --weights=C:\Users\RAPHAL~1\Leela\Networks\FormatDWPW\mobile_net_brk-96x6-custom.pb.gz -o custom_depthwise=true
+lc0.exe backendbench --weights=C:\Users\RAPHAL~1\Leela\Networks\FormatDWPW\mobile_net_brk-96x6-custom.pb.gz -o custom_depthwise=true
 
