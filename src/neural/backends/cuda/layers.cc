@@ -487,7 +487,7 @@ void DepthwiseConvLayer<half>::LoadWeights(float* pfilter, float* pBias, void* s
   } else {
     //std::cout << "Not NHWC" <<std::endl;
     copyTypeConverted((half*)weights, (float*)scratch,
-                      C * filter_size_ * filter_size_, 0);
+                    C * filter_size_ * filter_size_, 0);
     //copyTypeConvertedMask((half*)weights, (float*)scratch,
     //                 C * filter_size_ * filter_size_, C, 0);
   }
@@ -688,15 +688,22 @@ DepthwiseCustom<DataType>::DepthwiseCustom(int C_in, int H, int W
         convert_float_to_half2((float*)scratch, (half2*)weights, c_input_, 9, 1);
 
     /*
-    std::vector<half2> weights_host(c_input_ / 2 * 10);
-    const size_t weights_host_size = c_input_ / 2 * 10 * sizeof(half2);
-    cudaMemcpy(weights_host.data(), weights1, weights_host_size, cudaMemcpyDeviceToHost);
-    std::cout<<"Printing weights" <<std::endl;
-    std::cout<< weights_host[250 * 10].x << "|";
-    std::cout<< weights_host[250 * 10].y << std::endl;
-    std::cout<< weights_host[250 * 10 + 9].x << "|";
-    std::cout<< weights_host[250 * 10 + 9].y << std::endl;
+    std::vector<half2> weights_host(c_input_ / 2 * 9);
+    const size_t weights_host_size = c_input_ / 2 * 9 * sizeof(half2);
+    cudaMemcpy(weights_host.data(), weights, weights_host_size, cudaMemcpyDeviceToHost);
+    std::cout<<"\n Printing weights" <<std::endl;
+    std::cout<< weights_host[25 * 9].x << ", ";
+    std::cout<< weights_host[25 * 9 + 1].x << ", ";
+    std::cout<< weights_host[25 * 9 + 2].x << ", ";
+    std::cout<< weights_host[25 * 9 + 3].x << ", ";
+    std::cout<< weights_host[25 * 9 + 4].x << ", ";
+    std::cout<< weights_host[25 * 9 + 5].x << ", ";
+    std::cout<< weights_host[25 * 9 + 6].x << ", ";
+    std::cout<< weights_host[25 * 9 + 7].x << ", ";
+    std::cout<< weights_host[25 * 9 + 8].x << std::endl;
     */
+
+    
 
     ReportCUDAErrors(
         cudaMemcpy(scratch, pBias, bias_size, cudaMemcpyHostToDevice));

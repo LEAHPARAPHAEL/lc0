@@ -63,16 +63,9 @@
 #define DW_N_THREADS 384
 #define DW_BLOCK_W 8
 #define DW_BLOCK_H 4
-#define DW_BLOCK_D 72
-
-
-#define DW_THREAD_H 1
-#define DW_THREAD_W 1
-#define DW_PARALLEL_H 4
-#define DW_PARALLEL_W 8
-#define DW_PARALLEL_D 12
 #define PARALLEL_BLOCKS 4
-#define DEPTHWISE_THREAD_D 6
+#define DW_PARALLEL_D 12
+
 
 
 
@@ -246,6 +239,9 @@ __global__ void DepthwiseKernel(int C_in, half* output, const half2* input,
                               const half2* weights, const half2* biases) {
 #if __CUDA_ARCH__ >= 800   
 
+    const int block_depth = C_in / (2 * PARALLEL_BLOCKS);
+    const int thread_depth = block_depth / DW_PARALLEL_D;
+
     /*   
 
     8 blocks per chess position :
@@ -320,20 +316,20 @@ __global__ void DepthwiseKernel(int C_in, half* output, const half2* input,
     const int block_h = blockIdx.z;
 
     // Absolute horizontal position of the thread
-    const int abs_w = thread_w * DW_THREAD_W;
+    const int abs_w = thread_w;
 
     // Absolute channel number of the beginning of the thread
-    const int abs_d = DW_BLOCK_D * block_d + DEPTHWISE_THREAD_D * thread_d;
+    const int abs_d = block_depth * block_d + thread_depth * thread_d;
 
     // Absolute vertical position of the thread
-    const int abs_h = block_h * DW_BLOCK_H + thread_h * DW_THREAD_H;
+    const int abs_h = block_h * DW_BLOCK_H + thread_h;
 
-    // The nine depthwise weights and the bias
+    // The nine depthwise weights and the bias to be loaded
     half2 w0, w1, w2, w3, w4, w5, w6, w7, w8, b;
 
     // Loops over the 6 channels covered by the thread executing the kernel.
     #pragma unroll
-    for (int c = 0; c < DEPTHWISE_THREAD_D ; c+=1){
+    for (int c = 0; c < thread_depth ; c+=1){
 
         // Current channel (beginning of the thread + offset)
         const int current_d = abs_d + c;
@@ -390,7 +386,7 @@ __global__ void DepthwiseKernel(int C_in, half* output, const half2* input,
         const int abs_h_input = block_h * DW_BLOCK_H + thread_h - 2;
 
         // Column in the 8 x 8 input of the channel : substract 2 for left padding
-        const int abs_w_input = thread_w * DW_THREAD_W - 2;
+        const int abs_w_input = thread_w - 2;
 
         const int index_input = offset_nc + abs_h_input * 8 + abs_w_input;
 
@@ -520,7 +516,7 @@ void DepthwiseEval(int N, int C_in, half* output, const half* input, void* scrat
     convert_half_to_half2_nchw(input, (half2*)scratch,
                          N, C_in, 8, 8); 
 
-    dim3 threads(DW_PARALLEL_W, DW_PARALLEL_H, DW_PARALLEL_D);
+    dim3 threads(DW_BLOCK_W, DW_BLOCK_H, DW_PARALLEL_D);
 
     dim3 blocks(N, PARALLEL_BLOCKS, 8 / DW_BLOCK_H);
     DepthwiseKernel<<<blocks, threads>>>(C_in, output, (half2*)scratch, w1, b1);

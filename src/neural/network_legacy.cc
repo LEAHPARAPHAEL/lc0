@@ -162,8 +162,6 @@ BaseWeights::DepthwiseConvBlock::DepthwiseConvBlock(
 
 
 
-  if (weights.size() == 0) return;
-
   if (bn_betas.size() == 0) {
     for (size_t i = 0; i < bn_means.size(); i++) {
       bn_betas.emplace_back(0.0f);
@@ -177,7 +175,7 @@ BaseWeights::DepthwiseConvBlock::DepthwiseConvBlock(
   }
 
   if (bn_means.size() == 0) {
-    return;  // No BN
+    return; 
   }
 
   for (auto i = size_t{0}; i < bn_stddivs.size(); i++) {
