@@ -67,7 +67,7 @@ meson setup build --reconfigure --backend %backend% --buildtype release -Ddx=%DX
 -Dmkl_include="%MKL_PATH%\include" -Dmkl_libdirs="%MKL_PATH%\lib\intel64" -Ddnnl_dir="%DNNL_PATH%" ^
 -Dopencl_libdirs="%OPENCL_LIB_PATH%" -Dopencl_include="%OPENCL_INCLUDE_PATH%" ^
 -Dopenblas_include="%OPENBLAS_PATH%\include" -Dopenblas_libdirs="%OPENBLAS_PATH%\lib" ^
--Ddefault_library=static --native-file native-vs142.ini -Dcc_cuda=80
+-Ddefault_library=static --native-file native-vs142.ini
 
 pause
 

@@ -114,7 +114,7 @@ Weights layout for chess masks (from top to bottom, then left to right):
        0,w7, 0,w8, 0]
 */
 
-#if __CUDA_ARCH__ >= 800
+#if __CUDA_ARCH__ >= 700
 inline __device__ float get_input_at(const half* ip, const int index_h,
     const int index_w, const int global_index) {
       if (index_h >= 0 && index_h < 8 && index_w >= 0
@@ -237,7 +237,7 @@ void convert_half_to_half2_nchw(const half* input, half2* output,
 
 __global__ void DepthwiseKernel(int C_in, half* output, const half2* input,
                               const half2* weights, const half2* biases) {
-#if __CUDA_ARCH__ >= 800   
+#if __CUDA_ARCH__ >= 700 
 
     const int block_depth = C_in / (2 * PARALLEL_BLOCKS);
     const int thread_depth = block_depth / DW_PARALLEL_D;
@@ -503,8 +503,11 @@ __global__ void DepthwiseKernel(int C_in, half* output, const half2* input,
         output[2 * offset_nc + 64 + abs_h * 8 + abs_w] = __high2half(sum);
      
     }
-            
+
+  
 #endif
+
+
 }
 
 
