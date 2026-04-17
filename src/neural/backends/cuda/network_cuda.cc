@@ -51,6 +51,56 @@
 #undef cudaEventRecordExternal
 #endif
 
+namespace {
+std::vector<std::vector<float>> BuildChessFormerMasks(const WeightsFile& file, int num_heads, int num_layers) {
+    // Initialize N empty masks (defaulting to 0.0f)
+    std::vector<std::vector<float>> layer_masks(num_layers, std::vector<float>(num_heads * 64 * 64, 0.0f));
+    
+    auto network_format = file.format().network_format();
+    for (const auto& am : network_format.attention_masks()) {
+        std::string piece = am.piece_type();
+        
+        // Resolve layers
+        std::vector<uint32_t> target_layers;
+        if (am.layer_indices_size() == 0) {
+            for (int i = 0; i < num_layers; ++i) target_layers.push_back(i);
+        } else {
+            for (uint32_t l : am.layer_indices()) target_layers.push_back(l);
+        }
+
+        for (uint32_t l : target_layers) {
+            if (l >= num_layers) continue;
+
+            for (uint32_t head_idx : am.head_indices()) {
+                if (head_idx >= num_heads) continue;
+
+                for (int i = 0; i < 64; ++i) {
+                    int r1 = i / 8; int c1 = i % 8;
+                    for (int j = 0; j < 64; ++j) {
+                        int r2 = j / 8; int c2 = j % 8;
+                        int dr = std::abs(r1 - r2); int dc = std::abs(c1 - c2);
+
+                        bool valid = false;
+                        if (i == j) valid = true;
+                        else if (piece == "rook" && (dr == 0 || dc == 0)) valid = true;
+                        else if (piece == "bishop" && (dr == dc)) valid = true;
+                        else if (piece == "knight" && ((dr == 2 && dc == 1) || (dr == 1 && dc == 2))) valid = true;
+                        else if (piece == "queen" && (dr == 0 || dc == 0 || dr == dc)) valid = true;
+                        else if (piece == "king" && (dr <= 1 && dc <= 1)) valid = true;
+                        else if (piece == "pawn" && ((dr == 1 && dc <= 1) || (dr == 2 && dc == 0))) valid = true;
+
+                        if (!valid) {
+                            layer_masks[l][(head_idx * 64 * 64) + (i * 64) + j] = -10000.0f;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return layer_masks;
+}
+} // namespace
+
 namespace lczero {
 using namespace cudnn_backend;
 
@@ -229,10 +279,6 @@ class CudaNetwork : public Network {
 
     showInfo();
 
-#ifdef USE_CUTLASS
-    CERR << "Compiled with CUTLASS enabled";
-#endif
-
     int total_gpus;
     ReportCUDAErrors(cudaGetDeviceCount(&total_gpus));
 
@@ -340,13 +386,6 @@ class CudaNetwork : public Network {
     // Override if set in backend-opts.
     if (options.Exists<bool>("res_block_fusing")) {
       use_res_block_winograd_fuse_opt_ = options.Get<bool>("res_block_fusing");
-    }
-
-    bool use_fused_mha = false;
-    if (deviceProp.major >= 8 && fp16) {
-      use_fused_mha = options.GetOrDefault<bool>(
-          "fused_mha", file.format().network_format().ffn_activation() !=
-                           pblczero::NetworkFormat::ACTIVATION_RELU_2);
     }
 
     const bool use_gemm_ex = deviceProp.major >= 5;
@@ -491,13 +530,18 @@ class CudaNetwork : public Network {
               : static_cast<ActivationFunction>(ffn_activation);
       activations.default_activation = act;
 
+      int num_encoder_layers = weights.encoder.size();
+      std::vector<std::vector<float>> attention_masks = 
+          BuildChessFormerMasks(file, weights.encoder_head_count, num_encoder_layers);
+
       auto attention_body = std::make_unique<AttentionBody<DataType>>(
           weights, scratch_mem_, activations, numBlocks_,
           numBlocks_ > 0 ? kNumFilters : kInputPlanes, max_batch_size_,
           static_cast<InputEmbedding>(
               file.format().network_format().input_embedding()) ==
               InputEmbedding::INPUT_EMBEDDING_PE_DENSE,
-          use_gemm_ex, use_fused_mha);
+          use_gemm_ex, 
+          attention_mask);
       network_.emplace_back(std::move(attention_body));
 
       encoder_last_ = getLastLayer();
@@ -1043,22 +1087,12 @@ class CudaNetwork : public Network {
     return 2 * sm_count_;
   }
 
-  int GetPreferredBatchStep() const override {
-    int preferred_split = 7;
-    while (sm_count_ % preferred_split != 0) preferred_split++;
-    return preferred_split;
-  }
-
   int GetThreads() const override { return 1 + multi_stream_; }
 
   std::unique_ptr<NetworkComputation> NewComputation() override {
     // Set correct gpu id for this computation (as it might have been called
     // from a different thread).
-    int device = -1;
-    ReportCUDAErrors(cudaGetDevice(&device));
-    if (device != gpu_id_) {
-      ReportCUDAErrors(cudaSetDevice(gpu_id_));
-    }
+    ReportCUDAErrors(cudaSetDevice(gpu_id_));
     return std::make_unique<CudaNetworkComputation<DataType>>(this, wdl_,
                                                               moves_left_);
   }
@@ -1245,7 +1279,7 @@ void CudaNetworkComputation<DataType>::CaptureGraph(
 template <typename DataType>
 void CudaNetworkComputation<DataType>::ComputeBlocking() {
   LCTRACE_FUNCTION_SCOPE;
-  if (GetBatchSize() == 0) return;
+  assert(GetBatchSize() >= 1);
   if (inputs_outputs_->cuda_graphs_[GetBatchSize() - 1]) {
     std::unique_lock<std::mutex> lock = network_->LockEval();
     network_->GraphLaunch(inputs_outputs_.get(), GetBatchSize());
