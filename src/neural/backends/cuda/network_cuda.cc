@@ -88,7 +88,8 @@ std::vector<std::vector<float>> BuildChessFormerMasks(const WeightsFile& file, i
                         else if (piece == "queen" && (dr == 0 || dc == 0 || dr == dc)) valid = true;
                         else if (piece == "king" && (dr <= 1 && dc <= 1)) valid = true;
                         else if (piece == "pawn" && ((dr == 1 && dc <= 1) || (dr == 2 && dc == 0))) valid = true;
-
+                        else if (piece == 'color' && ((r1 + c1) % 2 == (r2 + c2) % 2)) valid = true;
+                
                         if (!valid) {
                             layer_masks[l][(head_idx * 64 * 64) + (i * 64) + j] = -10000.0f;
                         }
