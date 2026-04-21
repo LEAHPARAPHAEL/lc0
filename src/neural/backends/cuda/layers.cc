@@ -1487,7 +1487,7 @@ EncoderBlock<DataType>::EncoderBlock(
     int size, float alpha, DataType* smolgen_global_scratch,
     int smolgen_global_size, int max_batch_size, ActivationFunction smolgen_act,
     ActivationFunction ffn_act, float default_eps, bool use_gemm_ex,
-    bool fused_mha)
+    bool fused_mha, const std::vector<float>& attention_mask = {})
     : embedding_op_size_(size),
       encoder_heads_(heads),
       alpha_(alpha),
@@ -1513,6 +1513,11 @@ EncoderBlock<DataType>::EncoderBlock(
 
   allocAndUpload<DataType>(&mha_v_w, cpu_weights.mha.v_w, scratch);
   allocAndUpload<DataType>(&mha_v_b, cpu_weights.mha.v_b, scratch);
+
+  if (!attention_mask.empty()) {
+    has_attention_mask_ = true;
+    allocAndUpload<DataType>(&attention_mask_, attention_mask, scratch);
+  }
 
   // big allocation to hold qkv weights one after the other
   {
@@ -1775,9 +1780,29 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
 
 #ifdef USE_CUTLASS
   if (use_fused_mha_) {
-    // TODO: check if we need skip in a different tensor than same tensor as
-    // output!
-    fusedMHA(buffer2, mha_q, mha_k, mha_v, has_smolgen_ ? buffer2 : nullptr, N,
+    void* skip_ptr = nullptr;
+    long long bias_strideB = 0;
+
+    if (has_smolgen_ && has_attention_mask_) {
+        // Both are active. Smolgen is already sitting in buffer2.
+        // We add the mask to the smolgen buffer before passing it to CUTLASS.
+        AddAttentionMask<DataType>(N, encoder_heads_, buffer2, attention_mask_, stream);
+        skip_ptr = buffer2;
+        bias_strideB = encoder_heads_ * 64 * 64; 
+    } 
+    else if (has_smolgen_) {
+        // Standard LC0 behavior
+        skip_ptr = buffer2;
+        bias_strideB = encoder_heads_ * 64 * 64;
+    } 
+    else if (has_attention_mask_) {
+        // Mask only! By passing stride 0, CUTLASS automatically broadcasts 
+        // the single mask across all N batches for free!
+        skip_ptr = attention_mask_;
+        bias_strideB = 0;
+    }
+
+    fusedMHA(buffer2, mha_q, mha_k, mha_v, skip_ptr, bias_strideB, N,
              encoder_heads_, depth, stream);
   } else
 #endif
@@ -1823,6 +1848,9 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
 
     // attention_weights = tf.nn.softmax(scaled_attention_logits, axis = -1)
     // attention_weights -> buffer1
+    if (has_attention_mask_) {
+        AddAttentionMask<DataType>(N, encoder_heads_, buffer1, attention_mask_, stream);
+    }
     if (has_smolgen_) {
       // Add smolgen weights to the scaled matmul_qk attention logits before
       // softmax.
@@ -2023,6 +2051,9 @@ EncoderBlock<DataType>::~EncoderBlock() {
     ReportCUDAErrors(cudaFree(smol_ln2_gammas));
     ReportCUDAErrors(cudaFree(smol_ln2_betas));
   }
+  if (has_attention_mask_) {
+    ReportCUDAErrors(cudaFree(attention_mask_));
+  }
 }
 
 template <typename DataType>
@@ -2061,7 +2092,8 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
                                        int num_res_blocks, int input_c,
                                        int max_batch_size,
                                        bool is_pe_dense_embedding,
-                                       bool use_gemm_ex, bool fused_mha)
+                                       bool use_gemm_ex, bool fused_mha,
+                                       const std::vector<std::vector<float>>& layer_masks = {})
     : BaseLayer<DataType>(weights.ip_emb_b.size(), 8, 8, nullptr, false,
                           use_gemm_ex),
       embedding_op_size_(weights.ip_emb_b.size()),
@@ -2123,12 +2155,15 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
 
   int num_encoders = weights.encoder.size();
   float alpha = (float)pow(2.0 * num_encoders, -0.25);
-  for (const auto& enc : weights.encoder) {
+  for (int i = 0; i < weights.encoder.size(); ++i) {
+    const auto& enc = weights.encoder[i];
+    std::vector<float> mask = (i < layer_masks.size()) ? layer_masks[i] : std::vector<float>();
     EncoderBlock<DataType>* pW = new EncoderBlock<DataType>(
         enc, scratch, encoder_head_count_, embedding_op_size_, alpha,
         smolgen_global_, smolgen_global_size_, max_batch_size,
         activations_.smolgen_activation, activations_.ffn_activation,
-        is_pe_dense_embedding_ ? 1e-3 : 1e-6, use_gemm_ex, use_fused_mha_);
+        is_pe_dense_embedding_ ? 1e-3 : 1e-6, use_gemm_ex, use_fused_mha_, 
+        mask);
     encoder_weights_.emplace_back(pW);
   }
 }

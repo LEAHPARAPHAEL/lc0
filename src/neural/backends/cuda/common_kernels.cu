@@ -45,6 +45,32 @@ constexpr int kInputPlanes = 112;
 /////////////////////////////////////////////////////////////////////////////
 
 template <typename T>
+__global__ void AddAttentionMaskKernel(int N, int heads, int board_sq, T* logits, const T* mask) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * heads * board_sq;
+    
+    if (idx < total_elements) {
+        // Find which head and which board square we are in, ignoring the batch 'N'
+        int head_and_sq = idx % (heads * board_sq);
+        logits[idx] = logits[idx] + mask[head_and_sq];
+    }
+}
+
+template <typename T>
+void AddAttentionMask(int N, int heads, T* logits, const T* mask, cudaStream_t stream) {
+    int board_sq = 64 * 64;
+    int total_elements = N * heads * board_sq;
+    int threads = 256;
+    int blocks = (total_elements + threads - 1) / threads;
+    
+    AddAttentionMaskKernel<<<blocks, threads, 0, stream>>>(N, heads, board_sq, logits, mask);
+}
+
+// Instantiate for both precisions
+template void AddAttentionMask<half>(int N, int heads, half* logits, const half* mask, cudaStream_t stream);
+template void AddAttentionMask<float>(int N, int heads, float* logits, const float* mask, cudaStream_t stream);
+
+template <typename T>
 __global__ void addVectors_kernel(T* c, T* a, T* b, int size, int asize,
                                   int bsize, ActivationFunction activation) {
   int i = threadIdx.x + blockDim.x * blockIdx.x;

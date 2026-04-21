@@ -342,7 +342,8 @@ class EncoderBlock {
                DataType* smolgen_global_scratch, int smolgen_global_size,
                int max_batch_size, ActivationFunction smolgen_act,
                ActivationFunction ffn_act, float default_eps, bool use_gemm_ex,
-               bool fused_mha);
+               bool fused_mha, 
+               const std::vector<float>& attention_mask = {});
   ~EncoderBlock();
 
   void Eval(int N, DataType* inpop, DataType* scratch0, DataType* scratch1,
@@ -397,6 +398,9 @@ class EncoderBlock {
   const int max_batch_size_;
   const bool use_fused_mha_;
   const bool use_gemm_ex_;
+
+  DataType* attention_mask_ = nullptr;
+  bool has_attention_mask_ = false;
 };
 
 // The Attention policy head implementation
@@ -483,7 +487,8 @@ class AttentionBody : public BaseLayer<DataType> {
   AttentionBody(const MultiHeadWeights& weights, void* scratch,
                 Activations activations, int num_res_blocks, int input_c,
                 int max_batch_size, bool is_pe_dense_embedding,
-                bool use_gemm_ex, bool fused_mha);
+                bool use_gemm_ex, bool fused_mha,
+                const std::vector<std::vector<float>>& layer_masks = {});
   ~AttentionBody();
   void Eval(int N, DataType* output, const DataType* input,
             const DataType* input2, void* scratch, size_t scratch_size,

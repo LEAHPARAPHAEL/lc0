@@ -36,6 +36,7 @@ namespace cudnn_backend {
 
 template <bool bias>
 void fusedMHACutlass(void* output, void* q, void* k, void* v, void* skip,
+                     long long bias_strideB,
                      int batch_size, int num_heads, int depth,
                      cudaStream_t stream) {
   cutlass::half_t* mha_q = (cutlass::half_t*)q;
@@ -91,7 +92,8 @@ void fusedMHACutlass(void* output, void* q, void* k, void* v, void* skip,
 
     p.bias_strideH = 64 * 64;
     p.bias_strideM = 64;
-    p.bias_strideB = num_heads * p.bias_strideH;
+    //p.bias_strideB = num_heads * p.bias_strideH;
+    p.bias_strideB = bias_strideB;
   }
 
   constexpr auto kernel_fn = attention_kernel_batched_impl<Attention>;
@@ -110,13 +112,15 @@ void fusedMHACutlass(void* output, void* q, void* k, void* v, void* skip,
 }
 
 void fusedMHA(void* output, void* mha_q, void* mha_k, void* mha_v, void* skip,
+              long long bias_strideB,
               int batch_size, int num_heads, int depth, cudaStream_t stream) {
   if (skip == nullptr) {
-    fusedMHACutlass<false>(output, mha_q, mha_k, mha_v, skip, batch_size,
-                           num_heads, depth, stream);
+    fusedMHACutlass<false>(output, mha_q, mha_k, mha_v, skip, 
+                           bias_strideB, 
+                           batch_size, num_heads, depth, stream);
   } else {
-    fusedMHACutlass<true>(output, mha_q, mha_k, mha_v, skip, batch_size,
-                          num_heads, depth, stream);
+    fusedMHACutlass<true>(output, mha_q, mha_k, mha_v, skip, 
+                          bias_strideB, batch_size, num_heads, depth, stream);
   }
 }
 

@@ -51,6 +51,57 @@
 #undef cudaEventRecordExternal
 #endif
 
+namespace {
+std::vector<std::vector<float>> BuildChessFormerMasks(const WeightsFile& file, int num_heads, int num_layers) {
+    // Initialize N empty masks (defaulting to 0.0f)
+    std::vector<std::vector<float>> layer_masks(num_layers, std::vector<float>(num_heads * 64 * 64, 0.0f));
+    
+    auto network_format = file.format().network_format();
+    for (const auto& am : network_format.attention_masks()) {
+        std::string piece = am.piece_type();
+        
+        // Resolve layers
+        std::vector<uint32_t> target_layers;
+        if (am.layer_indices_size() == 0) {
+            for (int i = 0; i < num_layers; ++i) target_layers.push_back(i);
+        } else {
+            for (uint32_t l : am.layer_indices()) target_layers.push_back(l);
+        }
+
+        for (uint32_t l : target_layers) {
+            if (l >= num_layers) continue;
+
+            for (uint32_t head_idx : am.head_indices()) {
+                if (head_idx >= num_heads) continue;
+
+                for (int i = 0; i < 64; ++i) {
+                    int r1 = i / 8; int c1 = i % 8;
+                    for (int j = 0; j < 64; ++j) {
+                        int r2 = j / 8; int c2 = j % 8;
+                        int dr = std::abs(r1 - r2); int dc = std::abs(c1 - c2);
+
+                        bool valid = false;
+                        if (i == j) valid = true;
+                        else if (piece == "rook" && (dr == 0 || dc == 0)) valid = true;
+                        else if (piece == "bishop" && (dr == dc)) valid = true;
+                        else if (piece == "knight" && ((dr == 2 && dc == 1) || (dr == 1 && dc == 2))) valid = true;
+                        else if (piece == "queen" && (dr == 0 || dc == 0 || dr == dc)) valid = true;
+                        else if (piece == "king" && (dr <= 1 && dc <= 1)) valid = true;
+                        else if (piece == "pawn" && ((dr == 1 && dc <= 1) || (dr == 2 && dc == 0))) valid = true;
+                        else if (piece == "color" && ((r1 + c1) % 2 == (r2 + c2) % 2)) valid = true;
+                
+                        if (!valid) {
+                            layer_masks[l][(head_idx * 64 * 64) + (i * 64) + j] = -10000.0f;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return layer_masks;
+}
+} 
+
 namespace lczero {
 using namespace cudnn_backend;
 
@@ -491,13 +542,16 @@ class CudaNetwork : public Network {
               : static_cast<ActivationFunction>(ffn_activation);
       activations.default_activation = act;
 
+      std::vector<std::vector<float>> attention_masks = 
+        BuildChessFormerMasks(file, weights.encoder_head_count, num_encoder_blocks_);
+
       auto attention_body = std::make_unique<AttentionBody<DataType>>(
           weights, scratch_mem_, activations, numBlocks_,
           numBlocks_ > 0 ? kNumFilters : kInputPlanes, max_batch_size_,
           static_cast<InputEmbedding>(
               file.format().network_format().input_embedding()) ==
               InputEmbedding::INPUT_EMBEDDING_PE_DENSE,
-          use_gemm_ex, use_fused_mha);
+          use_gemm_ex, use_fused_mha, attention_masks);
       network_.emplace_back(std::move(attention_body));
 
       encoder_last_ = getLastLayer();

@@ -165,7 +165,10 @@ void genOffsetPointers(T** offsets, int heads, int max_batch, int depth,
                        cudaStream_t stream);
 
 void fusedMHA(void* output, void* mha_q, void* mha_k, void* mha_v, void* skip,
+              long long bias_strideB,
               int batch_size, int num_heads, int depth, cudaStream_t stream);
 
+template <typename T>
+void AddAttentionMask(int N, int heads, T* logits, const T* mask, cudaStream_t stream);
 }  // namespace cudnn_backend
 }  // namespace lczero
