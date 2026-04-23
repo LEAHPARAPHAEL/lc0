@@ -52,13 +52,13 @@
 #endif
 
 namespace {
-std::vector<std::vector<float>> BuildChessFormerMasks(const WeightsFile& file, int num_heads, int num_layers) {
+std::vector<std::vector<float>> BuildChessFormerMasks(const lczero::WeightsFile& file, int num_heads, int num_layers) {
     // Initialize N empty masks (defaulting to 0.0f)
     std::vector<std::vector<float>> layer_masks(num_layers, std::vector<float>(num_heads * 64 * 64, 0.0f));
     
     auto network_format = file.format().network_format();
     for (const auto& am : network_format.attention_masks()) {
-        std::string piece = am.piece_type();
+        auto piece = am.piece_type();
         
         // Resolve layers
         std::vector<uint32_t> target_layers;
@@ -69,10 +69,10 @@ std::vector<std::vector<float>> BuildChessFormerMasks(const WeightsFile& file, i
         }
 
         for (uint32_t l : target_layers) {
-            if (l >= num_layers) continue;
+            if (l >= static_cast<uint32_t>(num_layers)) continue;
 
             for (uint32_t head_idx : am.head_indices()) {
-                if (head_idx >= num_heads) continue;
+                if (head_idx >= static_cast<uint32_t>(num_heads)) continue;
 
                 for (int i = 0; i < 64; ++i) {
                     int r1 = i / 8; int c1 = i % 8;

@@ -1487,7 +1487,7 @@ EncoderBlock<DataType>::EncoderBlock(
     int size, float alpha, DataType* smolgen_global_scratch,
     int smolgen_global_size, int max_batch_size, ActivationFunction smolgen_act,
     ActivationFunction ffn_act, float default_eps, bool use_gemm_ex,
-    bool fused_mha, const std::vector<float>& attention_mask = {})
+    bool fused_mha, const std::vector<float>& attention_mask)
     : embedding_op_size_(size),
       encoder_heads_(heads),
       alpha_(alpha),
@@ -2093,7 +2093,7 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
                                        int max_batch_size,
                                        bool is_pe_dense_embedding,
                                        bool use_gemm_ex, bool fused_mha,
-                                       const std::vector<std::vector<float>>& layer_masks = {})
+                                       const std::vector<std::vector<float>>& layer_masks)
     : BaseLayer<DataType>(weights.ip_emb_b.size(), 8, 8, nullptr, false,
                           use_gemm_ex),
       embedding_op_size_(weights.ip_emb_b.size()),
@@ -2155,7 +2155,7 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
 
   int num_encoders = weights.encoder.size();
   float alpha = (float)pow(2.0 * num_encoders, -0.25);
-  for (int i = 0; i < weights.encoder.size(); ++i) {
+  for (size_t i = 0; i < weights.encoder.size(); ++i) {
     const auto& enc = weights.encoder[i];
     std::vector<float> mask = (i < layer_masks.size()) ? layer_masks[i] : std::vector<float>();
     EncoderBlock<DataType>* pW = new EncoderBlock<DataType>(
