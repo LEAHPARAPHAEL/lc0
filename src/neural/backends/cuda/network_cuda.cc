@@ -52,6 +52,7 @@
 #endif
 
 namespace {
+/*
 std::vector<std::vector<float>> BuildChessFormerMasks(const lczero::WeightsFile& file, int num_heads, int num_layers) {
     // Initialize N empty masks (defaulting to 0.0f)
     std::vector<std::vector<float>> layer_masks(num_layers, std::vector<float>(num_heads * 64 * 64, 0.0f));
@@ -100,7 +101,58 @@ std::vector<std::vector<float>> BuildChessFormerMasks(const lczero::WeightsFile&
     }
     return layer_masks;
 }
-} 
+*/
+std::vector<std::vector<float>> BuildChessFormerMasks(const lczero::WeightsFile& file, int num_heads, int num_layers) {
+    std::vector<std::vector<float>> layer_masks(num_layers);
+    
+    auto network_format = file.format().network_format();
+    for (const auto& am : network_format.attention_masks()) {
+        std::string piece(am.piece_type());
+
+        std::vector<uint32_t> target_layers;
+        if (am.layer_indices_size() == 0) {
+            for (uint32_t i = 0; i < static_cast<uint32_t>(num_layers); ++i) target_layers.push_back(i);
+        } else {
+            for (uint32_t l : am.layer_indices()) target_layers.push_back(l);
+        }
+
+        for (uint32_t l : target_layers) {
+            if (l >= static_cast<uint32_t>(num_layers)) continue;
+
+            for (uint32_t head_idx : am.head_indices()) {
+                if (head_idx >= static_cast<uint32_t>(num_heads)) continue;
+
+                for (int i = 0; i < 64; ++i) {
+                    int r1 = i / 8; int c1 = i % 8;
+                    for (int j = 0; j < 64; ++j) {
+                        int r2 = j / 8; int c2 = j % 8;
+                        int dr = std::abs(r1 - r2); int dc = std::abs(c1 - c2);
+
+                        bool valid = false;
+                        if (i == j) valid = true;
+                        else if (piece == "rook" && (dr == 0 || dc == 0)) valid = true;
+                        else if (piece == "bishop" && (dr == dc)) valid = true;
+                        else if (piece == "knight" && ((dr == 2 && dc == 1) || (dr == 1 && dc == 2))) valid = true;
+                        else if (piece == "queen" && (dr == 0 || dc == 0 || dr == dc)) valid = true;
+                        else if (piece == "king" && (dr <= 1 && dc <= 1)) valid = true;
+                        else if (piece == "pawn" && ((dr == 1 && dc <= 1) || (dr == 2 && dc == 0))) valid = true;
+                        else if (piece == "color" && ((r1 + c1) % 2 == (r2 + c2) % 2)) valid = true;
+                
+                        if (!valid) {
+                            if (layer_masks[l].empty()) {
+                                layer_masks[l].assign(num_heads * 64 * 64, 0.0f);
+                            }
+                            
+                            layer_masks[l][(head_idx * 64 * 64) + (i * 64) + j] = -10000.0f;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return layer_masks;
+}
+}
 
 namespace lczero {
 using namespace cudnn_backend;
