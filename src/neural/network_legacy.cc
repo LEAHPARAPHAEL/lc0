@@ -142,20 +142,20 @@ BaseWeights::MHA::MHA(const pblczero::Weights::MHA& mha)
       dense_w(LayerAdapter(mha.dense_w()).as_vector()),
       dense_b(LayerAdapter(mha.dense_b()).as_vector()),
       smolgen(Smolgen(mha.smolgen())),
-      has_smolgen(mha.has_smolgen()),
+      has_smolgen(mha.has_smolgen()) {
+      if (mha.has_rpe_q() || mha.has_rpe_k() || mha.has_rpe_v()) {
+        throw Exception("RPE weights file not supported.");
+      }
+    }
+      
+    /*
+    ,
       rpe_q(mha.has_rpe_q() ? LayerAdapter(mha.rpe_q()).as_vector() : Vec()),
       rpe_k(mha.has_rpe_k() ? LayerAdapter(mha.rpe_k()).as_vector() : Vec()),
       rpe_v(mha.has_rpe_v() ? LayerAdapter(mha.rpe_v()).as_vector() : Vec()),
       has_rpe_q(mha.has_rpe_q()),
       has_rpe_k(mha.has_rpe_k()),
       has_rpe_v(mha.has_rpe_v()) {}
-      
-    /*
-    {
-      if (mha.has_rpe_q() || mha.has_rpe_k() || mha.has_rpe_v()) {
-        throw Exception("RPE weights file not supported.");
-      }
-    }
     */
 
 

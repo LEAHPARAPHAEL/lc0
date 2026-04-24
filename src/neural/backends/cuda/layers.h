@@ -402,12 +402,14 @@ class EncoderBlock {
   DataType* attention_mask_ = nullptr;
   bool has_attention_mask_ = false;
 
+  /*
   DataType* rpe_q_expanded_ = nullptr;
   DataType* rpe_k_expanded_ = nullptr;
   DataType* rpe_v_expanded_ = nullptr;
   bool has_rpe_q_ = false;
   bool has_rpe_k_ = false;
   bool has_rpe_v_ = false;
+  */
 };
 
 // The Attention policy head implementation
