@@ -170,5 +170,15 @@ void fusedMHA(void* output, void* mha_q, void* mha_k, void* mha_v, void* skip,
 
 template <typename T>
 void AddAttentionMask(int N, int heads, T* logits, const T* mask, cudaStream_t stream);
+
+template <typename DataType>
+void ComputeRPELogits(int batch_size, int heads, int head_depth,
+                      const DataType* x, const DataType* rpe_expanded,
+                      DataType* output_bias, bool is_k, cudaStream_t stream);
+
+template <typename DataType>
+void ComputeRPEValue(int batch_size, int heads, int head_depth,
+                     const DataType* attn, const DataType* rpe_v_expanded,
+                     DataType* output, cudaStream_t stream);
 }  // namespace cudnn_backend
 }  // namespace lczero

@@ -70,6 +70,87 @@ void AddAttentionMask(int N, int heads, T* logits, const T* mask, cudaStream_t s
 template void AddAttentionMask<half>(int N, int heads, half* logits, const half* mask, cudaStream_t stream);
 template void AddAttentionMask<float>(int N, int heads, float* logits, const float* mask, cudaStream_t stream);
 
+template <typename DataType>
+__global__ void ComputeRPELogitsKernel(
+    int batch_size, int heads, int head_depth,
+    const DataType* x,             // [N, 64, H, D]
+    const DataType* rpe_expanded,  // [H, Q, K, D]
+    DataType* output_bias,         // [N, H, Q, K]
+    bool is_k) 
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * heads * 64 * 64;
+    if (idx >= total_elements) return;
+
+    int k_idx = idx % 64;
+    int q_idx = (idx / 64) % 64;
+    int h_idx = (idx / 4096) % heads;
+    int b_idx = idx / (heads * 4096);
+
+    int rpe_base = ((h_idx * 64 + q_idx) * 64 + k_idx) * head_depth;
+    
+    int x_base;
+    if (!is_k) {
+        x_base = ((b_idx * 64 + q_idx) * heads + h_idx) * head_depth;
+    } else {
+        x_base = ((b_idx * 64 + k_idx) * heads + h_idx) * head_depth;
+    }
+
+    float sum = 0.0f;
+    for (int d = 0; d < head_depth; ++d) {
+        sum += static_cast<float>(x[x_base + d]) * static_cast<float>(rpe_expanded[rpe_base + d]);
+    }
+
+    output_bias[idx] = static_cast<DataType>(static_cast<float>(output_bias[idx]) + sum);
+}
+
+template <typename DataType>
+__global__ void ComputeRPEValueKernel(
+    int batch_size, int heads, int head_depth,
+    const DataType* attn,          // [N, H, Q, K]
+    const DataType* rpe_v_expanded,// [H, Q, D, K] (Transposed for K-coalescing!)
+    DataType* output)              // [N, 64, H, D]
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * heads * 64 * head_depth;
+    if (idx >= total_elements) return;
+
+    int d_idx = idx % head_depth;
+    int h_idx = (idx / head_depth) % heads;
+    int q_idx = (idx / (head_depth * heads)) % 64;
+    int b_idx = idx / (head_depth * heads * 64);
+
+    int attn_base = (b_idx * heads + h_idx) * 64 * 64 + q_idx * 64;
+    int rpe_v_base = ((h_idx * 64 + q_idx) * head_depth + d_idx) * 64;
+
+    float sum = 0.0f;
+    for (int k = 0; k < 64; ++k) {
+        // GPU memory access along 'k' is now perfectly sequential for both arrays
+        sum += static_cast<float>(attn[attn_base + k]) * static_cast<float>(rpe_v_expanded[rpe_v_base + k]);
+    }
+
+    output[idx] = static_cast<DataType>(static_cast<float>(output[idx]) + sum);
+}
+
+template <typename DataType>
+void ComputeRPELogits(int batch_size, int heads, int head_depth, const DataType* x, const DataType* rpe_expanded, DataType* output_bias, bool is_k, cudaStream_t stream) {
+    int total = batch_size * heads * 64 * 64;
+    ComputeRPELogitsKernel<DataType><<<(total + 255) / 256, 256, 0, stream>>>(batch_size, heads, head_depth, x, rpe_expanded, output_bias, is_k);
+}
+
+template <typename DataType>
+void ComputeRPEValue(int batch_size, int heads, int head_depth, const DataType* attn, const DataType* rpe_v_expanded, DataType* output, cudaStream_t stream) {
+    int total = batch_size * heads * 64 * head_depth;
+    ComputeRPEValueKernel<DataType><<<(total + 255) / 256, 256, 0, stream>>>(batch_size, heads, head_depth, attn, rpe_v_expanded, output);
+}
+
+// Instantiate
+template void ComputeRPELogits<float>(int, int, int, const float*, const float*, float*, bool, cudaStream_t);
+template void ComputeRPELogits<half>(int, int, int, const half*, const half*, half*, bool, cudaStream_t);
+template void ComputeRPEValue<float>(int, int, int, const float*, const float*, float*, cudaStream_t);
+template void ComputeRPEValue<half>(int, int, int, const half*, const half*, half*, cudaStream_t);
+
+
 template <typename T>
 __global__ void addVectors_kernel(T* c, T* a, T* b, int size, int asize,
                                   int bsize, ActivationFunction activation) {

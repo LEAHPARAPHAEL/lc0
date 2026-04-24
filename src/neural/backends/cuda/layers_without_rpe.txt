@@ -1593,66 +1593,6 @@ EncoderBlock<DataType>::EncoderBlock(
     // GPU memory already allocated in AttentionBody.
     smol_global = smolgen_global_scratch;
   }
-
-  int d_model = mha_q_size_;
-  int depth = d_model / encoder_heads_;
-  int H = encoder_heads_;
-  int D = depth;
-
-  has_rpe_q_ = cpu_weights.mha.has_rpe_q;
-  has_rpe_k_ = cpu_weights.mha.has_rpe_k;
-  has_rpe_v_ = cpu_weights.mha.has_rpe_v;
-
-  if (has_rpe_q_) {
-      std::vector<float> rpe_q_exp(H * 64 * 64 * D, 0.0f);
-      for (int h = 0; h < H; ++h) {
-          for (int d = 0; d < D; ++d) {
-              int weight_idx_base = (d * H + h) * 225;
-              for (int from = 0; from < 64; ++from) {
-                  for (int to = 0; to < 64; ++to) {
-                      int dist_idx = ((from / 8) - (to / 8) + 7) * 15 + ((from % 8) - (to % 8) + 7);
-                      int out_idx = ((h * 64 + from) * 64 + to) * D + d;
-                      rpe_q_exp[out_idx] = cpu_weights.mha.rpe_q[weight_idx_base + dist_idx];
-                  }
-              }
-          }
-      }
-      allocAndUpload<DataType>(&rpe_q_expanded_, rpe_q_exp, scratch);
-  }
-
-  if (has_rpe_k_) {
-      std::vector<float> rpe_k_exp(H * 64 * 64 * D, 0.0f);
-      for (int h = 0; h < H; ++h) {
-          for (int d = 0; d < D; ++d) {
-              int weight_idx_base = (d * H + h) * 225;
-              for (int from = 0; from < 64; ++from) {
-                  for (int to = 0; to < 64; ++to) {
-                      int dist_idx = ((from / 8) - (to / 8) + 7) * 15 + ((from % 8) - (to % 8) + 7);
-                      int out_idx = ((h * 64 + from) * 64 + to) * D + d;
-                      rpe_k_exp[out_idx] = cpu_weights.mha.rpe_k[weight_idx_base + dist_idx];
-                  }
-              }
-          }
-      }
-      allocAndUpload<DataType>(&rpe_k_expanded_, rpe_k_exp, scratch);
-  }
-
-  if (has_rpe_v_) {
-      std::vector<float> rpe_v_exp(H * 64 * D * 64, 0.0f);
-      for (int h = 0; h < H; ++h) {
-          for (int d = 0; d < D; ++d) {
-              int weight_idx_base = (d * H + h) * 225;
-              for (int from = 0; from < 64; ++from) {
-                  for (int to = 0; to < 64; ++to) {
-                      int dist_idx = ((from / 8) - (to / 8) + 7) * 15 + ((from % 8) - (to % 8) + 7);
-                      int out_idx = ((h * 64 + from) * D + d) * 64 + to;
-                      rpe_v_exp[out_idx] = cpu_weights.mha.rpe_v[weight_idx_base + dist_idx];
-                  }
-              }
-          }
-      }
-      allocAndUpload<DataType>(&rpe_v_expanded_, rpe_v_exp, scratch);
-  }
 }
 
 template <typename DataType>
@@ -1845,34 +1785,26 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
   // shape(k)[-1] = depth
   float factor = 1.0f / sqrt((float)depth);
 
-  bool has_bias = has_smolgen_ || has_rpe_q_ || has_rpe_k_;
-  
-  if (has_bias) {
-      if (!has_smolgen_) {
-          ReportCUDAErrors(cudaMemsetAsync(buffer2, 0, N * encoder_heads_ * 64 * 64 * sizeof(DataType), stream));
-      }
-      if (has_rpe_q_) {
-          ComputeRPELogits(N, encoder_heads_, depth, mha_q, rpe_q_expanded_, buffer2, false, stream);
-      }
-      if (has_rpe_k_) {
-          ComputeRPELogits(N, encoder_heads_, depth, mha_k, rpe_k_expanded_, buffer2, true, stream);
-      }
-  }
-
 #ifdef USE_CUTLASS
-  // Force fallback to CuBLAS if rpe_v is present! Cutlass cannot handle rpe_v.
-  if (use_fused_mha_ && !has_rpe_v_) {
+  if (use_fused_mha_) {
     void* skip_ptr = nullptr;
     long long bias_strideB = 0;
 
-    if (has_bias) {
-        if (has_attention_mask_) {
-            AddAttentionMask<DataType>(N, encoder_heads_, buffer2, attention_mask_, stream);
-        }
+    if (has_smolgen_ && has_attention_mask_) {
+        // Both are active. Smolgen is already sitting in buffer2.
+        // We add the mask to the smolgen buffer before passing it to CUTLASS.
+        AddAttentionMask<DataType>(N, encoder_heads_, buffer2, attention_mask_, stream);
         skip_ptr = buffer2;
         bias_strideB = encoder_heads_ * 64 * 64; 
-    } else if (has_attention_mask_) {
-        // Mask only - Cutlass broadcasts it automatically
+    } 
+    else if (has_smolgen_) {
+        // Standard LC0 behavior
+        skip_ptr = buffer2;
+        bias_strideB = encoder_heads_ * 64 * 64;
+    } 
+    else if (has_attention_mask_) {
+        // Mask only! By passing stride 0, CUTLASS automatically broadcasts 
+        // the single mask across all N batches for free!
         skip_ptr = attention_mask_;
         bias_strideB = 0;
     }
@@ -1902,45 +1834,55 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
 
     cublasXGemmBatched<DataType>(
         cublas, CUBLAS_OP_T, CUBLAS_OP_N, 64 /*M*/, 64 /*N*/,
-        depth /*K*/,  
-        factor,       
-        *offset_pointers,  
-        d_model /*LDA*/,   
-        *offset_pointers + encoder_heads_ * max_batch_size_,  
-        d_model /*LDB*/,  
+        depth /*K*/,  // A/B, and M/N are swapped for row-major to col-major
+                      // transform
+        factor,       // to handle "/ tf.math.sqrt(dk)"
+        *offset_pointers,  // mha_k + offset /*A*/,
+        d_model /*LDA*/,   // (d_model = depth * encoder_heads_) to skip over
+                           // other "depth" slices / heads
+        // 64 * d_model,     /*strideA*/
+        *offset_pointers +
+            encoder_heads_ * max_batch_size_,  // mha_q + offset /*B*/,
+        d_model /*LDB*/,  // to skip over other other "depth" slices / heads
+        // 64 * d_model,     /*strideB*/
         0.0f,
-        *offset_pointers + encoder_heads_ * max_batch_size_ * 2,  
+        *offset_pointers + encoder_heads_ * max_batch_size_ *
+                               2,  // buffer1 + outOffset /*C*/,  // output
+                                   // (matmul_qk) goes to buffer1
         64 /*LDC*/,
+        // 64 * 64 /*strideC*/,
         N * encoder_heads_);
 
     // attention_weights = tf.nn.softmax(scaled_attention_logits, axis = -1)
+    // attention_weights -> buffer1
     if (has_attention_mask_) {
         AddAttentionMask<DataType>(N, encoder_heads_, buffer1, attention_mask_, stream);
     }
-    
-    if (has_bias) {
+    if (has_smolgen_) {
+      // Add smolgen weights to the scaled matmul_qk attention logits before
+      // softmax.
       Softmax(encoder_heads_ * N * 64, 64, buffer1, buffer1, buffer2, stream);
     } else {
       Softmax(encoder_heads_ * N * 64, 64, buffer1, buffer1,
               (const DataType*)nullptr, stream);
     }
 
-    // Multiply by V matrix
     cublasXGemmBatched<DataType>(
         cublas, CUBLAS_OP_N, CUBLAS_OP_N, depth /*M*/, 64 /*N*/, 64 /*K*/, 1.0f,
-        *offset_pointers + encoder_heads_ * max_batch_size_ * 3,  // mha_v
-        d_model /*LDA*/,           
-        *offset_pointers + encoder_heads_ * max_batch_size_ * 2,  // buffer1
-        64 /*LDB*/,                
+        *offset_pointers + encoder_heads_ * max_batch_size_ *
+                               3,  // mha_v + offset /*A*/,  // "v" matrix
+        d_model /*LDA*/,           // to skip over other "depth" slices / heads
+        // 64 * d_model,          /*strideA*/
+        *offset_pointers + encoder_heads_ * max_batch_size_ *
+                               2,  // buffer1 + weightsOffset /*B*/,
+        64 /*LDB*/,                // 64 * 64, /*strideB*/
         0.0f,
-        *offset_pointers + encoder_heads_ * max_batch_size_ * 4,  // buffer2
+        *offset_pointers +
+            encoder_heads_ * max_batch_size_ *
+                4,  // buffer2 + offset /*C*/,  // output goes to buffer2
         d_model /*LDC*/,
+        // 64 * d_model /*strideC*/,
         N * encoder_heads_);
-
-
-    if (has_rpe_v_) {
-        ComputeRPEValue(N, encoder_heads_, depth, buffer1, rpe_v_expanded_, buffer2, stream);
-    }
   }
 
   // #final dense layer (mha_dense), buffer2 -> buffer1
@@ -2119,9 +2061,6 @@ EncoderBlock<DataType>::~EncoderBlock() {
   if (has_attention_mask_) {
     ReportCUDAErrors(cudaFree(attention_mask_));
   }
-  if (has_rpe_q_) ReportCUDAErrors(cudaFree(rpe_q_expanded_));
-  if (has_rpe_k_) ReportCUDAErrors(cudaFree(rpe_k_expanded_));
-  if (has_rpe_v_) ReportCUDAErrors(cudaFree(rpe_v_expanded_));
 }
 
 template <typename DataType>
