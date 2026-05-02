@@ -461,6 +461,7 @@ if get_option('build_backends')
   cu_blas = cc.find_library('cublas', dirs: cudnn_libdirs, required: false)
   cu_dnn = cc.find_library('cudnn', dirs: cudnn_libdirs, required: false)
   cu_dart = cc.find_library('cudart', dirs: cudnn_libdirs, required: false)
+  cu_nvrtc = cc.find_library('nvrtc', dirs: cudnn_libdirs, required: false)
   nvcc = find_program(nvcc_paths,
                       required: false)
   nvcc_ok = false
@@ -540,7 +541,7 @@ if get_option('build_backends')
     deps += [cu_blas, cu_dart]
     cuda_files = ['src/neural/backends/cuda/layers.cc']
     if get_option('cudnn') and cu_dnn.found()
-      deps += cu_dnn
+      deps += [cu_dnn, cu_nvrtc]
       cuda_files += 'src/neural/backends/cuda/network_cudnn.cc'
       cuda_files += 'src/neural/backends/cuda/network_cuda.cc' # To support newer nets.
       add_project_arguments('-DUSE_CUDNN', language : 'cpp')

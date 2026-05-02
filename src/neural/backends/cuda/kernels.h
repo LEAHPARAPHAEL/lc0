@@ -171,6 +171,16 @@ void fusedMHA(void* output, void* mha_q, void* mha_k, void* mha_v, void* skip,
 template <typename T>
 void AddAttentionMask(int N, int heads, T* logits, const T* mask, cudaStream_t stream);
 
+void convert_float_to_half2(const float* input, half2* output, int C, int H, int W);
+
+void FusedDWPWevalHalf2(int N, int C_in, int C, half* output, const half* input, void* scratch,
+                              const half2* w1, const half2* b1, const half2* w2, cudaStream_t stream);
+
+void DepthwiseEval(int N, int C_in, MaskType mask_type, half* output, const half* input, void* scratch,
+                              const half2* w1, cudaStream_t stream);
+
+void convert_half_to_half2_nchw(const half* input, half2* output,
+                                int N, int C, int H, int W);
 /*
 template <typename DataType>
 void ComputeRPELogits_Q(int batch_size, int heads, int head_depth, const DataType* q_in, const DataType* rpe_exp, DataType* out, cudaStream_t stream);

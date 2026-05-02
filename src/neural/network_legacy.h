@@ -40,6 +40,18 @@ struct BaseWeights {
     Vec bn_stddivs;
   };
 
+  struct DepthwiseConvBlock {
+    explicit DepthwiseConvBlock(const pblczero::Weights::DepthwiseConvBlock& block,
+      const std::string& mask_type = "");
+
+    Vec weights;
+    Vec biases;
+    Vec bn_gammas;
+    Vec bn_betas;
+    Vec bn_means;
+    Vec bn_stddivs;
+  };
+
   struct SEunit {
     explicit SEunit(const pblczero::Weights::SEunit& se);
     Vec w1;
@@ -54,6 +66,16 @@ struct BaseWeights {
     ConvBlock conv2;
     SEunit se;
     bool has_se;
+  };
+
+  struct MobileNet {
+    explicit MobileNet(const pblczero::Weights::MobileNet& block,
+                        const std::string& mask_type = "");
+    ConvBlock conv1;
+    DepthwiseConvBlock d_conv;
+    ConvBlock conv2;
+    bool has_se;
+    SEunit se;
   };
 
   struct Smolgen {
@@ -125,6 +147,11 @@ struct BaseWeights {
   // @todo can this be folded into weights?
   Vec ip_emb_ln_gammas;
   Vec ip_emb_ln_betas;
+
+  ConvBlock ip_emb_expand;
+  std::vector<MobileNet> ip_emb_mobilenet_tower;
+  std::vector<Residual> ip_emb_residual_tower;
+  std::string mask_type;
 
   // Input gating
   Vec ip_mult_gate;

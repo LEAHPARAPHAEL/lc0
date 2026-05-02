@@ -38,6 +38,8 @@ BaseWeights::BaseWeights(const pblczero::Weights& weights)
       ip_emb_b(LayerAdapter(weights.ip_emb_b()).as_vector()),
       ip_emb_ln_gammas(LayerAdapter(weights.ip_emb_ln_gammas()).as_vector()),
       ip_emb_ln_betas(LayerAdapter(weights.ip_emb_ln_betas()).as_vector()),
+      ip_emb_expand(weights.ip_emb_expand()),
+      mask_type(weights.mask_type()),
       ip_mult_gate(LayerAdapter(weights.ip_mult_gate()).as_vector()),
       ip_add_gate(LayerAdapter(weights.ip_add_gate()).as_vector()),
       ip_emb_ffn(weights.ip_emb_ffn()),
@@ -53,13 +55,19 @@ BaseWeights::BaseWeights(const pblczero::Weights& weights)
       ip2_mov_w(LayerAdapter(weights.ip2_mov_w()).as_vector()),
       ip2_mov_b(LayerAdapter(weights.ip2_mov_b()).as_vector()),
       smolgen_w(LayerAdapter(weights.smolgen_w()).as_vector()),
-      has_smolgen(weights.has_smolgen_w()) {
+      has_smolgen(weights.has_smolgen_w()){
   for (const auto& res : weights.residual()) {
     residual.emplace_back(res);
   }
   encoder_head_count = weights.headcount();
   for (const auto& enc : weights.encoder()) {
     encoder.emplace_back(enc);
+  }
+  for (const auto& block : weights.ip_emb_mobilenet_tower()) {
+    ip_emb_mobilenet_tower.emplace_back(block, this->mask_type);
+  }
+  for (const auto& block : weights.ip_emb_residual_tower()) {
+    ip_emb_residual_tower.emplace_back(block);
   }
 }
 
@@ -75,6 +83,14 @@ BaseWeights::Residual::Residual(const pblczero::Weights::Residual& residual)
       se(residual.se()),
       has_se(residual.has_se()) {}
 
+BaseWeights::MobileNet::MobileNet(const pblczero::Weights::MobileNet& block, 
+                                  const std::string& mask_type)
+    : conv1(block.conv1()),
+      d_conv(block.d_conv(), mask_type),
+      conv2(block.conv2()),
+      has_se(block.has_se()),
+      se(block.se()) {}
+
 BaseWeights::ConvBlock::ConvBlock(const pblczero::Weights::ConvBlock& block)
     : weights(LayerAdapter(block.weights()).as_vector()),
       biases(LayerAdapter(block.biases()).as_vector()),
@@ -82,13 +98,10 @@ BaseWeights::ConvBlock::ConvBlock(const pblczero::Weights::ConvBlock& block)
       bn_betas(LayerAdapter(block.bn_betas()).as_vector()),
       bn_means(LayerAdapter(block.bn_means()).as_vector()),
       bn_stddivs(LayerAdapter(block.bn_stddivs()).as_vector()) {
-  if (weights.size() == 0) {
-    // Empty ConvBlock.
-    return;
-  }
+  
+  if (weights.size() == 0) return;
 
   if (bn_betas.size() == 0) {
-    // Old net without gamma and beta.
     for (auto i = size_t{0}; i < bn_means.size(); i++) {
       bn_betas.emplace_back(0.0f);
       bn_gammas.emplace_back(1.0f);
@@ -100,32 +113,108 @@ BaseWeights::ConvBlock::ConvBlock(const pblczero::Weights::ConvBlock& block)
     }
   }
 
-  if (bn_means.size() == 0) {
-    // No batch norm.
-    return;
-  }
+  if (bn_means.size() == 0) return;
 
-  // Fold batch norm into weights and biases.
-  // Variance to gamma.
   for (auto i = size_t{0}; i < bn_stddivs.size(); i++) {
     bn_gammas[i] *= 1.0f / std::sqrt(bn_stddivs[i] + kEpsilon);
     bn_means[i] -= biases[i];
   }
 
   auto outputs = biases.size();
-
-  // We can treat the [inputs, filter_size, filter_size] dimensions as one.
   auto inputs = weights.size() / outputs;
 
   for (auto o = size_t{0}; o < outputs; o++) {
     for (auto c = size_t{0}; c < inputs; c++) {
       weights[o * inputs + c] *= bn_gammas[o];
     }
-
     biases[o] = -bn_gammas[o] * bn_means[o] + bn_betas[o];
   }
 
-  // Batch norm weights are not needed anymore.
+  bn_stddivs.clear();
+  bn_means.clear();
+  bn_betas.clear();
+  bn_gammas.clear();
+}
+
+
+BaseWeights::DepthwiseConvBlock::DepthwiseConvBlock(const pblczero::Weights::DepthwiseConvBlock& block, 
+                                  const std::string& mask_type)
+    : weights(LayerAdapter(block.weights()).as_vector()),
+      biases(LayerAdapter(block.biases()).as_vector()),
+      bn_gammas(LayerAdapter(block.bn_gammas()).as_vector()),
+      bn_betas(LayerAdapter(block.bn_betas()).as_vector()),
+      bn_means(LayerAdapter(block.bn_means()).as_vector()),
+      bn_stddivs(LayerAdapter(block.bn_stddivs()).as_vector()) {
+  
+  if (weights.size() == 0) return;
+
+  if (bn_betas.size() == 0) {
+    for (auto i = size_t{0}; i < bn_means.size(); i++) {
+      bn_betas.emplace_back(0.0f);
+      bn_gammas.emplace_back(1.0f);
+    }
+  }
+  if (biases.size() == 0) {
+    for (auto i = size_t{0}; i < bn_means.size(); i++) {
+      biases.emplace_back(0.0f);
+    }
+  }
+
+  if (bn_means.size() == 0) return;
+
+  for (auto i = size_t{0}; i < bn_stddivs.size(); i++) {
+    bn_gammas[i] *= 1.0f / std::sqrt(bn_stddivs[i] + kEpsilon);
+    bn_means[i] -= biases[i];
+  }
+
+  auto outputs = biases.size();
+  auto inputs = weights.size() / outputs;
+
+  for (auto o = size_t{0}; o < outputs; o++) {
+    for (auto c = size_t{0}; c < inputs; c++) {
+      weights[o * inputs + c] *= bn_gammas[o];
+    }
+    biases[o] = -bn_gammas[o] * bn_means[o] + bn_betas[o];
+  }
+
+  /*
+  if (mask_type == "rbk" || mask_type == "rb") {
+    if (inputs != 25) {
+      throw Exception("Mask type requires a 5x5 depthwise convolution kernel.");
+    }
+
+    std::vector<float> packed_weights;
+    packed_weights.reserve(outputs * 10); 
+
+    const int rook_idx[9]   = {2, 7, 10, 11, 12, 13, 14, 17, 22};
+    const int bishop_idx[9] = {0, 4, 6, 8, 12, 16, 18, 20, 24};
+    const int knight_idx[9] = {1, 3, 5, 9, 12, 15, 19, 21, 23};
+
+    for (auto o = size_t{0}; o < outputs; o++) {
+      const int* active_mask = nullptr;
+
+      if (mask_type == "rbk") {
+        if (o < outputs / 3) active_mask = rook_idx;
+        else if (o < 2 * outputs / 3) active_mask = bishop_idx;
+        else active_mask = knight_idx;
+      } else { // "rb"
+        if (o < outputs / 2) active_mask = rook_idx;
+        else active_mask = bishop_idx;
+      }
+
+      for (int i = 0; i < 9; i++) {
+        packed_weights.push_back(weights[o * inputs + active_mask[i]]);
+      }
+      
+      packed_weights.push_back(biases[o]);
+    }
+
+    weights = std::move(packed_weights);
+    
+    biases.clear(); 
+  }
+  */
+
   bn_stddivs.clear();
   bn_means.clear();
   bn_betas.clear();

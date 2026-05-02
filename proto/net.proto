@@ -59,6 +59,27 @@ message Weights {
     optional Layer bn_betas = 6;
   }
 
+  message DepthwiseConvBlock {
+    optional Layer weights = 1;
+    optional Layer biases = 2;
+    optional Layer bn_means = 3;
+    optional Layer bn_stddivs = 4;
+    optional Layer bn_gammas = 5;
+    optional Layer bn_betas = 6;
+  }
+
+  message LayerNormalization {
+    optional Layer ln_gammas = 1;
+    optional Layer ln_betas = 2;
+  }
+
+  message BatchNormalization {
+    optional Layer bn_means = 1;
+    optional Layer bn_stddivs = 2;
+    optional Layer bn_gammas = 3;
+    optional Layer bn_betas = 4;
+  }
+
   message SEunit {
     // Squeeze-excitation unit (https://arxiv.org/abs/1709.01507)
     // weights and biases of the two fully connected layers.
@@ -67,6 +88,14 @@ message Weights {
     optional Layer w2 = 3;
     optional Layer b2 = 4;
   }
+
+  message MobileNet {
+    optional ConvBlock conv1 = 1;
+    optional DepthwiseConvBlock d_conv = 2;
+    optional ConvBlock conv2 = 3;
+    optional SEunit se = 4;
+  }
+
 
   message Residual {
     optional ConvBlock conv1 = 1;
@@ -203,7 +232,10 @@ message Weights {
   optional Layer ip_emb_ln_gammas = 39;
   optional Layer ip_emb_ln_betas = 40;
 
-
+  optional ConvBlock ip_emb_expand = 46;
+  repeated MobileNet ip_emb_mobilenet_tower = 47;
+  repeated Residual ip_emb_residual_tower = 48;
+  optional string mask_type = 49;
 
   // Input gating (NETWORK_ATTENTIONBODY_WITH_HEADFORMAT).
   optional Layer ip_mult_gate = 33;

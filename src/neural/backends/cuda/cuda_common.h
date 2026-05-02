@@ -45,6 +45,8 @@ typedef void* cudnnHandle_t;
 namespace lczero {
 namespace cudnn_backend {
 
+enum class MaskType { NONE, RBK, RB };
+
 static constexpr int kNumOutputPolicy = 1858;
 
 // max supported filter count for fast path

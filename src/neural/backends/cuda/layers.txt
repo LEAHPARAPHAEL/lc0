@@ -96,14 +96,6 @@ void dumpTensor(T* memory, int elements, const char* message, bool only_summary 
 
 namespace cudnn_backend {
 
-inline int GetPaddedBatchSize(int batch_size) {
-  int padded = 1;
-  while (padded < batch_size) {
-    padded *= 2;
-  }
-  return padded;
-}
-
 // Use Single kernel for entire SE operation.
 // Right now supported only for fp16 with nhwc and it's quite a bit faster
 // than using multiple passes. The flag can be set to false for debugging.
@@ -372,218 +364,6 @@ ConvLayer<DataType>::~ConvLayer() {
   cudnnDestroyTensorDescriptor(out_tensor_desc_);
   cudnnDestroyActivationDescriptor(activation_);
 }
-
-
-
-template <typename DataType>
-DepthwiseConvLayer<DataType>::DepthwiseConvLayer(
-    BaseLayer<DataType>* prev, int channels, int height, int width,
-    ActivationFunction act, bool use_gemm_ex,  int min_batch_size, int max_batch_size, 
-    cudnnHandle_t cudnn)
-    : BaseLayer<DataType>(channels, height, width, prev, false, use_gemm_ex),
-      channels_(channels),
-      act_(act) {
-
-  int min_padded_batch = GetPaddedBatchSize(min_batch_size);
-  int max_padded_batch = GetPaddedBatchSize(max_batch_size);
-
-  for (int b = min_padded_batch; b <= max_padded_batch; b *= 2) {
-      EnsureGraph(b, cudnn);
-  } 
-}
-
-template <typename DataType>
-DepthwiseConvLayer<DataType>::~DepthwiseConvLayer() {
-  if (weights_) ReportCUDAErrors(cudaFree(weights_));
-  if (biases_) ReportCUDAErrors(cudaFree(biases_));
-}
-
-template <typename DataType>
-void DepthwiseConvLayer<DataType>::LoadWeights(float* weights,
-                                               float* biases,
-                                               void* scratch) {
-  size_t num_weights = channels_ * 1 * 5 * 5;
-  size_t num_biases = channels_;
-
-  ReportCUDAErrors(cudaMalloc(&weights_, num_weights * sizeof(DataType)));
-  ReportCUDAErrors(cudaMalloc(&biases_, num_biases * sizeof(DataType)));
-
-  ReportCUDAErrors(cudaMemcpy(scratch, weights, num_weights * sizeof(float), cudaMemcpyHostToDevice));
-  copyTypeConverted(weights_, (float*)scratch, num_weights, 0);
-
-  ReportCUDAErrors(cudaMemcpy(scratch, biases, num_biases * sizeof(float), cudaMemcpyHostToDevice));
-  copyTypeConverted(biases_, (float*)scratch, num_biases, 0);
-}
-
-template <typename DataType>
-void DepthwiseConvLayer<DataType>::EnsureGraph(int padded_batch, cudnnHandle_t cudnn) {
-  if (plans_.count(padded_batch) > 0) return;
-
-  cudnn_frontend::DataType_t fe_dtype = std::is_same<DataType, half>::value ? 
-      cudnn_frontend::DataType_t::HALF : cudnn_frontend::DataType_t::FLOAT;
-
-  auto graph = std::make_shared<cudnn_frontend::graph::Graph>();
-  graph->set_io_data_type(fe_dtype)
-       .set_intermediate_data_type(cudnn_frontend::DataType_t::FLOAT)
-       .set_compute_data_type(cudnn_frontend::DataType_t::FLOAT);
-
-  auto X = graph->tensor(cudnn_frontend::graph::Tensor_attributes()
-      .set_name("X")
-      .set_dim({padded_batch, channels_, 8, 8})
-      .set_stride({channels_ * 64, 64, 8, 1}));
-
-  auto W = graph->tensor(cudnn_frontend::graph::Tensor_attributes()
-      .set_name("W")
-      .set_dim({channels_, 1, 5, 5})
-      .set_stride({25, 25, 5, 1}));
-
-  auto conv_options = cudnn_frontend::graph::Conv_fprop_attributes()
-      .set_padding({2, 2})
-      .set_stride({1, 1})
-      .set_dilation({1, 1});
-      
-  // Pure Conv Node
-  auto Y_conv = graph->conv_fprop(X, W, conv_options);
-
-  // Set the raw convolution as the final output of the graph
-  Y_conv->set_output(true)
-        .set_dim({padded_batch, channels_, 8, 8})
-        .set_stride({channels_ * 64, 64, 8, 1});
-
-  auto status = graph->build(cudnn, {cudnn_frontend::HeurMode_t::A});
-  if (!status.is_good()) {
-      throw Exception("cuDNN graph build failed: " + status.get_message());
-  }
-
-  // Notice: Plan caching is much simpler now without the B tensor
-  GraphPlan plan;
-  plan.graph = graph;
-  plan.X = X;
-  plan.W = W;
-  plan.Y = Y_conv; 
-  plan.workspace_size = graph->get_workspace_size();
-
-  plans_[padded_batch] = plan;
-}
-
-template <typename DataType>
-void DepthwiseConvLayer<DataType>::Eval(
-    int batch_size, DataType* output, const DataType* input,
-    const DataType* skip, void* scratch, size_t scratch_size,
-    cudnnHandle_t cudnn, cublasHandle_t cublas, cudaStream_t stream,
-    DataType*** /* offset_pointers */) {
-
-  int padded_batch = GetPaddedBatchSize(batch_size);
-  
-  EnsureGraph(padded_batch, cudnn); 
-
-  auto& plan = plans_[padded_batch];
-
-  if (scratch_size < plan.workspace_size) {
-      throw Exception("Scratch size is too small for cuDNN graph workspace");
-  }
-
-  // Execute the pure Depthwise Convolution
-  std::unordered_map<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, void*> variant_pack = {
-      {plan.X, (void*)input},
-      {plan.W, (void*)weights_},
-      {plan.Y, (void*)output}
-  };
-
-  auto status = plan.graph->execute(cudnn, variant_pack, scratch);
-  if (!status.is_good()) {
-      throw Exception("cuDNN graph execution failed: " + status.get_message());
-  }
-
-  // -------------------------------------------------------------
-  // Lc0 NATIVE FUSION: Add Bias and apply Activation perfectly!
-  // 'addBiasBatched' broadcasts the 1D bias across the 8x8 spatial plane
-  // and natively fuses whichever act_ you trained with (Mish, ReLU, etc.)
-  // -------------------------------------------------------------
-  addBias_NCHW<DataType>(output, output, biases_, batch_size, channels_, 8, 8, act_, stream);
-}
-
-
-template<typename DataType>
-DepthwiseCustom<DataType>::DepthwiseCustom(int C_in, int H, int W, std::string mask_type)
-    : BaseLayer<DataType>(C_in, H, W, nullptr, false, false),
-      c_input_(C_in) {
-  // Allocate memory for weights (filter tensor) and biases.
-  const size_t weight_size = sizeof(half) * c_input_ * 10;
-  ReportCUDAErrors(cudaMalloc(&weights, weight_size));
-
-  if (mask_type == "rbk") {
-      mask_type_ = MaskType::RBK;
-  } else if (mask_type == "rb") {
-      mask_type_ = MaskType::RB;
-  }
-  }
-
-  template <typename DataType>
-  void DepthwiseCustom<DataType>::LoadWeights(float* pfilter, void* scratch) {
-
-    const size_t weight_size = sizeof(float) * c_input_ * 10;
-    assert(scratch);
-    ReportCUDAErrors(
-        cudaMemcpy(scratch, pfilter, weight_size, cudaMemcpyHostToDevice));
-        //copyTypeConverted((half*)weights1, (float*)scratch, c_input_ * 9, 0);
-        convert_float_to_half2((float*)scratch, (half2*)weights, c_input_, 10, 1);
-
-    /*
-    std::vector<half2> weights_host(c_input_ / 2 * 9);
-    const size_t weights_host_size = c_input_ / 2 * 9 * sizeof(half2);
-    cudaMemcpy(weights_host.data(), weights, weights_host_size, cudaMemcpyDeviceToHost);
-    std::cout<<"\n Printing weights" <<std::endl;
-    std::cout<< weights_host[25 * 9].x << ", ";
-    std::cout<< weights_host[25 * 9 + 1].x << ", ";
-    std::cout<< weights_host[25 * 9 + 2].x << ", ";
-    std::cout<< weights_host[25 * 9 + 3].x << ", ";
-    std::cout<< weights_host[25 * 9 + 4].x << ", ";
-    std::cout<< weights_host[25 * 9 + 5].x << ", ";
-    std::cout<< weights_host[25 * 9 + 6].x << ", ";
-    std::cout<< weights_host[25 * 9 + 7].x << ", ";
-    std::cout<< weights_host[25 * 9 + 8].x << std::endl;
-    */
-
-  }
-
-  template <>
-  void DepthwiseCustom<half>::Eval(int N, half* output, const half* input,
-            const half* input2, void* scratch, size_t scratch_size,
-            cudnnHandle_t cudnn, cublasHandle_t cublas, cudaStream_t stream,
-            half***) {
-    
-    try  {
-      //FusedDWPWeval(N, c_input_, C, output, input, weights1, biases,
-      //           weights2, stream);
-      DepthwiseEval(N, c_input_, mask_type_, output, input, scratch, weights, stream);
-    }
-    catch (const std::runtime_error& e) {
-        std::cerr << "Runtime error: " << e.what() << std::endl;
-    }
-    catch (const std::exception& e) {
-        std::cerr << "Standard exception: " << e.what() << std::endl;
-    }
-    catch (...) {
-        std::cerr << "Unknown exception occurred!" << std::endl;
-    }
-
-            
-  }
-
-  template <>
-  void DepthwiseCustom<float>::Eval(int N, float* output, const float* input,
-            const float* input2, void* scratch, size_t scratch_size,
-            cudnnHandle_t cudnn, cublasHandle_t cublas, cudaStream_t stream,
-            float***) {
-    return;      
-  }
-
-  template <typename DataType>
-  DepthwiseCustom<DataType>::~DepthwiseCustom() {
-    ReportCUDAErrors(cudaFree(weights));
-  }
-
 #endif
 
 template <typename DataType>
@@ -2313,8 +2093,6 @@ void EmbeddingLayer<DataType>::Eval(
   addBiasBatched(output, output, biases_, 1, batch, num_outputs, act_, stream);
 }
 
-
-
 template <typename DataType>
 AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
                                        void* scratch, Activations activations,
@@ -2681,12 +2459,6 @@ void ValueHead<DataType>::Eval(int N, DataType* output, const DataType* input,
 #ifdef USE_CUDNN
 template class ConvLayer<half>;
 template class ConvLayer<float>;
-
-template class DepthwiseConvLayer<half>;
-template class DepthwiseConvLayer<float>;
-
-template class DepthwiseCustom<half>;
-template class DepthwiseCustom<float>;
 #endif
 
 template class FCLayer<half>;

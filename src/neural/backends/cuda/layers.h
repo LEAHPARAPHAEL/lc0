@@ -30,13 +30,16 @@
 
 #include <cstddef>
 #include <memory>
+#include <unordered_map>
 
 #include "cuda_common.h"
 #include "neural/network_legacy.h"
 #include "neural/tables/activation_function.h"
 
 #ifdef USE_CUDNN
+#include <cudnn_frontend.h>
 #include <cudnn.h>
+namespace fe = cudnn_frontend;
 #else
 typedef void* cudnnHandle_t;
 #endif
@@ -128,7 +131,6 @@ class ConvLayer : public BaseLayer<DataType> {
   void init();
 };
 
-#endif
 
 template <typename DataType>
 class FCLayer : public BaseLayer<DataType> {
@@ -333,6 +335,86 @@ class ResidualBlock : public BaseLayer<DataType> {
   DataType* b1_;
   DataType* b2_;
 };
+
+
+
+template <typename DataType>
+class DepthwiseConvLayer : public BaseLayer<DataType> {
+ public:
+  // padding = 2 for a 5x5 kernel to maintain the 8x8 spatial dimensions
+  DepthwiseConvLayer(BaseLayer<DataType>* prev, int channels, int height,
+                     int width, ActivationFunction act, bool use_gemm_ex,
+                     int min_batch_size, int max_batch_size, cudnnHandle_t cudnn);
+  ~DepthwiseConvLayer();
+
+  void LoadWeights(float* weights, float* biases, void* scratch);
+
+  void Eval(int batch_size, DataType* output, const DataType* input,
+            const DataType* skip, void* scratch, size_t scratch_size,
+            cudnnHandle_t cudnn, cublasHandle_t cublas,
+            cudaStream_t stream, DataType*** offset_pointers = nullptr) override;
+
+ private:
+  void EnsureGraph(int batch_size, cudnnHandle_t cudnn);
+
+  int channels_;
+  ActivationFunction act_;
+
+  DataType* weights_ = nullptr;
+  DataType* biases_ = nullptr;
+
+  // Modern cuDNN Graph API requires caching the graph per dynamic batch_size
+  struct GraphPlan {
+      std::shared_ptr<fe::graph::Graph> graph;
+      std::shared_ptr<fe::graph::Tensor_attributes> X;
+      std::shared_ptr<fe::graph::Tensor_attributes> W;
+      std::shared_ptr<fe::graph::Tensor_attributes> B;
+      std::shared_ptr<fe::graph::Tensor_attributes> Y;
+      int64_t workspace_size;
+  };
+  
+  std::unordered_map<int, GraphPlan> plans_;
+};
+
+
+
+template <typename DataType>
+class DepthwiseCustom : public BaseLayer<DataType> {
+  using BaseLayer<DataType>::C;
+  using BaseLayer<DataType>::H;
+  using BaseLayer<DataType>::W;
+  using BaseLayer<DataType>::GetC;
+  using BaseLayer<DataType>::GetH;
+  using BaseLayer<DataType>::GetW;
+  using BaseLayer<DataType>::nhwc_;
+
+ public:
+  DepthwiseCustom(int C_in, int H, int W, std::string mask_type);
+
+  ~DepthwiseCustom();
+
+  void LoadWeights(float* pfilter, void* scratch);
+  void Eval(int N, DataType* output, const DataType* input,
+            const DataType* input2, void* scratch, size_t scratch_size,
+            cudnnHandle_t cudnn, cublasHandle_t cublas, cudaStream_t stream,
+            DataType*** = nullptr) override;
+
+ private:
+  const int c_input_;
+
+  //DataType* biases = nullptr;
+  //DataType* weights1 = nullptr;
+  //DataType* weights2 = nullptr;
+  half2* weights = nullptr;
+  MaskType mask_type_;
+
+  void init();
+
+
+};
+
+
+#endif
 
 template <typename DataType>
 class EncoderBlock {
