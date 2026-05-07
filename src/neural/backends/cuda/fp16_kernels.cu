@@ -96,45 +96,89 @@ __device__ inline float2 operator*(float2 a, float2 b) {
 #endif
 
 
-  __global__ void convert_float_to_half2_kernel(const float* __restrict__ input,
-                                              half2* __restrict__ output,
-                                              int C, int H, int W) {
-    // Total number of half2 elements is (C / 2) * H * W
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_half2 = (C / 2) * H * W;
+__global__ void convert_float_to_half2_kernel_nchw(const float* __restrict__ input,
+                                            half2* __restrict__ output,
+                                            int C, int H, int W) {
+  // Total number of half2 elements is (C / 2) * H * W
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int total_half2 = (C / 2) * H * W;
 
-    if (tid >= total_half2) return;
+  if (tid >= total_half2) return;
 
-    // Compute (c2, h, w) from flat index
-    int w = tid % W;
-    int h = (tid / W) % H;
-    int c2 = (tid / (H * W)); // c2 = c / 2
+  // Compute (c2, h, w) from flat index
+  int w = tid % W;
+  int h = (tid / W) % H;
+  int c2 = (tid / (H * W)); // c2 = c / 2
 
-    int c0 = c2 * 2;
-    int c1 = c0 + 1;
+  int c0 = c2 * 2;
+  int c1 = c0 + 1;
 
-    // Flat indices in (C, H, W) format
-    int offset0 = (c0 * H + h) * W + w;
-    int offset1 = (c1 * H + h) * W + w;
+  // Flat indices in (C, H, W) format
+  int offset0 = (c0 * H + h) * W + w;
+  int offset1 = (c1 * H + h) * W + w;
 
-    // Load, convert, and pack
-    float f0 = input[offset0];
-    float f1 = input[offset1];
+  // Load, convert, and pack
+  float f0 = input[offset0];
+  float f1 = input[offset1];
 
-    half2 packed;
-    packed.x = __float2half(f0);
-    packed.y = __float2half(f1);
+  half2 packed;
+  packed.x = __float2half(f0);
+  packed.y = __float2half(f1);
 
-    output[tid] = packed;
+  output[tid] = packed;
 }
 
-void convert_float_to_half2(const float* input, half2* output, int C, int H, int W) {
+void convert_float_to_half2_nchw(const float* input, half2* output, int C, int H, int W) {
 
   int num_half2 = (C / 2) * H * W;
   int threads = 256;
   int blocks = (num_half2 + threads - 1) / threads;
 
-  convert_float_to_half2_kernel<<<blocks, threads>>>(input, output, C, H, W);
+  convert_float_to_half2_kernel_nchw<<<blocks, threads>>>(input, output, C, H, W);
+}
+
+__global__ void convert_float_to_half2_kernel_nhwc(const float* __restrict__ input,
+                                                   half2* __restrict__ output,
+                                                   int C, int H, int W) {
+  // Total number of half2 elements is (C / 2) * H * W
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int total_half2 = (C / 2) * H * W;
+
+  if (tid >= total_half2) return;
+
+  // In NHWC (half2), the fast-moving dimension is the packed channel (C / 2).
+  // Then Width, then Height.
+  int c2 = tid % (C / 2);
+  int w  = (tid / (C / 2)) % W;
+  int h  = tid / ((C / 2) * W);
+
+  // Reconstruct the original 2 channel indices
+  int c0 = c2 * 2;
+  int c1 = c0 + 1;
+
+  // Compute the flat indices to read from the NCHW float input
+  int offset0 = (c0 * H + h) * W + w;
+  int offset1 = (c1 * H + h) * W + w;
+
+  // Load, convert, and pack
+  float f0 = input[offset0];
+  float f1 = input[offset1];
+
+  half2 packed;
+  packed.x = __float2half(f0);
+  packed.y = __float2half(f1);
+
+  // Since tid iterates natively in NHWC order (C moving fastest), 
+  // we can write directly to tid.
+  output[tid] = packed;
+}
+
+void convert_float_to_half2_nhwc(const float* input, half2* output, int C, int H, int W) {
+  int num_half2 = (C / 2) * H * W;
+  int threads = 256;
+  int blocks = (num_half2 + threads - 1) / threads;
+
+  convert_float_to_half2_kernel_nhwc<<<blocks, threads>>>(input, output, C, H, W);
 }
 
 
@@ -167,88 +211,23 @@ __global__ void convert_half_to_half2_kernel_nchw(const half* __restrict__ input
 }
 
 void convert_half_to_half2_nchw(const half* input, half2* output,
-                                int N, int C, int H, int W) {
+                                int N, int C, int H, int W, cudaStream_t stream) {
     int total_half2 = N * (C / 2) * H * W;
     int threads = 256;
     int blocks = (total_half2 + threads - 1) / threads;
 
-    convert_half_to_half2_kernel_nchw<<<blocks, threads>>>(input, output, N, C, H, W);
+    convert_half_to_half2_kernel_nchw<<<blocks, threads, 0, stream>>>(input, output, N, C, H, W);
 }
 
 
 template <MaskType mask_type>
-__global__ void DepthwiseKernel(int C_in, half* output, const half2* input,
-                              const half2* weights) {
+__global__ void DepthwiseKernelNCHW(int C_in, half* output, const half2* input,
+                              const half2* weights, ActivationFunction activation) {
 #if __CUDA_ARCH__ >= 700 
 
     const int block_depth = C_in / (2 * PARALLEL_BLOCKS);
     const int thread_depth = block_depth / DW_PARALLEL_D;
 
-    /*   
-
-    8 blocks per chess position :
-    - a block covers half of the board (the upper half or the lower half), and spans
-      multiple channels (in the current design, a quarter of the total channels).
-    - so, in total, for an input of shape (N,C,H,W), 8N blocks are required to compute
-      the result of the depthwise convolution.
-    - the number of blocks must be high enough to occupy all the streaming multiprocessors
-      but at the same time not too high to avoid a long queue.
-    - as this number depends on the size of the batch N, a compromise must be made, efficient for
-      the most common batch sizes (between 5 and 40).
-
-                -----------------------
-               /          6          /|
-              /---------------------/ |
-          C  /          4          /| |
-            /---------------------/ |6|
-           /          2          /| | |
-          /---------------------/ |4|/|
-         /           0         /| | / |
-        ----------------------- |2|/|7|
-        |                     | | / | /
-        |          0          |0|/|5|/
-        |                     | / | /
-      H |_____________________|/|3|/
-        |                     | | / 
-        |                     |1|/
-        |          1          | /
-        |                     |/
-        -----------------------
-                   W
-
-    
-    384 threads per block : 
-    - each block computes one spatial position, but across several channels.
-    - each channel is therefore covered by 32 threads, which is exactly the number of
-      threads in a warp, allowing only 9 of them to load the 9 different weights and
-      share them through registers.
-    - as the values are in half2 format, two adjacent channels are computed simultaneously,
-      so the position is treated as if it only contained 576 / 2 = 288 channels.
-    - 12 threads in parallel cover the 72 channels of the block, so each thread is
-      responsible for 6 channels (12 in reality, as each channel is doubled).
-    
-              
-               ------------------------- 
-              /_ /_ /_ /_ /_ /_ /_ /_ /|
-             .  .  .  .  .  .  .  .  . |
-            .  .  .  .  .  .  .  .  .  |
-        D  /_ /_ /_ /_ /_ /_ /_ /_ /   |
-          /_ /_ /_ /_ /_ /_ /_ /_ /|   /
-         / 0/ 1/  /  /  /  /  /  /||  .
-        ------------------------- || .
-        | 0| 1|  |  |  |  |  |  | ||/
-      H |  |  |  |  |  |  |  |  | |/
-        |  |  |  |  |  |  |  |  | /
-        |  |  |  |  |  |  |  |31|/
-        -------------------------
-                    W
-                  
-
-    thread_w : the horizontal position of the thread, goes from 0 to 8
-    thread_h : the vertical position of the thread, goes from 0 to 4
-    thread_d : the first channel covered by this thread, with 0 being the
-    first channel of the block, not necessarily the first channel overall.
-    */
     const int thread_w = threadIdx.x;
     const int thread_h = threadIdx.y;
     const int thread_d = threadIdx.z;
@@ -272,27 +251,13 @@ __global__ void DepthwiseKernel(int C_in, half* output, const half2* input,
     // Loops over the 6 channels covered by the thread executing the kernel.
     for (int c = 0; c < thread_depth ; c+=1){
 
-        // Current channel (beginning of the thread + offset)
         const int current_d = abs_d + c;
-            
-        // Used to share the 9 weights among the threads of the same warp
+
         half2 shared_weight;
 
-        /*
-          Each thread fetches at most one weight and shares it with the warp.
-          For the sake of simplicity, the 9 first threads fetch the 9 weights and
-          the 10th gets the bias. 
-        */ 
         if (thread_h * DW_BLOCK_W + thread_w < 10){
-            shared_weight = weights[current_d * 9 + thread_h * DW_BLOCK_W + thread_w];
+            shared_weight = weights[current_d * 10 + thread_h * DW_BLOCK_W + thread_w];
         }
-
-
-        /*
-          The threads of the warp share the 9 weights and the bias using registers.
-          For example, the first weight (w0) was fetched by the first thread of the warp
-          (the thread at index 0), so the last argument of the __shfl_sync function is 0.
-        */ 
 
         unsigned active_threads_mask = __activemask();
 
@@ -307,85 +272,21 @@ __global__ void DepthwiseKernel(int C_in, half* output, const half2* input,
         w8 = __shfl_sync(active_threads_mask, shared_weight, 8);
         b = __shfl_sync(active_threads_mask, shared_weight, 9);
             
-
-        /*
-          Batch + channel index : 
-          - misses only the height and width offsets to have
-            the final index. 
-          - counts with packed channels, hence the C_in / 2, so will have to be doubled when
-            going back to half format for the output. 
-        */ 
-
         const int offset_nc = (block_n * C_in / 2 + current_d) * 64;
 
 
 
         // Row in the 8 x 8 input of the channel : substract 2 for top padding
-        const int abs_h_input = block_h * DW_BLOCK_H + thread_h - 2;
+        const int abs_h_input = abs_h - 2;
 
         // Column in the 8 x 8 input of the channel : substract 2 for left padding
-        const int abs_w_input = thread_w - 2;
+        const int abs_w_input = abs_w - 2;
 
         const int index_input = offset_nc + abs_h_input * 8 + abs_w_input;
 
         // Accumulator
         half2 sum = make_half2(0.0f, 0.0f);
 
-        /*
-        Weights layout for chess masks (from top to bottom, then left to right): 
-        [w0, w1, w2, w3, w4, w5, w6, w7, w8]
-
-        - Rook (first third of the input channels):
-          [0, 0,w0, 0, 0,
-           0, 0,w1, 0, 0,
-          w2,w3,w4,w5,w6,
-           0, 0,w7, 0, 0,
-           0, 0,w8, 0, 0]
-
-        - Bishop (second third of the input channels):
-          [w0, 0, 0, 0,w1,
-            0,w2, 0,w3, 0,
-            0, 0,w4, 0, 0,
-            0,w5, 0,w6, 0,
-           w7, 0, 0, 0,w8]
-
-        - Knight (last third of the input channels):
-          [0,w0, 0,w1, 0,
-          w2, 0, 0, 0, w3,
-           0, 0,w4, 0, 0,
-          w5, 0, 0, 0, w6,
-           0,w7, 0,w8, 0]
-
-
-
-        A same padding is applied, which means that 2 rows and columns are added at each end of the board
-        to keep the same size after the 5x5 convolution.
-        For example, consider the first thread of the first channel of the first position of the batch :
-        - block_n = block_d = block_h = thread_d = thread_w = thread_h = current_d = offset_nc = 0
-        - first third of the channels, so it's a rook kernel.
-        - we compute abs_h_input = -2, abs_w_input = -2, index_input = -18.
-        - -18 marks the index of the X mark in the padded board.
-        - as long as abs_h_input < 0 or abs_h_input > 7 or abs_w_input < 0 or abs_w_input > 7, the input
-          will be 0 because out of bounds. 
-        - so the first computation to be potentially non-zero is the one at the center of the kernel. We check
-          that it corresponds to index_input + 18 = 0, which is indeed the first position of the board. 
-
-       
-        X  0  *  0  0  0  0  0  0  0  0  0                   
-        0  0  *  0  0  0  0  0  0  0  0  0
-        *  * [*][*][*][ ][ ][ ][ ][ ] 0  0
-        0  0 [*][ ][ ][ ][ ][ ][ ][ ] 0  0
-        0  0 [*][ ][ ][ ][ ][ ][ ][ ] 0  0
-        0  0 [ ][ ][ ][ ][ ][ ][ ][ ] 0  0
-        0  0 [ ][ ][ ][ ][ ][ ][ ][ ] 0  0
-        0  0 [ ][ ][ ][ ][ ][ ][ ][ ] 0  0
-        0  0 [ ][ ][ ][ ][ ][ ][ ][ ] 0  0
-        0  0 [ ][ ][ ][ ][ ][ ][ ][ ] 0  0
-        0  0  0  0  0  0  0  0  0  0  0  0
-        0  0  0  0  0  0  0  0  0  0  0  0
-
-      */
-      
         if (mask_type == MaskType::RBK){
           // Rook filter
           if (2 * current_d < (C_in / 3)) {
@@ -454,13 +355,14 @@ __global__ void DepthwiseKernel(int C_in, half* output, const half2* input,
               sum = __hfma2(w8, get_input_half2_at(input, abs_h_input + 4, abs_w_input + 4, index_input + 36), sum);
           }
         }
-                
-        // Adds the bias to the sum
+
         sum = __hadd2(sum, b);
-
-        // ReLU ! 
-        sum = __hmax2(sum, __float2half2_rn(0.0f));
-
+    
+        float2 sum_f32 = __half22float2(sum);
+        sum_f32.x = activate(sum_f32.x, activation);
+        sum_f32.y = activate(sum_f32.y, activation);
+        // Pack back to strict FP16
+        sum = __float22half2_rn(sum_f32);
         
         /*
           Writes the result in the output, splitting the two halves of the sums, which correspond to the channels 
@@ -479,40 +381,341 @@ __global__ void DepthwiseKernel(int C_in, half* output, const half2* input,
 
 
 
-void DepthwiseEval(int N, int C_in, MaskType mask_type, half* output, const half* input, void* scratch,
-                              const half2* w1, cudaStream_t stream) {
+void DepthwiseEvalNCHW(int N, int C_in, MaskType mask_type, half* output, const half* input, void* scratch,
+                              const half2* w1, ActivationFunction activation, cudaStream_t stream) {
 
     //std::cout << "Number of positions in the batch : " << N << std::endl;
     convert_half_to_half2_nchw(input, (half2*)scratch,
-                         N, C_in, 8, 8); 
+                         N, C_in, 8, 8, stream); 
 
     dim3 threads(DW_BLOCK_W, DW_BLOCK_H, DW_PARALLEL_D);
 
     dim3 blocks(N, PARALLEL_BLOCKS, 8 / DW_BLOCK_H);
     switch (mask_type) {
       case MaskType::RBK:
-          DepthwiseKernel<MaskType::RBK><<<blocks, threads, 0, stream>>>(
-              C_in, output, (half2*)scratch, w1);
+          DepthwiseKernelNCHW<MaskType::RBK><<<blocks, threads, 0, stream>>>(
+              C_in, output, (half2*)scratch, w1, activation);
           break;
 
       case MaskType::RB:
-          DepthwiseKernel<MaskType::RB><<<blocks, threads, 0, stream>>>(
-              C_in, output, (half2*)scratch, w1);
+          DepthwiseKernelNCHW<MaskType::RB><<<blocks, threads, 0, stream>>>(
+              C_in, output, (half2*)scratch, w1, activation);
           break;
     }
-    /*
-    cudaDeviceSynchronize();
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-    std::cerr << "Kernel launch failed: " << cudaGetErrorString(err) << "\n";
-    }
-  
-
-    std::exit(0);
-    */
-    
-
 }
+
+
+__device__ __forceinline__ half2 get_input_half2_nhwc(const half2* input, int n, int h, int w, int c_half2, int total_c_half2) {
+    // Return 0 for padding (out of 8x8 bounds)
+    if (h < 0 || h >= 8 || w < 0 || w >= 8) {
+        return make_half2(0.0f, 0.0f);
+    }
+    // NHWC Flat Index for half2: (n * H * W * C2) + (h * W * C2) + (w * C2) + c2
+    int index = (n * 64 * total_c_half2) + (h * 8 * total_c_half2) + (w * total_c_half2) + c_half2;
+    return input[index];
+}
+
+
+
+
+
+
+
+// 1. Safe Clamped Memory Reader (Stops Segfaults)
+__device__ __forceinline__ half2 get_input_half2_nhwc_safe(const half2* input, int n, int h, int w, int c_half2, int total_c_half2) {
+    if (h < 0 || h >= 8 || w < 0 || w >= 8) {
+      return __float2half2_rn(0.0f); 
+    }
+    else {
+      int index = (n * 64 * total_c_half2) + (h * 8 * total_c_half2) + (w * total_c_half2) + c_half2;
+      return input[index];
+    }
+      
+}
+
+// 2. Pure FP32 Accumulator (Fixes Precision Drift)
+__device__ __forceinline__ void mac_fp32(float2& sum, float2 w, half2 in_h2) {
+    float2 in_f32 = __half22float2(in_h2);
+    sum.x += w.x * in_f32.x;
+    sum.y += w.y * in_f32.y;
+}
+
+// 3. The Re-architected Kernel
+template <MaskType mask_type>
+__global__ void DepthwiseKernelNHWC_fp32(int total_c_half2, half2* output, const half2* input, const half2* weights,
+  ActivationFunction activation) {
+#if __CUDA_ARCH__ >= 700 
+    // threadIdx.x is now mapped to Channel!
+    int c_half2 = blockIdx.y * blockDim.x + threadIdx.x;
+    if (c_half2 >= total_c_half2) return;
+
+    int w = threadIdx.y;
+    int h = blockIdx.z;
+    int n = blockIdx.x;
+
+    // Load all 9 weights and 1 bias into ultra-fast FP32 registers.
+    // Because weights are formatted [10, C], consecutive threads read 
+    // consecutive memory addresses perfectly!
+    float2 w_f32[9];
+    #pragma unroll
+    for(int i = 0; i < 9; ++i) {
+        w_f32[i] = __half22float2(weights[i * total_c_half2 + c_half2]);
+    }
+    float2 b_f32 = __half22float2(weights[9 * total_c_half2 + c_half2]);
+
+    int abs_h_input = h - 2;
+    int abs_w_input = w - 2;
+
+    float2 sum = make_float2(0.0f, 0.0f);
+
+    if (mask_type == MaskType::RBK) {
+        if (c_half2 < (total_c_half2 / 3)) { // Rook
+            mac_fp32(sum, w_f32[0], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input + 2, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[1], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 2, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[2], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[3], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 1, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[4], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 2, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[5], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 3, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[6], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 4, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[7], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 2, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[8], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input + 2, c_half2, total_c_half2));
+        }
+        else if (c_half2 < (2 * total_c_half2 / 3)) { // Bishop
+            mac_fp32(sum, w_f32[0], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[1], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input + 4, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[2], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 1, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[3], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 3, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[4], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 2, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[5], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 1, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[6], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 3, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[7], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[8], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input + 4, c_half2, total_c_half2));
+        }
+        else { // Knight
+            mac_fp32(sum, w_f32[0], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input + 1, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[1], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input + 3, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[2], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[3], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 4, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[4], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 2, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[5], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[6], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 4, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[7], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input + 1, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[8], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input + 3, c_half2, total_c_half2));
+        }
+    } else {
+        if (c_half2 < total_c_half2 / 2) { // Rook
+            mac_fp32(sum, w_f32[0], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input + 2, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[1], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 2, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[2], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[3], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 1, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[4], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 2, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[5], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 3, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[6], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 4, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[7], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 2, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[8], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input + 2, c_half2, total_c_half2));
+        } else { // Bishop
+            mac_fp32(sum, w_f32[0], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[1], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input + 4, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[2], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 1, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[3], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 3, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[4], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 2, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[5], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 1, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[6], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 3, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[7], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input, c_half2, total_c_half2));
+            mac_fp32(sum, w_f32[8], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input + 4, c_half2, total_c_half2));
+        }
+    }
+
+    sum.x += b_f32.x;
+    sum.y += b_f32.y;
+    sum.x = activate(sum.x, activation);
+    sum.y = activate(sum.y, activation);
+
+    // Write coalesced output back to VRAM
+    int out_index = (n * 64 * total_c_half2) + (h * 8 * total_c_half2) + (w * total_c_half2) + c_half2;
+    output[out_index] = __float22half2_rn(sum);
+#endif
+}
+
+
+template <MaskType mask_type>
+__global__ void DepthwiseKernelNHWC_fp16(int total_c_half2, half2* output, const half2* input, const half2* weights,
+  ActivationFunction activation) {
+#if __CUDA_ARCH__ >= 700 
+    // threadIdx.x is mapped to Channel
+    int c_half2 = blockIdx.y * blockDim.x + threadIdx.x;
+    if (c_half2 >= total_c_half2) return;
+
+    int w = threadIdx.y;
+    int h = blockIdx.z;
+    int n = blockIdx.x;
+
+    // Load all 9 weights and 1 bias natively as half2
+    // No conversion to float2 needed, saving registers and instructions
+    half2 w_h2[9];
+    #pragma unroll
+    for(int i = 0; i < 9; ++i) {
+        w_h2[i] = weights[i * total_c_half2 + c_half2];
+    }
+    half2 b_h2 = weights[9 * total_c_half2 + c_half2];
+
+    int abs_h_input = h - 2;
+    int abs_w_input = w - 2;
+
+    // Initialize accumulator in strict fp16
+    half2 sum = __float2half2_rn(0.0f);
+
+    if (mask_type == MaskType::RBK) {
+        if (c_half2 < (total_c_half2 / 3)) { // Rook
+            sum = __hfma2(w_h2[0], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input + 2, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[1], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 2, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[2], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[3], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 1, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[4], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 2, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[5], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 3, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[6], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 4, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[7], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 2, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[8], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input + 2, c_half2, total_c_half2), sum);
+        }
+        else if (c_half2 < (2 * total_c_half2 / 3)) { // Bishop
+            sum = __hfma2(w_h2[0], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[1], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input + 4, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[2], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 1, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[3], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 3, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[4], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 2, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[5], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 1, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[6], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 3, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[7], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[8], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input + 4, c_half2, total_c_half2), sum);
+        }
+        else { // Knight
+            sum = __hfma2(w_h2[0], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input + 1, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[1], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input + 3, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[2], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[3], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 4, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[4], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 2, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[5], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[6], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 4, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[7], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input + 1, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[8], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input + 3, c_half2, total_c_half2), sum);
+        }
+    } else {
+        if (c_half2 < total_c_half2 / 2) { // Rook
+            sum = __hfma2(w_h2[0], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input + 2, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[1], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 2, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[2], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[3], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 1, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[4], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 2, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[5], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 3, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[6], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 4, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[7], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 2, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[8], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input + 2, c_half2, total_c_half2), sum);
+        } else { // Bishop
+            sum = __hfma2(w_h2[0], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[1], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input + 4, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[2], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 1, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[3], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 3, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[4], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 2, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[5], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 1, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[6], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 3, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[7], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[8], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input + 4, c_half2, total_c_half2), sum);
+        }
+    }
+
+    sum = __hadd2(sum, b_h2);
+    
+    float2 sum_f32 = __half22float2(sum);
+    sum_f32.x = activate(sum_f32.x, activation);
+    sum_f32.y = activate(sum_f32.y, activation);
+    // Pack back to strict FP16
+    sum = __float22half2_rn(sum_f32);
+
+    // Write coalesced output back to VRAM (no conversion needed)
+    int out_index = (n * 64 * total_c_half2) + (h * 8 * total_c_half2) + (w * total_c_half2) + c_half2;
+    output[out_index] = sum;
+#endif
+}
+
+template <MaskType mask_type>
+__global__ void DepthwiseKernelNHWC_dense(int total_c_half2, half2* output, const half2* input, const half2* weights,
+ ActivationFunction activation) {
+#if __CUDA_ARCH__ >= 700 
+    int c_half2 = blockIdx.y * blockDim.x + threadIdx.x;
+    if (c_half2 >= total_c_half2) return;
+
+    int w = threadIdx.y;
+    int h = blockIdx.z;
+    int n = blockIdx.x;
+
+    // Load all 25 weights and 1 bias into ultra-fast FP32 registers.
+    float2 w_f32[25];
+    #pragma unroll
+    for(int i = 0; i < 25; ++i) {
+        w_f32[i] = __half22float2(weights[i * total_c_half2 + c_half2]);
+    }
+    // The bias is sitting at index 25
+    float2 b_f32 = __half22float2(weights[25 * total_c_half2 + c_half2]);
+
+    int abs_h_input = h - 2;
+    int abs_w_input = w - 2;
+
+    float2 sum = make_float2(0.0f, 0.0f);
+
+    // Compute the full, dense 5x5 spatial convolution
+    #pragma unroll
+    for (int dy = 0; dy < 5; ++dy) {
+        #pragma unroll
+        for (int dx = 0; dx < 5; ++dx) {
+            mac_fp32(sum, w_f32[dy * 5 + dx], 
+                     get_input_half2_nhwc_safe(input, n, abs_h_input + dy, abs_w_input + dx, c_half2, total_c_half2));
+        }
+    }
+
+    sum.x += b_f32.x;
+    sum.y += b_f32.y;
+    sum.x = activate(sum.x, activation);
+    sum.y = activate(sum.y, activation);
+
+    // Write coalesced output back to VRAM
+    int out_index = (n * 64 * total_c_half2) + (h * 8 * total_c_half2) + (w * total_c_half2) + c_half2;
+    output[out_index] = __float22half2_rn(sum);
+#endif
+}
+
+void DepthwiseEvalNHWC(int N, int C_in, MaskType mask_type, half* output, const half* input, void* scratch,
+                       const half2* w1, ActivationFunction activation, cudaStream_t stream) {
+    
+    const half2* input_half2 = reinterpret_cast<const half2*>(input);
+    half2* output_half2 = reinterpret_cast<half2*>(output);
+
+    int total_c_half2 = C_in / 2;
+
+    // Block: 32 Channels (x) * 8 Width (y) * 1 Height (z) = 256 threads.
+    // threadIdx.x perfectly traverses the fast-moving Channel dimension.
+    dim3 threads(32, 8, 1);
+    
+    // Grid: Batch (x), Channel Blocks (y), Height (z)
+    dim3 blocks(N, (total_c_half2 + 31) / 32, 8);
+
+    switch (mask_type) {
+      case MaskType::RBK:
+          DepthwiseKernelNHWC_fp32<MaskType::RBK><<<blocks, threads, 0, stream>>>(
+              total_c_half2, output_half2, input_half2, w1, activation);
+          break;
+      case MaskType::RB:
+          DepthwiseKernelNHWC_fp32<MaskType::RB><<<blocks, threads, 0, stream>>>(
+              total_c_half2, output_half2, input_half2, w1, activation);
+          break;
+    }
+}
+
+
+
+
+
+
+
 
 
 

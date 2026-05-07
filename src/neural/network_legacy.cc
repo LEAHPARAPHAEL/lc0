@@ -64,7 +64,7 @@ BaseWeights::BaseWeights(const pblczero::Weights& weights)
     encoder.emplace_back(enc);
   }
   for (const auto& block : weights.ip_emb_mobilenet_tower()) {
-    ip_emb_mobilenet_tower.emplace_back(block, this->mask_type);
+    ip_emb_mobilenet_tower.emplace_back(block);
   }
   for (const auto& block : weights.ip_emb_residual_tower()) {
     ip_emb_residual_tower.emplace_back(block);
@@ -83,10 +83,9 @@ BaseWeights::Residual::Residual(const pblczero::Weights::Residual& residual)
       se(residual.se()),
       has_se(residual.has_se()) {}
 
-BaseWeights::MobileNet::MobileNet(const pblczero::Weights::MobileNet& block, 
-                                  const std::string& mask_type)
+BaseWeights::MobileNet::MobileNet(const pblczero::Weights::MobileNet& block)
     : conv1(block.conv1()),
-      d_conv(block.d_conv(), mask_type),
+      d_conv(block.d_conv()),
       conv2(block.conv2()),
       has_se(block.has_se()),
       se(block.se()) {}
@@ -137,8 +136,7 @@ BaseWeights::ConvBlock::ConvBlock(const pblczero::Weights::ConvBlock& block)
 }
 
 
-BaseWeights::DepthwiseConvBlock::DepthwiseConvBlock(const pblczero::Weights::DepthwiseConvBlock& block, 
-                                  const std::string& mask_type)
+BaseWeights::DepthwiseConvBlock::DepthwiseConvBlock(const pblczero::Weights::DepthwiseConvBlock& block)
     : weights(LayerAdapter(block.weights()).as_vector()),
       biases(LayerAdapter(block.biases()).as_vector()),
       bn_gammas(LayerAdapter(block.bn_gammas()).as_vector()),
@@ -176,44 +174,6 @@ BaseWeights::DepthwiseConvBlock::DepthwiseConvBlock(const pblczero::Weights::Dep
     }
     biases[o] = -bn_gammas[o] * bn_means[o] + bn_betas[o];
   }
-
-  /*
-  if (mask_type == "rbk" || mask_type == "rb") {
-    if (inputs != 25) {
-      throw Exception("Mask type requires a 5x5 depthwise convolution kernel.");
-    }
-
-    std::vector<float> packed_weights;
-    packed_weights.reserve(outputs * 10); 
-
-    const int rook_idx[9]   = {2, 7, 10, 11, 12, 13, 14, 17, 22};
-    const int bishop_idx[9] = {0, 4, 6, 8, 12, 16, 18, 20, 24};
-    const int knight_idx[9] = {1, 3, 5, 9, 12, 15, 19, 21, 23};
-
-    for (auto o = size_t{0}; o < outputs; o++) {
-      const int* active_mask = nullptr;
-
-      if (mask_type == "rbk") {
-        if (o < outputs / 3) active_mask = rook_idx;
-        else if (o < 2 * outputs / 3) active_mask = bishop_idx;
-        else active_mask = knight_idx;
-      } else { // "rb"
-        if (o < outputs / 2) active_mask = rook_idx;
-        else active_mask = bishop_idx;
-      }
-
-      for (int i = 0; i < 9; i++) {
-        packed_weights.push_back(weights[o * inputs + active_mask[i]]);
-      }
-      
-      packed_weights.push_back(biases[o]);
-    }
-
-    weights = std::move(packed_weights);
-    
-    biases.clear(); 
-  }
-  */
 
   bn_stddivs.clear();
   bn_means.clear();

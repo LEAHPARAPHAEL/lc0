@@ -165,21 +165,28 @@ void genOffsetPointers(T** offsets, int heads, int max_batch, int depth,
                        cudaStream_t stream);
 
 void fusedMHA(void* output, void* mha_q, void* mha_k, void* mha_v, void* skip,
-              long long bias_strideB,
               int batch_size, int num_heads, int depth, cudaStream_t stream);
 
 template <typename T>
 void AddAttentionMask(int N, int heads, T* logits, const T* mask, cudaStream_t stream);
 
-void convert_float_to_half2(const float* input, half2* output, int C, int H, int W);
+void convert_float_to_half2_nchw(const float* input, half2* output, int C, int H, int W);
+
+void convert_float_to_half2_nhwc(const float* input, half2* output, int C, int H, int W);
 
 void FusedDWPWevalHalf2(int N, int C_in, int C, half* output, const half* input, void* scratch,
                               const half2* w1, const half2* b1, const half2* w2, cudaStream_t stream);
 
-void DepthwiseEval(int N, int C_in, MaskType mask_type, half* output, const half* input, void* scratch,
-                              const half2* w1, cudaStream_t stream);
+void DepthwiseEvalNCHW(int N, int C_in, MaskType mask_type, half* output, const half* input, void* scratch,
+                              const half2* w1, ActivationFunction activation, cudaStream_t stream);
 
 void convert_half_to_half2_nchw(const half* input, half2* output,
+                                int N, int C, int H, int W, cudaStream_t stream);
+
+void DepthwiseEvalNHWC(int N, int C_in, MaskType mask_type, half* output, const half* input, void* scratch,
+                              const half2* w1, ActivationFunction activation, cudaStream_t stream);
+
+void convert_half_to_half2_nhwc(const half* input, half2* output,
                                 int N, int C, int H, int W);
 /*
 template <typename DataType>

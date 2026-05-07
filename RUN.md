@@ -15,23 +15,30 @@ position startpos moves e2e4 c7c6 d2d4 d7d5 b1c3 d5e4 c3e4
 ./build/release/lc0 --weights=/home/raph/leela/networks/8x256x8h-crbk/8x256x8h-crbk-150000.pb.gz
 
 # Backendbench
-./build/lc0 backendbench --weights=/home/raph/leela/networks/8x256x8h/8x256x8h-150000.pb.gz
-./build/lc0 backendbench --weights=/home/raph/leela/networks/8x256x8h-crbk/8x256x8h-crbk-150000.pb.gz
-./build/lc0 backendbench --weights=/home/raph/leela/networks/8x384x12h/8x384x12h-150000.pb.gz
-./build/release/lc0 backendbench --weights=/home/raph/leela/networks/8x384x12h-4res/8x384x12h-4res-10000.pb.gz
-./build/release/lc0 backendbench --weights=/home/raph/leela/networks/8x384x12h-2res/8x384x12h-2res-50000.pb.gz
-./build/release/lc0 backendbench --weights=/home/raph/leela/networks/8x384x12h-2rbk-256/8x384x12h-2rbk-256-70000.pb.gz
+
+./build/release/lc0 backendbench --weights=/home/raph/leela/networks/8x384x12h-2rbk-256/8x384x12h-2rbk-256-150000.pb.gz
 
 ./build/release/lc0 --weights=/home/raph/leela/networks/8x384x12h-2rbk-256/8x384x12h-2rbk-256-150000.pb.gz
 
-./build/release/lc0 backendbench --weights=/home/raph/leela/networks/8x384x12h-2res-256/8x384x12h-2res-256-118000.pb.gz
+./build/release/lc0 backendbench --weights=/home/raph/leela/networks/8x384x12h-2res-256/8x384x12h-2res-256-150000.pb.gz
 
-./build/release/lc0 --weights=/home/raph/leela/networks/8x384x12h-2res-256/8x384x12h-2res-256-118000.pb.gz
+./build/release/lc0 --weights=/home/raph/leela/networks/8x384x12h-2res-256/8x384x12h-2res-256-150000.pb.gz
 
-./build/release/lc0 --weights=/home/raph/leela/networks/8x384x12h-256/8x384x12h-256-118000.pb.gz
+./build/release/lc0 --weights=/home/raph/leela/networks/8x384x12h-256/8x384x12h-256-150000.pb.gz
 
-./build/release/lc0 backendbench --weights=/home/raph/leela/networks/8x384x12h-256/8x384x12h-256-118000.pb.gz
+./build/release/lc0 backendbench --weights=/home/raph/leela/networks/8x384x12h-256/8x384x12h-256-150000.pb.gz
 
+
+
+
+# NHWC
+./build/release/lc0 --weights=/home/raph/leela/networks/8x384x12h-2rbk-relu/8x384x12h-2rbk-relu-150000.pb.gz -o custom_depthwise=true,nhwc=true
+
+./build/release/lc0 backendbench --weights=/home/raph/leela/networks/8x384x12h-2rbk-relu/8x384x12h-2rbk-relu-150000.pb.gz -o custom_depthwise=true,nhwc=true
+
+./build/release/lc0 --weights=/home/raph/leela/networks/8x384x12h-2rbk-256/8x384x12h-2rbk-256-150000.pb.gz -o custom_depthwise=true,nhwc=true
+
+./build/release/lc0 backendbench --weights=/home/raph/leela/networks/8x384x12h-2rbk-256/8x384x12h-2rbk-256-150000.pb.gz -o custom_depthwise=true,nhwc=true
 
 # CUDNN
 

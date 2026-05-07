@@ -41,8 +41,7 @@ struct BaseWeights {
   };
 
   struct DepthwiseConvBlock {
-    explicit DepthwiseConvBlock(const pblczero::Weights::DepthwiseConvBlock& block,
-      const std::string& mask_type = "");
+    explicit DepthwiseConvBlock(const pblczero::Weights::DepthwiseConvBlock& block);
 
     Vec weights;
     Vec biases;
@@ -69,8 +68,7 @@ struct BaseWeights {
   };
 
   struct MobileNet {
-    explicit MobileNet(const pblczero::Weights::MobileNet& block,
-                        const std::string& mask_type = "");
+    explicit MobileNet(const pblczero::Weights::MobileNet& block);
     ConvBlock conv1;
     DepthwiseConvBlock d_conv;
     ConvBlock conv2;
