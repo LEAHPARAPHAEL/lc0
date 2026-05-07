@@ -700,11 +700,11 @@ void DepthwiseEvalNHWC(int N, int C_in, MaskType mask_type, half* output, const 
 
     switch (mask_type) {
       case MaskType::RBK:
-          DepthwiseKernelNHWC_fp32<MaskType::RBK><<<blocks, threads, 0, stream>>>(
+          DepthwiseKernelNHWC_fp16<MaskType::RBK><<<blocks, threads, 0, stream>>>(
               total_c_half2, output_half2, input_half2, w1, activation);
           break;
       case MaskType::RB:
-          DepthwiseKernelNHWC_fp32<MaskType::RB><<<blocks, threads, 0, stream>>>(
+          DepthwiseKernelNHWC_fp16<MaskType::RB><<<blocks, threads, 0, stream>>>(
               total_c_half2, output_half2, input_half2, w1, activation);
           break;
     }
