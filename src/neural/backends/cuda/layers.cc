@@ -2919,7 +2919,189 @@ void EmbeddingLayer<DataType>::Eval(
   addBiasBatched(output, output, biases_, 1, batch, num_outputs, act_, stream);
 }
 
+template <typename DataType>
+Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
+                            void* scratch, Activations activations,
+                            ActivationFunction act,
+                            int input_c,
+                            int max_batch_size,
+                            bool use_gemm_ex, bool fused_mha,
+                            bool nhwc)     
+  : BaseLayer<DataType>(weights.ip_emb_b.size(), 8, 8, nullptr, false, use_gemm_ex),
+    embedding_op_size_(weights.ip_emb_b.size()),
+    encoder_head_count_(weights.encoder_head_count),
+    activations_(activations),
+    act_(act),
+    input_c_(input_c),
+    has_gating_(weights.ip_mult_gate.size() > 0 &&
+                weights.ip_add_gate.size() > 0),
+    has_smolgen_(weights.has_smolgen),
+    is_pe_dense_embedding_(is_pe_dense_embedding),
+    use_fused_mha_(fused_mha),
+    nhwc_(nhwc) {
+    
+  starts_with_encoder_ = std::holds_alternative<EncoderLayer>(weights.tower[0].block);
 
+  BaseLayer<DataType>* prev_layer = nullptr;
+
+  int current_channels = input_c_;
+
+  if (starts_with_encoder_) {
+    allocAndUpload<DataType>(&ip_emb_w_, weights.ip_emb_w, scratch);
+    allocAndUpload<DataType>(&ip_emb_b_, weights.ip_emb_b, scratch);
+    allocAndUpload<DataType>(&ip_emb_pre_w_, weights.ip_emb_preproc_w, scratch);
+    allocAndUpload<DataType>(&ip_emb_pre_b_, weights.ip_emb_preproc_b, scratch);
+
+    allocAndUpload<DataType>(&ip_emb_ln_g_, weights.ip_emb_ln_gammas, scratch);
+    allocAndUpload<DataType>(&ip_emb_ln_b_, weights.ip_emb_ln_betas, scratch);
+
+    allocAndUpload<DataType>(&ip_emb_ffn_d1_w_, weights.ip_emb_ffn.dense1_w,
+                             scratch);
+    allocAndUpload<DataType>(&ip_emb_ffn_d1_b_, weights.ip_emb_ffn.dense1_b,
+                             scratch);
+
+    allocAndUpload<DataType>(&ip_emb_ffn_d2_w_, weights.ip_emb_ffn.dense2_w,
+                             scratch);
+    allocAndUpload<DataType>(&ip_emb_ffn_d2_b_, weights.ip_emb_ffn.dense2_b,
+                             scratch);
+
+    allocAndUpload<DataType>(&ip_emb_ffn_ln_g_, weights.ip_emb_ffn_ln_gammas,
+                             scratch);
+    allocAndUpload<DataType>(&ip_emb_ffn_ln_b_, weights.ip_emb_ffn_ln_betas,
+                             scratch);
+
+    // 12 is the number of input channels used for the input encoding.
+    embedding_dense_size_ = weights.ip_emb_preproc_b.size() / 64;
+    embedding_ffn_size_ = weights.ip_emb_ffn.dense2_b.size();
+    embedding_ffn_dff_ = weights.ip_emb_ffn.dense1_b.size();
+    prev_layer = this;
+  }
+
+  else {
+    input_conv_ = std::make_unique<FusedWinogradConvSELayer<DataType>>(
+        prev_layer, weights.input.biases.size(), 8, 8, current_channels, act_, true, false, false, 0, use_gemm_ex, true                  
+    );
+
+    input_conv_->LoadWeights(const_cast<float*>(weights.input.weights.data()),
+                              const_cast<float*>(weights.input.biases.data()),
+                              scratch);
+    prev_layer = input_conv_.get();
+  }
+
+  for (const auto& pb_block : weights.tower) {
+      TowerNode node;
+
+      // CNN -> ENC
+      if (!pb_block.dense_w.empty()) {
+          node.out_channels = pb_block.dense_b.size();
+          node.in_channels = current_channels; 
+          allocAndUpload<DataType>(&node.dense_w, pb_block.dense_w, scratch);
+          allocAndUpload<DataType>(&node.dense_b, pb_block.dense_b, scratch);
+          allocAndUpload<DataType>(&node.ln_gammas, pb_block.ln_gammas, scratch);
+          allocAndUpload<DataType>(&node.ln_betas, pb_block.ln_betas, scratch);
+          allocAndUpload<DataType>(&node.mult_gate, pb_block.mult_gate, scratch);
+          allocAndUpload<DataType>(&node.add_gate, pb_block.add_gate, scratch);
+          current_channels = node.out_channels; 
+      }
+
+      // ENC -> CNN
+      else if (!pb_block.enc_cnn.biases.empty()) {
+          node.transition_cnn = std::make_unique<Conv1Layer<DataType>>(
+              prev_layer, pb_block.enc_cnn.biases.size(), 8, 8, current_channels,
+              act_, true, use_gemm_ex, nhwc_
+          );
+
+          current_channels = pb_block.enc_cnn.biases.size();
+          prev_layer = node.transition_cnn.get();
+      }
+
+      // CNN -> CNN
+      else if (!pb_block.cnn_cnn.biases.empty()) {
+          node.transition_cnn = std::make_unique<Conv1Layer<DataType>>(
+              prev_layer, pb_block.cnn_cnn.biases.size(), 8, 8, current_channels,
+              act_, true, use_gemm_ex, nhwc_
+          );
+          
+          // UPDATE STATE
+          current_channels = pb_block.cnn_cnn.biases.size();
+          prev_layer = node.transition_cnn.get();
+      }
+
+      // Core block
+      if (std::holds_alternative<EncoderLayer>(pb_block.block)) {
+          node.type = TowerNode::TRANSFORMER;
+          const auto& enc_weights = std::get<EncoderLayer>(pb_block.block);
+          node.encoder = std::make_unique<EncoderBlock<DataType>>(enc_weights, scratch, ...);
+      } 
+      else if (std::holds_alternative<Residual>(pb_block.block)) {
+          node.type = TowerNode::RESIDUAL;
+          const auto& res_weights = std::get<Residual>(pb_block.block);
+          node.cnn = std::make_unique<ResidualLayer<DataType>>(res_weights, ...);
+          prev_layer = node.cnn.get();
+      }
+      else if (std::holds_alternative<MobileNet>(pb_block.block)) {
+          node.type = TowerNode::MOBILENET;
+          const auto& m_weights = std::get<MobileNet>(pb_block.block);
+
+
+          int se_k = m_weights.se.b1.size();
+          int c_expand = m_weights.conv1.biases.size();
+
+          auto conv1 = std::make_unique<Conv1Layer<DataType>>(prev_layer, 
+            c_expand, 8, 8, current_channels, act, true, use_gemm_ex, nhwc_);
+          conv1->LoadWeights(&m_weights.conv1.weights[0],
+                            &m_weights.conv1.biases[0],
+                            scratch);
+          prev_layer = conv1.get();
+          node.cnn_layers.push_back(std::move(conv1));
+          current_channels = c_expand;
+ 
+
+          if (custom_depthwise_) {
+            auto d_conv = std::make_unique<DepthwiseCustom<DataType>>(c_expand, 8, 8, weights.mask_type, act_, nhwc_);
+            d_conv->LoadWeights(&m_weights.d_conv.weights[0],
+                                &m_weights.d_conv.biases[0],
+                              scratch);
+            prev_layer = d_conv.get();
+            node.cnn_layers.push_back(std::move(d_conv));
+            
+          }
+          #ifdef USE_CUDNN
+          else {
+            auto d_conv = std::make_unique<DepthwiseConvLayer<DataType>>(prev_layer, 
+            c_expand, 8, 8, act_, use_gemm_ex, min_batch_size_, max_batch_size_, cudnn_);
+
+            d_conv->LoadWeights(&m_weights.d_conv.weights[0],
+                                &m_weights.d_conv.biases[0],
+                              scratch);
+            prev_layer = d_conv.get();
+            node.cnn_layers.push_back(std::move(d_conv));
+          }
+          #endif
+
+
+          auto conv2 = std::make_unique<Conv1Layer<DataType>>(getLastLayer(), 
+            conv_emb_channels_, 8, 8, c_expand, ACTIVATION_NONE, false, use_gemm_ex, nhwc_);
+          conv2->LoadWeights(&weights.ip_emb_mobilenet_tower[block].conv2.weights[0],
+                            nullptr,
+                            scratch);
+
+          auto se = std::make_unique<SELayer<DataType>>(getLastLayer(),
+          se_k, false, act);
+          se->LoadWeights(&weights.ip_emb_mobilenet_tower[block].se.w1[0],
+                          &weights.ip_emb_mobilenet_tower[block].se.b1[0],
+                          &weights.ip_emb_mobilenet_tower[block].se.w2[0],
+                          &weights.ip_emb_mobilenet_tower[block].se.b2[0],
+                          &weights.ip_emb_mobilenet_tower[block].conv2.biases[0],
+                          scratch_mem_);
+
+          node.cnn = std::make_unique<DepthwiseCustom<DataType>>(m_weights, ...);
+          prev_layer = node.cnn.get();
+      }
+      
+      tower_nodes_.push_back(std::move(node));
+  }
+}
 
 template <typename DataType>
 AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,

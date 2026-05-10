@@ -38,12 +38,8 @@ BaseWeights::BaseWeights(const pblczero::Weights& weights)
       ip_emb_b(LayerAdapter(weights.ip_emb_b()).as_vector()),
       ip_emb_ln_gammas(LayerAdapter(weights.ip_emb_ln_gammas()).as_vector()),
       ip_emb_ln_betas(LayerAdapter(weights.ip_emb_ln_betas()).as_vector()),
-      cnn_enc_w(LayerAdapter(weights.cnn_enc_w()).as_vector()),
-      cnn_enc_b(LayerAdapter(weights.ip_emb_ln_betas()).as_vector()),
-      cnn_enc_ln_gammas(LayerAdapter(weights.ip_emb_ln_betas()).as_vector()),
-      cnn_enc_ln_betas(LayerAdapter(weights.ip_emb_ln_betas()).as_vector()),
-      cnn_enc_mult_gate(LayerAdapter(weights.ip_emb_ln_betas()).as_vector()),
-      cnn_enc_add_gate(LayerAdapter(weights.ip_emb_ln_betas()).as_vector()),
+      ip_emb_expand(weights.ip_emb_expand()),
+      mask_type(weights.mask_type()),
       ip_mult_gate(LayerAdapter(weights.ip_mult_gate()).as_vector()),
       ip_add_gate(LayerAdapter(weights.ip_add_gate()).as_vector()),
       ip_emb_ffn(weights.ip_emb_ffn()),
@@ -60,10 +56,19 @@ BaseWeights::BaseWeights(const pblczero::Weights& weights)
       ip2_mov_b(LayerAdapter(weights.ip2_mov_b()).as_vector()),
       smolgen_w(LayerAdapter(weights.smolgen_w()).as_vector()),
       has_smolgen(weights.has_smolgen_w()){
-  for (const auto& block : weights.tower()) {
-    tower.emplace_back(block);
+  for (const auto& res : weights.residual()) {
+    residual.emplace_back(res);
   }
   encoder_head_count = weights.headcount();
+  for (const auto& enc : weights.encoder()) {
+    encoder.emplace_back(enc);
+  }
+  for (const auto& block : weights.ip_emb_mobilenet_tower()) {
+    ip_emb_mobilenet_tower.emplace_back(block);
+  }
+  for (const auto& block : weights.ip_emb_residual_tower()) {
+    ip_emb_residual_tower.emplace_back(block);
+  }
 }
 
 BaseWeights::SEunit::SEunit(const pblczero::Weights::SEunit& se)
@@ -139,7 +144,6 @@ BaseWeights::DepthwiseConvBlock::DepthwiseConvBlock(const pblczero::Weights::Dep
       bn_means(LayerAdapter(block.bn_means()).as_vector()),
       bn_stddivs(LayerAdapter(block.bn_stddivs()).as_vector()) {
   
-  mask_type = block.mask_type();
   if (weights.size() == 0) return;
 
   if (bn_betas.size() == 0) {
@@ -221,33 +225,6 @@ BaseWeights::EncoderLayer::EncoderLayer(
       ffn(FFN(encoder.ffn())),
       ln2_gammas(LayerAdapter(encoder.ln2_gammas()).as_vector()),
       ln2_betas(LayerAdapter(encoder.ln2_betas()).as_vector()) {}
-
-BaseWeights::TowerBlock::TowerBlock(
-    const pblczero::Weights::TowerBlock& pb_block)
-    : dense_w(LayerAdapter(pb_block.dense_w()).as_vector()),
-      dense_b(LayerAdapter(pb_block.dense_b()).as_vector()),
-      mult_gate(LayerAdapter(pb_block.mult_gate()).as_vector()),
-      add_gate(LayerAdapter(pb_block.add_gate()).as_vector()),
-      ln_gammas(LayerAdapter(pb_block.ln_gammas()).as_vector()),
-      ln_betas(LayerAdapter(pb_block.ln_betas()).as_vector()),
-      cnn_cnn(ConvBlock(pb_block.cnn_cnn())),
-      enc_cnn(ConvBlock(pb_block.enc_cnn())) {
-
-    switch (pb_block.block_type_case()) {
-        case pblczero::Weights::TowerBlock::kMobilenet:
-            block = MobileNet(pb_block.mobilenet());
-            break;
-
-        case pblczero::Weights::TowerBlock::kResidual:
-            block = Residual(pb_block.residual());
-            break;
-
-        case pblczero::Weights::TowerBlock::kEncoder:
-            block = EncoderLayer(pb_block.encoder());
-            break;
-    }
-  }
-
 
 BaseWeights::Smolgen::Smolgen(const pblczero::Weights::Smolgen& smolgen)
     : compress(LayerAdapter(smolgen.compress()).as_vector()),

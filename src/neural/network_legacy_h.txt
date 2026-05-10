@@ -14,7 +14,7 @@
 
  You should have received a copy of the GNU General Public License
  along with Leela Chess.  If not, see <http://www.gnu.org/licenses/>.
-*/
+ */
 
 #pragma once
 
@@ -22,8 +22,6 @@
 #include <vector>
 
 #include "proto/net.pb.h"
-#include <variant>
-#include <optional>
 
 namespace lczero {
 
@@ -51,7 +49,6 @@ struct BaseWeights {
     Vec bn_betas;
     Vec bn_means;
     Vec bn_stddivs;
-    std::string mask_type;
   };
 
   struct SEunit {
@@ -133,21 +130,6 @@ struct BaseWeights {
     Vec ln2_betas;
   };
 
-  struct TowerBlock {
-    explicit TowerBlock(const pblczero::Weights::TowerBlock& pb_block);
-    Vec dense_w;
-    Vec dense_b;
-    Vec mult_gate;
-    Vec add_gate;
-    Vec ln_gammas;
-    Vec ln_betas;
-    ConvBlock cnn_cnn;
-    ConvBlock enc_cnn;
-
-    std::variant<std::monostate, MobileNet, Residual, EncoderLayer> block;
-    
-  };
-
   // Input convnet.
   ConvBlock input;
 
@@ -164,6 +146,10 @@ struct BaseWeights {
   Vec ip_emb_ln_gammas;
   Vec ip_emb_ln_betas;
 
+  ConvBlock ip_emb_expand;
+  std::vector<MobileNet> ip_emb_mobilenet_tower;
+  std::vector<Residual> ip_emb_residual_tower;
+  std::string mask_type;
 
   // Input gating
   Vec ip_mult_gate;
@@ -173,15 +159,6 @@ struct BaseWeights {
   FFN ip_emb_ffn;
   Vec ip_emb_ffn_ln_gammas;
   Vec ip_emb_ffn_ln_betas;
-
-  TowerBlock tower;
-  // CNN -> Encoder
-  Vec cnn_enc_w;
-  Vec cnn_enc_b;
-  Vec cnn_enc_ln_gammas;
-  Vec cnn_enc_ln_betas;
-  Vec cnn_enc_mult_gate;
-  Vec cnn_enc_add_gate;
 
   // Encoder stack.
   std::vector<EncoderLayer> encoder;

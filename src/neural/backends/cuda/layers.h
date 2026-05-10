@@ -691,6 +691,86 @@ class AttentionBody : public BaseLayer<DataType> {
   bool nhwc_;
 };
 
+
+template <typename DataType>
+class Backbone : public BaseLayer<DataType> {
+  using BaseLayer<DataType>::C;
+  using BaseLayer<DataType>::H;
+  using BaseLayer<DataType>::W;
+  using BaseLayer<DataType>::GetC;
+  using BaseLayer<DataType>::GetH;
+  using BaseLayer<DataType>::GetW;
+
+ public:
+  Backbone(const MultiHeadWeights& weights, void* scratch,
+                Activations activations, ActivationFunction act, int input_c,
+                int max_batch_size, bool is_pe_dense_embedding,
+                bool use_gemm_ex, bool fused_mha, bool nhwc = false);
+  ~Backbone();
+  void Eval(int N, DataType* output, const DataType* input,
+            const DataType* input2, void* scratch, size_t scratch_size,
+            cudnnHandle_t cudnn, cublasHandle_t cublas, cudaStream_t stream,
+            DataType*** = nullptr) override;
+
+ private:
+  // GPU allocations to hold various weights used by the attention net body.
+  DataType *ip_emb_pre_w_, *ip_emb_pre_b_;  // input position preprocessing weights.
+  DataType *ip_emb_w_, *ip_emb_b_;          // "embedding" layer in net body
+  DataType *ip_emb_ln_g_, *ip_emb_ln_b_;  // input embedding layernorm gamma and beta
+  DataType *ip_mult_gate_, *ip_add_gate_;   // input gating
+  DataType *ip_emb_ffn_d1_w_, *ip_emb_ffn_d1_b_;  // input embedding FFN dense1 weights
+  DataType *ip_emb_ffn_d2_w_, *ip_emb_ffn_d2_b_;  // input embedding FFN dense2 weights
+  DataType *ip_emb_ffn_ln_g_, *ip_emb_ffn_ln_b_;  // input embedding FFN layernorm gamma and beta
+  DataType *smolgen_global_;  // global smolgen weights for all encoder layers
+  DataType *pos_encoding_;
+  int embedding_dense_size_;
+  int embedding_op_size_;
+  int embedding_ffn_size_;
+  int embedding_ffn_dff_;
+  int encoder_head_count_;
+  Activations activations_;
+  ActivationFunction act_;
+  int input_c_;
+  int smolgen_global_size_;
+  const bool has_gating_;
+  const bool has_smolgen_;
+  bool is_pe_dense_embedding_;  // flag for dense position encoding
+  const bool use_fused_mha_;
+  bool nhwc_;
+  struct TowerNode {
+    DataType* dense_w = nullptr;
+    DataType* dense_b = nullptr;
+    DataType* ln_gammas = nullptr;
+    DataType* ln_betas = nullptr;
+    DataType* mult_gate = nullptr;
+    DataType* add_gate = nullptr;
+    
+    std::unique_ptr<BaseLayer<DataType>> transition_cnn;
+
+    enum BlockType { TRANSFORMER, RESIDUAL, MOBILENET };
+    BlockType type;
+    
+    std::unique_ptr<EncoderBlock<DataType>> encoder;
+    std::vector<std::unique_ptr<BaseLayer<DataType>>> cnn_layers;
+
+    int in_channels;
+    int out_channels;
+  };
+
+  std::vector<TowerNode> tower_nodes_;
+  bool starts_with_encoder_;
+
+  bool end_with_cnn_;
+
+  DataType *cnn_enc_w_, *cnn_enc_b_;
+  DataType *cnn_enc_ln_gammas_, *cnn_enc_ln_betas_;
+  DataType *cnn_enc_mult_gate_, *cnn_enc_add_gate_;
+  std::unique_ptr<FusedWinogradConvSELayer<DataType>> input_conv_;
+};
+
+
+
+
 // The value head implementation
 // Responsible for loading weights into GPU memory, and evaluating the value
 // head and value error head
