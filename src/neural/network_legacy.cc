@@ -38,12 +38,6 @@ BaseWeights::BaseWeights(const pblczero::Weights& weights)
       ip_emb_b(LayerAdapter(weights.ip_emb_b()).as_vector()),
       ip_emb_ln_gammas(LayerAdapter(weights.ip_emb_ln_gammas()).as_vector()),
       ip_emb_ln_betas(LayerAdapter(weights.ip_emb_ln_betas()).as_vector()),
-      cnn_enc_w(LayerAdapter(weights.cnn_enc_w()).as_vector()),
-      cnn_enc_b(LayerAdapter(weights.ip_emb_ln_betas()).as_vector()),
-      cnn_enc_ln_gammas(LayerAdapter(weights.ip_emb_ln_betas()).as_vector()),
-      cnn_enc_ln_betas(LayerAdapter(weights.ip_emb_ln_betas()).as_vector()),
-      cnn_enc_mult_gate(LayerAdapter(weights.ip_emb_ln_betas()).as_vector()),
-      cnn_enc_add_gate(LayerAdapter(weights.ip_emb_ln_betas()).as_vector()),
       ip_mult_gate(LayerAdapter(weights.ip_mult_gate()).as_vector()),
       ip_add_gate(LayerAdapter(weights.ip_add_gate()).as_vector()),
       ip_emb_ffn(weights.ip_emb_ffn()),
@@ -51,6 +45,12 @@ BaseWeights::BaseWeights(const pblczero::Weights& weights)
           LayerAdapter(weights.ip_emb_ffn_ln_gammas()).as_vector()),
       ip_emb_ffn_ln_betas(
           LayerAdapter(weights.ip_emb_ffn_ln_betas()).as_vector()),
+      cnn_enc_w(LayerAdapter(weights.cnn_enc_w()).as_vector()),
+      cnn_enc_b(LayerAdapter(weights.cnn_enc_b()).as_vector()),
+      cnn_enc_ln_gammas(LayerAdapter(weights.cnn_enc_ln_gammas()).as_vector()),
+      cnn_enc_ln_betas(LayerAdapter(weights.cnn_enc_ln_betas()).as_vector()),
+      cnn_enc_mult_gate(LayerAdapter(weights.cnn_enc_mult_gate()).as_vector()),
+      cnn_enc_add_gate(LayerAdapter(weights.cnn_enc_add_gate()).as_vector()),
       moves_left(weights.moves_left()),
       ip_mov_w(LayerAdapter(weights.ip_mov_w()).as_vector()),
       ip_mov_b(LayerAdapter(weights.ip_mov_b()).as_vector()),
@@ -64,6 +64,7 @@ BaseWeights::BaseWeights(const pblczero::Weights& weights)
     tower.emplace_back(block);
   }
   encoder_head_count = weights.headcount();
+  epsilon = weights.epsilon();
 }
 
 BaseWeights::SEunit::SEunit(const pblczero::Weights::SEunit& se)
@@ -139,7 +140,10 @@ BaseWeights::DepthwiseConvBlock::DepthwiseConvBlock(const pblczero::Weights::Dep
       bn_means(LayerAdapter(block.bn_means()).as_vector()),
       bn_stddivs(LayerAdapter(block.bn_stddivs()).as_vector()) {
   
-  mask_type = block.mask_type();
+  rook_channels = block.rook_channels();
+  bishop_channels = block.bishop_channels();
+  knight_channels = block.knight_channels();
+
   if (weights.size() == 0) return;
 
   if (bn_betas.size() == 0) {
@@ -222,6 +226,15 @@ BaseWeights::EncoderLayer::EncoderLayer(
       ln2_gammas(LayerAdapter(encoder.ln2_gammas()).as_vector()),
       ln2_betas(LayerAdapter(encoder.ln2_betas()).as_vector()) {}
 
+BaseWeights::ConvNext::ConvNext(
+    const pblczero::Weights::ConvNext& block)
+    : d_conv(DepthwiseConvBlock(block.d_conv())),
+      ln1_gammas(LayerAdapter(block.ln1_gammas()).as_vector()),
+      ln1_betas(LayerAdapter(block.ln1_betas()).as_vector()),
+      ffn(FFN(block.ffn())),
+      ln2_gammas(LayerAdapter(block.ln2_gammas()).as_vector()),
+      ln2_betas(LayerAdapter(block.ln2_betas()).as_vector()) {}
+
 BaseWeights::TowerBlock::TowerBlock(
     const pblczero::Weights::TowerBlock& pb_block)
     : dense_w(LayerAdapter(pb_block.dense_w()).as_vector()),
@@ -233,18 +246,20 @@ BaseWeights::TowerBlock::TowerBlock(
       cnn_cnn(ConvBlock(pb_block.cnn_cnn())),
       enc_cnn(ConvBlock(pb_block.enc_cnn())) {
 
-    switch (pb_block.block_type_case()) {
-        case pblczero::Weights::TowerBlock::kMobilenet:
-            block = MobileNet(pb_block.mobilenet());
-            break;
-
-        case pblczero::Weights::TowerBlock::kResidual:
-            block = Residual(pb_block.residual());
-            break;
-
-        case pblczero::Weights::TowerBlock::kEncoder:
-            block = EncoderLayer(pb_block.encoder());
-            break;
+    if (pb_block.has_mobilenet()) {
+        block = MobileNet(pb_block.mobilenet());
+    } 
+    else if (pb_block.has_residual()) {
+        block = Residual(pb_block.residual());
+    } 
+    else if (pb_block.has_encoder()) { 
+        block = EncoderLayer(pb_block.encoder());
+    } 
+    else if (pb_block.has_convnext()) { 
+        block = ConvNext(pb_block.convnext());
+    } 
+    else {
+        block = std::monostate{};
     }
   }
 

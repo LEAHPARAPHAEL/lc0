@@ -546,6 +546,58 @@ void convertNCHWtoNHWC(DstType* output_tensor, const SrcType* input_tensor,
       output_tensor, input_tensor, Nin, Cin, Nout, Cout, H, W);
 }
 
+template <typename dT, typename sT>
+__device__ dT readNHWC(const sT* input_tensor, int n, int c, int h, int w,
+                       int Nin, int Cin, int H, int W) {
+  if (n >= Nin || c >= Cin) return 0;
+
+  int index;
+  index = n;
+  index *= H;    
+  index += h;
+  index *= W;    
+  index += w;
+  index *= Cin;   
+  index += c;
+
+  return (dT)(input_tensor[index]);
+}
+
+
+template <typename dT, typename sT>
+__global__ void NHWCtoNCHW_kernel(dT* output_tensor, const sT* input_tensor,
+                                  int Nin, int Cin, int Nout, int Cout, int H,
+                                  int W) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= Nout * Cout * H * W) return;
+
+  int index = tid;
+
+  int w = index % W;
+  index /= W;
+  int h = index % H;
+  index /= H;
+  int c = index % Cout;
+  index /= Cout;
+  int n = index;
+
+  output_tensor[tid] =
+      readNHWC<dT, sT>(input_tensor, n, c, h, w, Nin, Cin, H, W);
+
+}
+
+template <typename DstType, typename SrcType>
+void convertNHWCtoNCHW(DstType* output_tensor, const SrcType* input_tensor,
+                       int Nin, int Cin, int Nout, int Cout, int H, int W,
+                       cudaStream_t stream) {
+  size_t numElements = Nout * Cout * H * W;
+  const int blockSize = 256;
+  int blocks = DivUp(numElements, blockSize);
+  
+  NHWCtoNCHW_kernel<<<blocks, blockSize, 0, stream>>>(
+      output_tensor, input_tensor, Nin, Cin, Nout, Cout, H, W);
+}
+
 template <typename DstType, typename SrcType>
 __global__ void copyTypeConverted_kernel(DstType* op, SrcType* ip, int N) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1712,6 +1764,21 @@ template void OutputTransform<float, false, ACTIVATION_NONE, true, false, false,
                                      const float* b1, const float* w2,
                                      const float* b2, cudaStream_t stream);
 
+template void OutputTransform<float, false, ACTIVATION_MISH, true, true, true,
+                              true>(int N, int C, int se_K, float* output,
+                                    const float* input, const float* skip,
+                                    const float* bias, const float* w1,
+                                    const float* b1, const float* w2,
+                                    const float* b2, cudaStream_t stream);
+
+template void OutputTransform<float, false, ACTIVATION_RELU, true, true, true,
+                              true>(int N, int C, int se_K, float* output,
+                                    const float* input, const float* skip,
+                                    const float* bias, const float* w1,
+                                    const float* b1, const float* w2,
+                                    const float* b2, cudaStream_t stream);                                    
+                                    
+
 template void OutputInputTransform<float, true, ACTIVATION_RELU, true, true>(
     int N, int C, int se_K, float* output, const float* input,
     const float* skip, const float* bias, const float* w1, const float* b1,
@@ -1780,6 +1847,21 @@ template void convertNCHWtoNHWC<half, half>(half* output_tensor,
                                             const half* input_tensor, int Nin,
                                             int Cin, int Nout, int Cout, int H,
                                             int W, cudaStream_t stream);
+
+template void convertNHWCtoNCHW<half, float>(half* output_tensor,
+                                             const float* input_tensor, int Nin,
+                                             int Cin, int Nout, int Cout, int H,
+                                             int W, cudaStream_t stream);
+template void convertNHWCtoNCHW<float, float>(float* output_tensor,
+                                              const float* input_tensor,
+                                              int Nin, int Cin, int Nout,
+                                              int Cout, int H, int W,
+                                              cudaStream_t stream);
+template void convertNHWCtoNCHW<half, half>(half* output_tensor,
+                                            const half* input_tensor, int Nin,
+                                            int Cin, int Nout, int Cout, int H,
+                                            int W, cudaStream_t stream);
+    
 
 template void inputPreprocessForAttentionBody<half>(
     half* output, const half* input, const half* encoding, int N,

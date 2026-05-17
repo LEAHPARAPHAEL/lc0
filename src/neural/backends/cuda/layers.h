@@ -35,7 +35,7 @@
 #include "cuda_common.h"
 #include "neural/network_legacy.h"
 #include "neural/tables/activation_function.h"
-
+#include <kernels.h>
 #ifdef USE_CUDNN
 #include <cudnn_frontend.h>
 #include <cudnn.h>
@@ -255,43 +255,6 @@ class FusedWinogradConvSELayer : public BaseLayer<DataType> {
   DataType* b2_;
 };
 
-/*
-template <typename DataType>
-class Conv1Layer : public BaseLayer<DataType> {
-  using BaseLayer<DataType>::C;
-  using BaseLayer<DataType>::H;
-  using BaseLayer<DataType>::W;
-  using BaseLayer<DataType>::GetC;
-  using BaseLayer<DataType>::GetH;
-  using BaseLayer<DataType>::GetW;
-  using BaseLayer<DataType>::nhwc_;
-
- public:
-  Conv1Layer(BaseLayer<DataType>* ip, int C, int H, int W, int Cin,
-             ActivationFunction activation, bool bias, bool use_gemm_ex);
-
-  ~Conv1Layer();
-  void LoadWeights(float* pfilter, float* pBias, void* scratch);
-  void Eval(int N, DataType* output, const DataType* input,
-            const DataType* input2, void* scratch, size_t scratch_size,
-            cudnnHandle_t cudnn, cublasHandle_t cublas, cudaStream_t stream,
-            DataType*** = nullptr) override;
-
- private:
-  const int c_input_;
-  const ActivationFunction act_;
-  const bool use_bias_;
-
-  DataType* biases_ = nullptr;
-  DataType* weights_ = nullptr;
-
-  // uses stride of 0 to read a vector as a matrix
-  void cublasSpecialMatrixMul(const DataType* A, const DataType* B,
-                              DataType* Out, int M, int N, int K, int batchSize,
-                              cublasHandle_t cublas);
-};
-*/
-
 template <typename DataType>
 class Conv1Layer : public BaseLayer<DataType> {
   using BaseLayer<DataType>::C;
@@ -341,7 +304,8 @@ class ResidualBlock : public BaseLayer<DataType> {
  public:
   ResidualBlock(BaseLayer<DataType>* ip, int C, bool se, int se_k,
                 bool use_gemm_ex, bool first, bool last,
-                ActivationFunction activation, int shared_mem_size);
+                ActivationFunction activation, int shared_mem_size,
+                bool output_nhwc);
 
   ~ResidualBlock();
   void LoadWeights0(float* pfilter, float* pBias, void* scratch);
@@ -372,6 +336,8 @@ class ResidualBlock : public BaseLayer<DataType> {
   DataType* w2_;
   DataType* b1_;
   DataType* b2_;
+
+  bool output_nhwc_;
 };
 
 #ifdef USE_CUDNN
@@ -472,7 +438,8 @@ class DepthwiseCustom : public BaseLayer<DataType> {
   using BaseLayer<DataType>::nhwc_;
 
  public:
-  DepthwiseCustom(int C_in, int H, int W, std::string mask_type, ActivationFunction act, bool nhwc = false);
+  DepthwiseCustom(int C_in, int H, int W, ActivationFunction act, bool nhwc, int rook_channels,
+      int bishop_channels, int knight_channels);
 
   ~DepthwiseCustom();
 
@@ -490,7 +457,9 @@ class DepthwiseCustom : public BaseLayer<DataType> {
   //DataType* weights1 = nullptr;
   //DataType* weights2 = nullptr;
   half2* weights = nullptr;
-  MaskType mask_type_;
+  int rook_channels_;
+  int bishop_channels_;
+  int knight_channels_;
 
   void init();
 
@@ -693,6 +662,32 @@ class AttentionBody : public BaseLayer<DataType> {
 
 
 template <typename DataType>
+class LayoutTransformLayer : public BaseLayer<DataType> {
+ private:
+  bool to_nhwc_;
+  int channels_;
+  
+ public:
+  LayoutTransformLayer(BaseLayer<DataType>* prev, int channels, bool to_nhwc)
+      : BaseLayer<DataType>(channels, 8, 8, prev, to_nhwc, false),
+        to_nhwc_(to_nhwc), channels_(channels) {}
+
+  void Eval(int N, DataType* output, const DataType* input, const DataType* input2,
+            void* scratch, size_t scratch_size, cudnnHandle_t cudnn,
+            cublasHandle_t cublas, cudaStream_t stream, DataType*** offset_pointers) override {
+      
+      if (to_nhwc_) {
+          convertNCHWtoNHWC((DataType*)scratch, input, N, channels_, N, channels_, 8, 8, stream);
+      } else {
+          convertNHWCtoNCHW((DataType*)scratch, input, N, channels_, N, channels_, 8, 8, stream);
+      }
+      
+      int size = N * channels_ * 64;
+      cudaMemcpyAsync(output, scratch, size * sizeof(DataType), cudaMemcpyDeviceToDevice, stream);
+  }
+};
+
+template <typename DataType>
 class Backbone : public BaseLayer<DataType> {
   using BaseLayer<DataType>::C;
   using BaseLayer<DataType>::H;
@@ -703,9 +698,24 @@ class Backbone : public BaseLayer<DataType> {
 
  public:
   Backbone(const MultiHeadWeights& weights, void* scratch,
-                Activations activations, ActivationFunction act, int input_c,
-                int max_batch_size, bool is_pe_dense_embedding,
-                bool use_gemm_ex, bool fused_mha, bool nhwc = false);
+                Activations activations,
+                int input_c,
+                int residual_blocks,
+                int mobilenet_blocks,
+                int convnext_blocks,
+                int encoder_blocks,
+                std::string first_block,
+                int min_batch_size,
+                int max_batch_size,
+                bool use_gemm_ex, 
+                bool fused_mha, 
+                bool nhwc,
+                bool use_res_block_winograd_fuse_opt,
+                bool allow_cache_opt,
+                int l2_cache_size,
+                int shared_mem_per_block_optin,
+                bool use_custom_depthwise, 
+                cudnnHandle_t cudnn);
   ~Backbone();
   void Eval(int N, DataType* output, const DataType* input,
             const DataType* input2, void* scratch, size_t scratch_size,
@@ -734,7 +744,6 @@ class Backbone : public BaseLayer<DataType> {
   int smolgen_global_size_;
   const bool has_gating_;
   const bool has_smolgen_;
-  bool is_pe_dense_embedding_;  // flag for dense position encoding
   const bool use_fused_mha_;
   bool nhwc_;
   struct TowerNode {
@@ -744,28 +753,64 @@ class Backbone : public BaseLayer<DataType> {
     DataType* ln_betas = nullptr;
     DataType* mult_gate = nullptr;
     DataType* add_gate = nullptr;
-    
-    std::unique_ptr<BaseLayer<DataType>> transition_cnn;
 
-    enum BlockType { TRANSFORMER, RESIDUAL, MOBILENET };
-    BlockType type;
+    DataType* convnext_ln1_betas = nullptr;
+    DataType* convnext_ln1_gammas = nullptr;
+    DataType* convnext_ffn_dense1_w = nullptr;
+    DataType* convnext_ffn_dense1_b = nullptr;
+    DataType* convnext_ffn_dense2_w = nullptr;
+    DataType* convnext_ffn_dense2_b = nullptr;
+    DataType* convnext_ln2_betas = nullptr;
+    DataType* convnext_ln2_gammas = nullptr;
     
+    std::unique_ptr<Conv1Layer<DataType>> transition_cnn;
+
+    enum BlockType { TRANSFORMER, RESIDUAL, MOBILENET, CONVNEXT };
+    BlockType type;
+
+    int skip_idx = 0;
+
+    bool requires_NHWC_NCHW_conversion = false;
+    bool requires_NCHW_NHWC_conversion = false;
+
     std::unique_ptr<EncoderBlock<DataType>> encoder;
     std::vector<std::unique_ptr<BaseLayer<DataType>>> cnn_layers;
 
     int in_channels;
     int out_channels;
+    int dff_channels;
   };
 
   std::vector<TowerNode> tower_nodes_;
   bool starts_with_encoder_;
+  bool starts_with_residual_;
+  bool starts_with_mobilenet_;
+  bool starts_with_convnext_;
 
   bool end_with_cnn_;
 
   DataType *cnn_enc_w_, *cnn_enc_b_;
   DataType *cnn_enc_ln_gammas_, *cnn_enc_ln_betas_;
   DataType *cnn_enc_mult_gate_, *cnn_enc_add_gate_;
-  std::unique_ptr<FusedWinogradConvSELayer<DataType>> input_conv_;
+  std::unique_ptr<BaseLayer<DataType>> input_conv_;
+  //std::unique_ptr<ConvLayer<DataType>> input_conv_;
+
+  bool use_res_block_winograd_fuse_opt_;
+  int shared_mem_per_block_optin_;
+  bool use_custom_depthwise_;
+  std::unique_ptr<LayoutTransformLayer<DataType>> final_layout_transform_;
+  int total_residual_blocks_;
+  bool allow_cache_opt_ = false;
+  int l2_cache_size_;
+  float alpha_;
+
+  int residual_blocks_;
+  int mobilenet_blocks_;
+  int convnext_blocks_;
+  int encoder_blocks_;
+  int input_conv_output_channels_;
+
+  float default_epsilon_;
 };
 
 

@@ -51,7 +51,9 @@ struct BaseWeights {
     Vec bn_betas;
     Vec bn_means;
     Vec bn_stddivs;
-    std::string mask_type;
+    int rook_channels;
+    int bishop_channels;
+    int knight_channels;
   };
 
   struct SEunit {
@@ -133,6 +135,17 @@ struct BaseWeights {
     Vec ln2_betas;
   };
 
+  struct ConvNext {
+    explicit ConvNext(const pblczero::Weights::ConvNext& block);
+    DepthwiseConvBlock d_conv;
+    Vec ln1_gammas;
+    Vec ln1_betas;
+    FFN ffn;
+    Vec ln2_gammas;
+    Vec ln2_betas;
+  };
+
+
   struct TowerBlock {
     explicit TowerBlock(const pblczero::Weights::TowerBlock& pb_block);
     Vec dense_w;
@@ -144,7 +157,7 @@ struct BaseWeights {
     ConvBlock cnn_cnn;
     ConvBlock enc_cnn;
 
-    std::variant<std::monostate, MobileNet, Residual, EncoderLayer> block;
+    std::variant<std::monostate, MobileNet, Residual, EncoderLayer, ConvNext> block;
     
   };
 
@@ -174,7 +187,7 @@ struct BaseWeights {
   Vec ip_emb_ffn_ln_gammas;
   Vec ip_emb_ffn_ln_betas;
 
-  TowerBlock tower;
+  std::vector<TowerBlock> tower;
   // CNN -> Encoder
   Vec cnn_enc_w;
   Vec cnn_enc_b;
@@ -186,6 +199,7 @@ struct BaseWeights {
   // Encoder stack.
   std::vector<EncoderLayer> encoder;
   int encoder_head_count;
+  float epsilon;
 
   // Residual tower.
   std::vector<Residual> residual;

@@ -24,6 +24,8 @@
   terms of the respective license agreement, the licensors of this
   Program grant you additional permission to convey the resulting work.
 */
+
+/*
 #include <algorithm>
 #include <cassert>
 #include <list>
@@ -1286,3 +1288,4 @@ REGISTER_NETWORK("cudnn", MakeCudnnNetwork<float>, 110)
 REGISTER_NETWORK("cudnn-fp16", MakeCudnnNetwork<half>, 105)
 
 }  // namespace lczero
+*/

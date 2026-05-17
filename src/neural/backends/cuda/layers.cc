@@ -96,6 +96,23 @@ void dumpTensor(T* memory, int elements, const char* message, bool only_summary 
 
 namespace cudnn_backend {
 
+#define TRAP_CUDA(block_idx, phase_name) \
+    do { \
+        cudaError_t sync_err = cudaDeviceSynchronize(); \
+        cudaError_t last_err = cudaGetLastError(); \
+        cudaError_t err = (sync_err != cudaSuccess) ? sync_err : last_err; \
+        if (err != cudaSuccess) { \
+            printf("\n>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>\n"); \
+            printf("FATAL GPU CRASH!\n"); \
+            printf("Location: Block %d | Phase: %s\n", block_idx, phase_name); \
+            printf("Error: %s\n", cudaGetErrorString(err)); \
+            printf("<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<\n\n"); \
+            fflush(stdout); \
+            exit(1); \
+        } \
+    } while(0)
+
+
 inline int GetPaddedBatchSize(int batch_size) {
   
   if (batch_size <= 32) {
@@ -942,20 +959,19 @@ void DepthwiseConvLayer<DataType>::Eval(
 
 
 template<typename DataType>
-DepthwiseCustom<DataType>::DepthwiseCustom(int C_in, int H, int W, std::string mask_type, ActivationFunction act, 
-  bool nhwc)
+DepthwiseCustom<DataType>::DepthwiseCustom(int C_in, int H, int W, ActivationFunction act, bool nhwc,
+      int rook_channels,
+      int bishop_channels, 
+      int knight_channels)
     : BaseLayer<DataType>(C_in, H, W, nullptr, nhwc, false),
       c_input_(C_in),
-      act_(act) {
+      act_(act),
+      rook_channels_(rook_channels),
+      bishop_channels_(bishop_channels),
+      knight_channels_(knight_channels) {
   // Allocate memory for weights (filter tensor) and biases.
-  const size_t weight_size = sizeof(half) * c_input_ * 26;
+  const size_t weight_size = sizeof(half) * c_input_ * 10;
   ReportCUDAErrors(cudaMalloc(&weights, weight_size));
-
-  if (mask_type == "rbk") {
-      mask_type_ = MaskType::RBK;
-  } else if (mask_type == "rb") {
-      mask_type_ = MaskType::RB;
-  }
   }
 
   
@@ -974,16 +990,10 @@ DepthwiseCustom<DataType>::DepthwiseCustom(int C_in, int H, int W, std::string m
     for (int o = 0; o < c_input_; o++) {
         const int* active_mask = nullptr;
 
-        if (mask_type_ == MaskType::RBK) {
-            if (o < c_input_ / 3) active_mask = rook_idx;
-            else if (o < 2 * c_input_ / 3) active_mask = bishop_idx;
-            else active_mask = knight_idx;
-        } else { // MaskType::RB
-            if (o < c_input_ / 2) active_mask = rook_idx;
-            else active_mask = bishop_idx;
-        }
+        if (o < rook_channels_) active_mask = rook_idx;
+        else if (o < (rook_channels_ + bishop_channels_)) active_mask = bishop_idx;
+        else active_mask = knight_idx;
 
-        // Extract the 9 specific mask weights from the full 5x5 (25) grid
         for (int i = 0; i < 9; i++) {
             packed_weights.push_back(pfilter[o * 25 + active_mask[i]]);
         }
@@ -994,7 +1004,7 @@ DepthwiseCustom<DataType>::DepthwiseCustom(int C_in, int H, int W, std::string m
     const size_t packed_size = sizeof(float) * c_input_ * 10;
 
     // --- OPTIONAL DEBUG BLOCK ---
-    
+    /*
     if (c_input_ > 0) {
         std::cout << "\n=== DEBUG: DepthwiseCustom Packing | Channel 0 ===" << std::endl;
         std::cout << "Packed Array (9 Weights + 1 Bias):\n";
@@ -1003,14 +1013,12 @@ DepthwiseCustom<DataType>::DepthwiseCustom(int C_in, int H, int W, std::string m
         }
         std::cout << "\n==================================================\n" << std::endl;
     }
-    
+    */
     // ----------------------------
 
-    // Copy the tightly packed array from Host to GPU Scratch Memory
     ReportCUDAErrors(
         cudaMemcpy(scratch, packed_weights.data(), packed_size, cudaMemcpyHostToDevice));
         
-    // Convert to half2 format
     if (nhwc_) {
       convert_float_to_half2_nhwc((float*)scratch, (half2*)weights, c_input_, 10, 1);
     }
@@ -1022,35 +1030,6 @@ DepthwiseCustom<DataType>::DepthwiseCustom(int C_in, int H, int W, std::string m
   
   
 
-  /*
-  template <typename DataType>
-  void DepthwiseCustom<DataType>::LoadWeights(float* pfilter, float* pBias, void* scratch) {
-    assert(pfilter != nullptr);
-    assert(scratch != nullptr);
-
-    // 25 spatial weights + 1 bias = 26 elements per channel
-    std::vector<float> packed_weights(26 * c_input_, 0.0f); 
-
-    for (int o = 0; o < c_input_; o++) {
-        // 1. Pack all 25 weights in standard [C, 26] format (NCHW)
-        for (int i = 0; i < 25; i++) {
-            packed_weights[o * 26 + i] = pfilter[o * 25 + i];
-        }
-        
-        // 2. Bias goes into the 26th spot of the channel
-        packed_weights[o * 26 + 25] = pBias ? pBias[o] : 0.0f;
-    }
-
-    const size_t packed_size = sizeof(float) * c_input_ * 26;
-    ReportCUDAErrors(cudaMemcpy(scratch, packed_weights.data(), packed_size, cudaMemcpyHostToDevice));
-        
-    // 3. Launch the NHWC converter! 
-    // It reads [C, 26] floats and writes perfectly coalesced [26, C/2] half2s.
-    convert_float_to_half2_nhwc((float*)scratch, (half2*)weights, c_input_, 26, 1);
-  }
-  */
-  
-
   template <>
   void DepthwiseCustom<half>::Eval(int N, half* output, const half* input,
             const half* input2, void* scratch, size_t scratch_size,
@@ -1059,11 +1038,13 @@ DepthwiseCustom<DataType>::DepthwiseCustom(int C_in, int H, int W, std::string m
     
     try  {
       if (nhwc_) {
-        DepthwiseEvalNHWC(N, c_input_, mask_type_, output, input, scratch, weights, act_, stream);
+        DepthwiseEvalNHWC(N, c_input_, output, input, scratch, weights, act_, rook_channels_,
+          bishop_channels_, knight_channels_, stream);
       }
         
       else {
-        DepthwiseEvalNCHW(N, c_input_, mask_type_, output, input, scratch, weights, act_, stream);
+        DepthwiseEvalNCHW(N, c_input_, output, input, scratch, weights, act_, rook_channels_,
+          bishop_channels_, knight_channels_, stream);
       }
     }
     catch (const std::runtime_error& e) {
@@ -1751,114 +1732,6 @@ FusedWinogradConvSELayer<DataType>::~FusedWinogradConvSELayer() {
   }
 }
 
-/*
-template <typename DataType>
-Conv1Layer<DataType>::Conv1Layer(BaseLayer<DataType>* ip, int C, int H, int W,
-                                 int Cin, ActivationFunction activation,
-                                 bool bias, bool use_gemm_ex)
-    : BaseLayer<DataType>(C, H, W, ip, false, use_gemm_ex),
-      c_input_(Cin),
-      act_(activation),
-      use_bias_(bias) {
-  // Allocate memory for weights (filter tensor) and biases.
-  const size_t weight_size = sizeof(DataType) * c_input_ * C * 1 * 1;
-  ReportCUDAErrors(cudaMalloc(&weights_, weight_size));
-
-  if (use_bias_) {
-    const size_t bias_size = sizeof(DataType) * C;
-    ReportCUDAErrors(cudaMalloc(&biases_, bias_size));
-  }
-}
-
-template <typename DataType>
-void Conv1Layer<DataType>::LoadWeights(float* pfilter, float* pBias,
-                                       void* scratch) {
-  const size_t weight_size = sizeof(float) * c_input_ * C * 1 * 1;
-  const size_t bias_size = sizeof(float) * C;
-
-  // first copy from CPU memory to scratch space in GPU memory
-  // and then do the type conversion using a kernel
-  assert(scratch);
-  ReportCUDAErrors(
-      cudaMemcpy(scratch, pfilter, weight_size, cudaMemcpyHostToDevice));
-  copyTypeConverted((DataType*)weights_, (float*)scratch, C * c_input_ * 1 * 1,
-                    0);
-
-  if (pBias) {
-    ReportCUDAErrors(
-        cudaMemcpy(scratch, pBias, bias_size, cudaMemcpyHostToDevice));
-    copyTypeConverted((DataType*)biases_, (float*)scratch, C, 0);
-  }
-}
-template <>
-void Conv1Layer<half>::cublasSpecialMatrixMul(const half* A, const half* B,
-                                              half* Out, int M, int N, int K,
-                                              int batchSize,
-                                              cublasHandle_t cublas) {
-  // Need to initialize 1.0 and 0.0 as hexadecimal for fp16 because typecasting
-  // float to half type doesn't work before CUDA 10.0
-  __half_raw one_h{0x3C00};
-  __half_raw zero_h{0};
-  half halfOne = one_h;
-  half halfZero = zero_h;
-
-  // dimensions of matrix A = M x K
-  // dimensions of matrix B = K x N
-  // dimensions of output   = M x N
-
-  // cublas supports only col major output
-  // to multiply row major matrices, use the trick below
-  // NOTE strideB set to 0 below!
-  ReportCUBLASErrors(cublasGemmStridedBatchedEx(
-      cublas, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &halfOne, B, CUDA_R_16F, N,
-      N * K, A, CUDA_R_16F, K, 0, &halfZero, Out, CUDA_R_16F, N, N * M,
-      batchSize, CUDA_R_16F, CUBLAS_GEMM_DEFAULT));
-}
-
-template <>
-void Conv1Layer<float>::cublasSpecialMatrixMul(const float* A, const float* B,
-                                               float* Out, int M, int N, int K,
-                                               int batchSize,
-                                               cublasHandle_t cublas) {
-  float floatOne = 1.0f;
-  float floatZero = 0.0f;
-
-  // NOTE strideB set to 0 below!
-  if (use_gemm_ex_)
-    ReportCUBLASErrors(cublasGemmStridedBatchedEx(
-        cublas, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &floatOne, B, CUDA_R_32F, N,
-        N * K, A, CUDA_R_32F, K, 0, &floatZero, Out, CUDA_R_32F, N, N * M,
-        batchSize, CUDA_R_32F, CUBLAS_GEMM_DEFAULT));
-  else
-    // Much slower on RTX 2060.. why? Maybe a cublas bug :-/
-    ReportCUBLASErrors(cublasSgemmStridedBatched(
-        cublas, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &floatOne, B, N, N * K, A, K,
-        0, &floatZero, Out, N, N * M, batchSize));
-}
-
-template <typename DataType>
-void Conv1Layer<DataType>::Eval(int N, DataType* output, const DataType* input,
-                                const DataType*, void*,
-                                size_t,
-                                cudnnHandle_t , cublasHandle_t cublas,
-                                cudaStream_t stream, DataType***) {
-  cublasSpecialMatrixMul(weights_, input, output, C, H * W, c_input_, N,
-                         cublas);
-
-  if (use_bias_)
-    addBias_NCHW(output, output, biases_, N, C, H, W, act_, stream);
-  else if (act_ != ACTIVATION_NONE)
-    addVectors(output, output, (DataType*)nullptr, N * C * H * W, N * C * H * W,
-               0, act_, stream);
-}
-
-template <typename DataType>
-Conv1Layer<DataType>::~Conv1Layer() {
-  ReportCUDAErrors(cudaFree(weights_));
-  if (use_bias_) ReportCUDAErrors(cudaFree(biases_));
-}
-*/
-
 template <typename DataType>
 Conv1Layer<DataType>::Conv1Layer(BaseLayer<DataType>* ip, int C, int H, int W,
                                  int Cin, ActivationFunction activation,
@@ -1991,7 +1864,8 @@ ResidualBlock<DataType>::ResidualBlock(BaseLayer<DataType>* ip, int C, bool se,
                                        int se_k, bool use_gemm_ex, bool first,
 
                                        bool last, ActivationFunction activation,
-                                       int shared_mem_size)
+                                       int shared_mem_size,
+                                       bool output_nhwc)
     : BaseLayer<DataType>(C, 8, 8, ip, ip->isNHWC(), use_gemm_ex),
       has_se_(se),
       se_k_(se_k),
@@ -1999,7 +1873,8 @@ ResidualBlock<DataType>::ResidualBlock(BaseLayer<DataType>* ip, int C, bool se,
       first_block_(first),
       last_block_(last),
       shared_mem_size_(shared_mem_size),
-      act_(activation) {
+      act_(activation),
+      output_nhwc_(output_nhwc) {
   if (act_ != ACTIVATION_RELU && act_ != ACTIVATION_MISH) {
     throw Exception("Unsupported activation for residual block.");
   }
@@ -2183,14 +2058,29 @@ void ResidualBlock<DataType>::Eval(int N, DataType* output,
 
   if (act_ == ACTIVATION_RELU) {
     if (last_block_) {
-      if (has_se_)
-        OutputTransform<DataType, true, ACTIVATION_RELU, true, true, true,
-                        false>(N, C, se_k_, output, transformed_output, input,
-                               biases1_, w1_, b1_, w2_, b2_, stream);
-      else
-        OutputTransform<DataType, false, ACTIVATION_RELU, true, true, true,
-                        false>(N, C, se_k_, output, transformed_output, input,
-                               biases1_, w1_, b1_, w2_, b2_, stream);
+      if (has_se_) {
+        if (output_nhwc_)
+          OutputTransform<DataType, true, ACTIVATION_RELU, true, true, true,
+                  true>(N, C, se_k_, output, transformed_output, input,
+                          biases1_, w1_, b1_, w2_, b2_, stream);
+        else
+          OutputTransform<DataType, true, ACTIVATION_RELU, true, true, true,
+                  false>(N, C, se_k_, output, transformed_output, input,
+                          biases1_, w1_, b1_, w2_, b2_, stream);
+      }
+
+      else {
+        if (output_nhwc_)
+          OutputTransform<DataType, false, ACTIVATION_RELU, true, true, true,
+                true>(N, C, se_k_, output, transformed_output, input,
+                        biases1_, w1_, b1_, w2_, b2_, stream);
+        else
+          OutputTransform<DataType, false, ACTIVATION_RELU, true, true, true,
+                false>(N, C, se_k_, output, transformed_output, input,
+                        biases1_, w1_, b1_, w2_, b2_, stream);
+
+      }
+
     } else {
       if (has_se_) {
         if (allowFusing) {
@@ -2212,14 +2102,29 @@ void ResidualBlock<DataType>::Eval(int N, DataType* output,
     }
   } else if (act_ == ACTIVATION_MISH) {
     if (last_block_) {
-      if (has_se_)
-        OutputTransform<DataType, true, ACTIVATION_MISH, true, true, true,
-                        false>(N, C, se_k_, output, transformed_output, input,
-                               biases1_, w1_, b1_, w2_, b2_, stream);
-      else
-        OutputTransform<DataType, false, ACTIVATION_MISH, true, true, true,
-                        false>(N, C, se_k_, output, transformed_output, input,
-                               biases1_, w1_, b1_, w2_, b2_, stream);
+      if (has_se_) {
+        if (output_nhwc_)
+          OutputTransform<DataType, true, ACTIVATION_MISH, true, true, true,
+                  true>(N, C, se_k_, output, transformed_output, input,
+                          biases1_, w1_, b1_, w2_, b2_, stream);
+        else
+          OutputTransform<DataType, true, ACTIVATION_MISH, true, true, true,
+                  false>(N, C, se_k_, output, transformed_output, input,
+                          biases1_, w1_, b1_, w2_, b2_, stream);
+      }
+
+      else {
+        if (output_nhwc_)
+          OutputTransform<DataType, false, ACTIVATION_MISH, true, true, true,
+                true>(N, C, se_k_, output, transformed_output, input,
+                        biases1_, w1_, b1_, w2_, b2_, stream);
+        else
+          OutputTransform<DataType, false, ACTIVATION_MISH, true, true, true,
+                false>(N, C, se_k_, output, transformed_output, input,
+                        biases1_, w1_, b1_, w2_, b2_, stream);
+
+      }
+
     } else {
       if (has_se_) {
         if (allowFusing) {
@@ -2420,7 +2325,12 @@ EncoderBlock<DataType>::EncoderBlock(
     smol_dense_1_size_ = cpu_weights.mha.smolgen.dense1_b.size();
     smol_dense_2_size_ = cpu_weights.mha.smolgen.dense2_b.size();
     smol_global_size_ = smolgen_global_size;
-
+    /*
+    std::cout<<"smol_compress_size_"<<smol_compress_size_<<std::endl;
+    std::cout<<"smol_dense_1_size_"<<smol_dense_1_size_<<std::endl;
+    std::cout<<"smol_dense_2_size_"<<smol_dense_2_size_<<std::endl;
+    std::cout<<"smol_global_size_"<<smol_global_size_<<std::endl;
+    */
     allocAndUpload<DataType>(&smol_compress, cpu_weights.mha.smolgen.compress,
                              scratch);
     allocAndUpload<DataType>(&smol_dense1_w, cpu_weights.mha.smolgen.dense1_w,
@@ -2452,6 +2362,14 @@ static void cublasXgemm(cublasHandle_t handle, cublasOperation_t transa,
                         float alpha, const DataType* A, int lda,
                         const DataType* B, int ldb, float beta, DataType* C,
                         int ldc) {
+  /*
+  std::cout<<"m "<<m<<std::endl;
+  std::cout<<"n "<<n<<std::endl;
+  std::cout<<"k "<<k<<std::endl;
+  std::cout<<"lda "<<lda<<std::endl;
+  std::cout<<"ldb "<<ldb<<std::endl;
+  std::cout<<"ldc "<<ldc<<std::endl;
+  */
   const bool fp16 = std::is_same<half, DataType>::value;
   if (fp16) {
     unsigned short alpha_h = FP32toFP16(alpha);
@@ -2525,7 +2443,6 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
                                   DataType*** offset_pointers) const {
   const int d_model = mha_q_size_;
   const int depth = d_model / encoder_heads_;
-
   // Calculate smolgen weights. Do this first so we can make use of
   // scratch, buffer1 and buffer2.
   if (has_smolgen_) {
@@ -2921,30 +2838,76 @@ void EmbeddingLayer<DataType>::Eval(
 
 template <typename DataType>
 Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
-                            void* scratch, Activations activations,
-                            ActivationFunction act,
+                            void* scratch, 
+                            Activations activations,
                             int input_c,
+                            int residual_blocks,
+                            int mobilenet_blocks,
+                            int convnext_blocks,
+                            int encoder_blocks,
+                            std::string first_block,
+                            int min_batch_size,
                             int max_batch_size,
-                            bool use_gemm_ex, bool fused_mha,
-                            bool nhwc)     
-  : BaseLayer<DataType>(weights.ip_emb_b.size(), 8, 8, nullptr, false, use_gemm_ex),
+                            bool use_gemm_ex, 
+                            bool fused_mha,
+                            bool nhwc,
+                            bool use_res_block_winograd_fuse_opt,
+                            bool allow_cache_opt,
+                            int l2_cache_size,
+                            int shared_mem_per_block_optin,
+                            bool use_custom_depthwise,
+                            cudnnHandle_t cudnn)     
+  : BaseLayer<DataType>(weights.ip_emb_b.size(), 8, 8, nullptr, nhwc, use_gemm_ex),
     embedding_op_size_(weights.ip_emb_b.size()),
     encoder_head_count_(weights.encoder_head_count),
+    default_epsilon_(weights.epsilon),
     activations_(activations),
-    act_(act),
+    act_(activations.default_activation),
     input_c_(input_c),
+    residual_blocks_(residual_blocks),
+    mobilenet_blocks_(mobilenet_blocks),
+    encoder_blocks_(encoder_blocks),
+    convnext_blocks_(convnext_blocks),
     has_gating_(weights.ip_mult_gate.size() > 0 &&
                 weights.ip_add_gate.size() > 0),
     has_smolgen_(weights.has_smolgen),
-    is_pe_dense_embedding_(is_pe_dense_embedding),
     use_fused_mha_(fused_mha),
-    nhwc_(nhwc) {
+    nhwc_(nhwc),
+    use_res_block_winograd_fuse_opt_(use_res_block_winograd_fuse_opt),
+    allow_cache_opt_(allow_cache_opt),
+    l2_cache_size_(l2_cache_size),
+    shared_mem_per_block_optin_(shared_mem_per_block_optin),
+    use_custom_depthwise_(use_custom_depthwise),
+    smolgen_global_(nullptr),
+    ip_mult_gate_(nullptr),
+    ip_add_gate_(nullptr),
+    cnn_enc_w_(nullptr),
+    cnn_enc_b_(nullptr),
+    cnn_enc_ln_gammas_(nullptr),
+    cnn_enc_ln_betas_(nullptr),
+    cnn_enc_mult_gate_(nullptr),
+    cnn_enc_add_gate_(nullptr) {
     
-  starts_with_encoder_ = std::holds_alternative<EncoderLayer>(weights.tower[0].block);
-
+  starts_with_encoder_ = first_block == "T";
+  starts_with_residual_ = first_block == "R";
+  starts_with_mobilenet_ = first_block == "M";
+  starts_with_convnext_ = first_block == "C";
+  //default_epsilon_ = starts_with_encoder_ ? 1e-3 : 1e-6;
   BaseLayer<DataType>* prev_layer = nullptr;
-
+  
   int current_channels = input_c_;
+
+  alpha_ = (encoder_blocks_ + convnext_blocks_) > 0 ? (float)pow(2.0 * (encoder_blocks_ + convnext_blocks_), -0.25) : 1.0f;
+
+  if (has_smolgen_) {
+    allocAndUpload<DataType>(&smolgen_global_, weights.smolgen_w, scratch);
+    smolgen_global_size_ = 64*64;
+  }
+
+  if (has_gating_) {
+    allocAndUpload<DataType>(&ip_mult_gate_, weights.ip_mult_gate, scratch);
+    allocAndUpload<DataType>(&ip_add_gate_, weights.ip_add_gate, scratch);
+  }
 
   if (starts_with_encoder_) {
     allocAndUpload<DataType>(&ip_emb_w_, weights.ip_emb_w, scratch);
@@ -2970,31 +2933,37 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
     allocAndUpload<DataType>(&ip_emb_ffn_ln_b_, weights.ip_emb_ffn_ln_betas,
                              scratch);
 
-    // 12 is the number of input channels used for the input encoding.
     embedding_dense_size_ = weights.ip_emb_preproc_b.size() / 64;
     embedding_ffn_size_ = weights.ip_emb_ffn.dense2_b.size();
     embedding_ffn_dff_ = weights.ip_emb_ffn.dense1_b.size();
     prev_layer = this;
+    current_channels = embedding_op_size_;
+  }
+  else if (starts_with_mobilenet_ || starts_with_convnext_){
+    auto input_conv = std::make_unique<Conv1Layer<DataType>>(
+              prev_layer, weights.input.biases.size(), 8, 8, current_channels,
+              act_, true, use_gemm_ex, nhwc_
+          );
+    
+    input_conv->LoadWeights(const_cast<float*>(weights.input.weights.data()),
+                                const_cast<float*>(weights.input.biases.data()),
+                                scratch);
+    
+    prev_layer = input_conv.get();
+
+    input_conv_ = std::move(input_conv);
+    
+    current_channels = weights.input.biases.size();
+    input_conv_output_channels_ = current_channels;    
   }
 
-  else {
-    input_conv_ = std::make_unique<FusedWinogradConvSELayer<DataType>>(
-        prev_layer, weights.input.biases.size(), 8, 8, current_channels, act_, true, false, false, 0, use_gemm_ex, true                  
-    );
-
-    input_conv_->LoadWeights(const_cast<float*>(weights.input.weights.data()),
-                              const_cast<float*>(weights.input.biases.data()),
-                              scratch);
-    prev_layer = input_conv_.get();
-  }
-
-  for (const auto& pb_block : weights.tower) {
+  for (size_t i = 0; i < weights.tower.size(); ++i) {
+      const auto& pb_block = weights.tower[i];
       TowerNode node;
-
       // CNN -> ENC
       if (!pb_block.dense_w.empty()) {
-          node.out_channels = pb_block.dense_b.size();
-          node.in_channels = current_channels; 
+          node.out_channels = pb_block.dense_b.size(); 
+          node.in_channels = current_channels;
           allocAndUpload<DataType>(&node.dense_w, pb_block.dense_w, scratch);
           allocAndUpload<DataType>(&node.dense_b, pb_block.dense_b, scratch);
           allocAndUpload<DataType>(&node.ln_gammas, pb_block.ln_gammas, scratch);
@@ -3002,6 +2971,10 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
           allocAndUpload<DataType>(&node.mult_gate, pb_block.mult_gate, scratch);
           allocAndUpload<DataType>(&node.add_gate, pb_block.add_gate, scratch);
           current_channels = node.out_channels; 
+          if (!nhwc_) {
+            node.requires_NCHW_NHWC_conversion = true;
+          }
+          embedding_op_size_ = current_channels;
       }
 
       // ENC -> CNN
@@ -3010,9 +2983,15 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
               prev_layer, pb_block.enc_cnn.biases.size(), 8, 8, current_channels,
               act_, true, use_gemm_ex, nhwc_
           );
+          node.transition_cnn->LoadWeights(const_cast<float*>(pb_block.enc_cnn.weights.data()),
+                                           const_cast<float*>(pb_block.enc_cnn.biases.data()), 
+                                           scratch);
 
           current_channels = pb_block.enc_cnn.biases.size();
           prev_layer = node.transition_cnn.get();
+          if (!nhwc_) {
+            node.requires_NHWC_NCHW_conversion = true;
+          }
       }
 
       // CNN -> CNN
@@ -3021,87 +3000,435 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
               prev_layer, pb_block.cnn_cnn.biases.size(), 8, 8, current_channels,
               act_, true, use_gemm_ex, nhwc_
           );
+
+          node.transition_cnn->LoadWeights(const_cast<float*>(pb_block.cnn_cnn.weights.data()),
+                                  const_cast<float*>(pb_block.cnn_cnn.biases.data()), 
+                                  scratch);
           
-          // UPDATE STATE
           current_channels = pb_block.cnn_cnn.biases.size();
           prev_layer = node.transition_cnn.get();
       }
 
-      // Core block
-      if (std::holds_alternative<EncoderLayer>(pb_block.block)) {
+      if (std::holds_alternative<BaseWeights::EncoderLayer>(pb_block.block)) {
           node.type = TowerNode::TRANSFORMER;
-          const auto& enc_weights = std::get<EncoderLayer>(pb_block.block);
-          node.encoder = std::make_unique<EncoderBlock<DataType>>(enc_weights, scratch, ...);
+          const auto& enc_weights = std::get<BaseWeights::EncoderLayer>(pb_block.block);
+          node.encoder = std::make_unique<EncoderBlock<DataType>>(
+              enc_weights, scratch, encoder_head_count_, embedding_op_size_, 
+              alpha_,
+              smolgen_global_, smolgen_global_size_, max_batch_size,
+              activations_.smolgen_activation, activations_.ffn_activation,
+              default_epsilon_, use_gemm_ex, use_fused_mha_
+          );
       } 
-      else if (std::holds_alternative<Residual>(pb_block.block)) {
-          node.type = TowerNode::RESIDUAL;
-          const auto& res_weights = std::get<Residual>(pb_block.block);
-          node.cnn = std::make_unique<ResidualLayer<DataType>>(res_weights, ...);
-          prev_layer = node.cnn.get();
-      }
-      else if (std::holds_alternative<MobileNet>(pb_block.block)) {
-          node.type = TowerNode::MOBILENET;
-          const auto& m_weights = std::get<MobileNet>(pb_block.block);
+      else if (std::holds_alternative<BaseWeights::MobileNet>(pb_block.block)) {
+        node.type = TowerNode::MOBILENET;
+        const auto& m_weights = std::get<BaseWeights::MobileNet>(pb_block.block);
 
+        int se_k = m_weights.se.b1.size();
+        int c_expand = m_weights.conv1.biases.size();
 
-          int se_k = m_weights.se.b1.size();
-          int c_expand = m_weights.conv1.biases.size();
+        auto conv1 = std::make_unique<Conv1Layer<DataType>>(prev_layer, 
+          c_expand, 8, 8, current_channels, act_, true, use_gemm_ex, nhwc_);
+        conv1->LoadWeights(const_cast<float*>(m_weights.conv1.weights.data()),
+                          const_cast<float*>(m_weights.conv1.biases.data()),
+                          scratch);
+        prev_layer = conv1.get();
+        node.cnn_layers.push_back(std::move(conv1));
+        current_channels = c_expand;
 
-          auto conv1 = std::make_unique<Conv1Layer<DataType>>(prev_layer, 
-            c_expand, 8, 8, current_channels, act, true, use_gemm_ex, nhwc_);
-          conv1->LoadWeights(&m_weights.conv1.weights[0],
-                            &m_weights.conv1.biases[0],
+        if (nhwc_ || use_custom_depthwise_) {
+          auto d_conv = std::make_unique<DepthwiseCustom<DataType>>(c_expand, 8, 8, act_, nhwc_,
+                m_weights.d_conv.rook_channels,
+                m_weights.d_conv.bishop_channels,
+                m_weights.d_conv.knight_channels);
+          d_conv->LoadWeights(const_cast<float*>(m_weights.d_conv.weights.data()),
+                              const_cast<float*>(m_weights.d_conv.biases.data()),
                             scratch);
-          prev_layer = conv1.get();
-          node.cnn_layers.push_back(std::move(conv1));
-          current_channels = c_expand;
- 
+          prev_layer = d_conv.get();
+          node.cnn_layers.push_back(std::move(d_conv));
+        }
+        #ifdef USE_CUDNN
+        else {
+          auto d_conv = std::make_unique<DepthwiseConvLayer<DataType>>(prev_layer, 
+          c_expand, 8, 8, act_, use_gemm_ex, min_batch_size, max_batch_size, cudnn);
 
-          if (custom_depthwise_) {
-            auto d_conv = std::make_unique<DepthwiseCustom<DataType>>(c_expand, 8, 8, weights.mask_type, act_, nhwc_);
-            d_conv->LoadWeights(&m_weights.d_conv.weights[0],
-                                &m_weights.d_conv.biases[0],
-                              scratch);
-            prev_layer = d_conv.get();
-            node.cnn_layers.push_back(std::move(d_conv));
-            
-          }
-          #ifdef USE_CUDNN
-          else {
-            auto d_conv = std::make_unique<DepthwiseConvLayer<DataType>>(prev_layer, 
-            c_expand, 8, 8, act_, use_gemm_ex, min_batch_size_, max_batch_size_, cudnn_);
-
-            d_conv->LoadWeights(&m_weights.d_conv.weights[0],
-                                &m_weights.d_conv.biases[0],
-                              scratch);
-            prev_layer = d_conv.get();
-            node.cnn_layers.push_back(std::move(d_conv));
-          }
-          #endif
-
-
-          auto conv2 = std::make_unique<Conv1Layer<DataType>>(getLastLayer(), 
-            conv_emb_channels_, 8, 8, c_expand, ACTIVATION_NONE, false, use_gemm_ex, nhwc_);
-          conv2->LoadWeights(&weights.ip_emb_mobilenet_tower[block].conv2.weights[0],
-                            nullptr,
+          d_conv->LoadWeights(const_cast<float*>(m_weights.d_conv.weights.data()),
+                              const_cast<float*>(m_weights.d_conv.biases.data()),
                             scratch);
+          prev_layer = d_conv.get();
+          node.cnn_layers.push_back(std::move(d_conv));
+        }
+        #endif
 
-          auto se = std::make_unique<SELayer<DataType>>(getLastLayer(),
-          se_k, false, act);
-          se->LoadWeights(&weights.ip_emb_mobilenet_tower[block].se.w1[0],
-                          &weights.ip_emb_mobilenet_tower[block].se.b1[0],
-                          &weights.ip_emb_mobilenet_tower[block].se.w2[0],
-                          &weights.ip_emb_mobilenet_tower[block].se.b2[0],
-                          &weights.ip_emb_mobilenet_tower[block].conv2.biases[0],
-                          scratch_mem_);
 
-          node.cnn = std::make_unique<DepthwiseCustom<DataType>>(m_weights, ...);
-          prev_layer = node.cnn.get();
+        auto conv2 = std::make_unique<Conv1Layer<DataType>>(prev_layer, 
+          m_weights.conv2.biases.size(), 8, 8, current_channels, ACTIVATION_NONE, false, use_gemm_ex, nhwc_);
+        conv2->LoadWeights(const_cast<float*>(m_weights.conv2.weights.data()),
+                          nullptr,
+                          scratch);
+        prev_layer = conv2.get();
+        node.cnn_layers.push_back(std::move(conv2));
+        current_channels = m_weights.conv2.biases.size();
+
+        auto se = std::make_unique<SELayer<DataType>>(prev_layer,
+        se_k, false, act_);
+        se->LoadWeights(const_cast<float*>(m_weights.se.w1.data()),
+                        const_cast<float*>(m_weights.se.b1.data()),
+                        const_cast<float*>(m_weights.se.w2.data()),
+                        const_cast<float*>(m_weights.se.b2.data()),
+                        const_cast<float*>(m_weights.conv2.biases.data()),
+                        scratch);
+
+        prev_layer = se.get();
+        node.cnn_layers.push_back(std::move(se));
+        node.skip_idx = 3;
       }
-      
+      else if (std::holds_alternative<BaseWeights::ConvNext>(pb_block.block)) {
+        node.type = TowerNode::CONVNEXT;
+        const auto& c_weights = std::get<BaseWeights::ConvNext>(pb_block.block);
+        allocAndUpload<DataType>(&node.convnext_ln1_betas, c_weights.ln1_betas, scratch);
+        allocAndUpload<DataType>(&node.convnext_ln1_gammas, c_weights.ln1_gammas, scratch);
+        allocAndUpload<DataType>(&node.convnext_ffn_dense1_w, c_weights.ffn.dense1_w, scratch);
+        allocAndUpload<DataType>(&node.convnext_ffn_dense1_b, c_weights.ffn.dense1_b, scratch);
+        allocAndUpload<DataType>(&node.convnext_ffn_dense2_w, c_weights.ffn.dense2_w, scratch);
+        allocAndUpload<DataType>(&node.convnext_ffn_dense2_b, c_weights.ffn.dense2_b, scratch);
+        allocAndUpload<DataType>(&node.convnext_ln2_betas, c_weights.ln2_betas, scratch);
+        allocAndUpload<DataType>(&node.convnext_ln2_gammas, c_weights.ln2_gammas, scratch);
+        node.dff_channels = c_weights.ffn.dense1_b.size();
+
+        if (nhwc_ || use_custom_depthwise_) {
+          auto d_conv = std::make_unique<DepthwiseCustom<DataType>>(current_channels, 8, 8, act_, nhwc_,
+                c_weights.d_conv.rook_channels,
+                c_weights.d_conv.bishop_channels,
+                c_weights.d_conv.knight_channels);
+          d_conv->LoadWeights(const_cast<float*>(c_weights.d_conv.weights.data()),
+                              const_cast<float*>(c_weights.d_conv.biases.data()),
+                            scratch);
+          prev_layer = d_conv.get();
+          node.cnn_layers.push_back(std::move(d_conv));
+        }
+        #ifdef USE_CUDNN
+        else {
+          auto d_conv = std::make_unique<DepthwiseConvLayer<DataType>>(prev_layer, 
+          current_channels, 8, 8, act_, use_gemm_ex, min_batch_size, max_batch_size, cudnn);
+
+          d_conv->LoadWeights(const_cast<float*>(c_weights.d_conv.weights.data()),
+                              const_cast<float*>(c_weights.d_conv.biases.data()),
+                            scratch);
+          prev_layer = d_conv.get();
+          node.cnn_layers.push_back(std::move(d_conv));
+        }
+        #endif
+
+      }      
+      node.out_channels = current_channels;
       tower_nodes_.push_back(std::move(node));
   }
+
+  if (!weights.cnn_enc_b.empty()) {
+    if (!nhwc_) {
+      final_layout_transform_ = std::make_unique<LayoutTransformLayer<DataType>>(prev_layer, current_channels, true);
+      prev_layer = final_layout_transform_.get();
+    }
+    allocAndUpload<DataType>(&cnn_enc_w_, weights.cnn_enc_w, scratch);
+    allocAndUpload<DataType>(&cnn_enc_b_, weights.cnn_enc_b, scratch);
+    allocAndUpload<DataType>(&cnn_enc_ln_gammas_, weights.cnn_enc_ln_gammas, scratch);
+    allocAndUpload<DataType>(&cnn_enc_ln_betas_, weights.cnn_enc_ln_betas, scratch);
+    allocAndUpload<DataType>(&cnn_enc_mult_gate_, weights.cnn_enc_mult_gate, scratch);
+    allocAndUpload<DataType>(&cnn_enc_add_gate_, weights.cnn_enc_add_gate, scratch);
+    prev_layer = this;
+  }
+
+  this->C = current_channels;
 }
+
+template <typename DataType>
+void Backbone<DataType>::Eval(int N, DataType* output,
+                              const DataType* input,
+                              const DataType* input2, void* scratch,
+                              size_t scratch_size, cudnnHandle_t cudnn,
+                              cublasHandle_t cublas, cudaStream_t stream,
+                              DataType*** offset_pointers) {
+  DataType* flow = (DataType*)output; 
+  DataType* buf0 = (DataType*)input;  
+  DataType* buf1 = (DataType*)input2;  
+  DataType* buf2 = buf1 + scratch_size / (2 * sizeof(DataType));
+
+  DataType* temp = (DataType*)scratch;
+
+  int inputC = input_c_;
+  int current_channels = inputC;
+
+  if (starts_with_encoder_) {
+      const int num_outputs = 64 * embedding_dense_size_;
+      const int num_inputs = 64 * 12;
+      const int batch = N;
+
+      convertNCHWtoNHWC(temp, buf0, N, inputC, N, 12, 8, 8, stream);
+      cublasXgemm<DataType>(
+          cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch, num_inputs,
+          1.0f, (const DataType*)ip_emb_pre_w_, num_inputs,
+          temp, num_inputs, 0.0f, buf1, num_outputs);
+
+      const int size = num_outputs * N;
+      addVectors(buf1, buf1, ip_emb_pre_b_, size, size, num_outputs, ACTIVATION_NONE, stream);
+      inputPreprocessForAttentionBody(temp, buf0, buf1, N, kInputPlanes, embedding_dense_size_, true, stream);
+      inputC += embedding_dense_size_;
+      {
+      const int num_outputs = embedding_op_size_;
+      const int num_inputs = inputC;
+      const int batch = N * 64;
+      cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs,
+                            batch, num_inputs, 1.0f, (const DataType*)ip_emb_w_,
+                            num_inputs, temp, num_inputs, 0.0f, flow, num_outputs);
+      LayerNorm<DataType>(N * 64, embedding_op_size_, temp, flow,
+                          ip_emb_b_, (DataType*)nullptr, ip_emb_ln_g_,
+                          ip_emb_ln_b_, default_epsilon_, 1.0, act_, stream);
+      }
+
+      if (has_gating_) {
+        applyInputGating<DataType>(temp, temp, ip_mult_gate_, ip_add_gate_, N, 64, embedding_op_size_, stream);
+      }
+
+      {
+      const int num_inputs = embedding_ffn_size_;
+      const int num_outputs = embedding_ffn_dff_; 
+      const int batch = N * 64;
+      cublasXgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch, num_inputs, 1.0f, 
+                  (const DataType*)ip_emb_ffn_d1_w_, num_inputs, temp, num_inputs, 0.0f, buf1, num_outputs);
+      addBiasBatched(buf1, buf1, ip_emb_ffn_d1_b_, 1, batch, num_outputs, activations_.ffn_activation, stream);
+      }
+
+      {
+      const int num_inputs = embedding_ffn_dff_; 
+      const int num_outputs = embedding_ffn_size_;
+      const int batch = N * 64;
+      
+      cublasXgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch, num_inputs, 1.0f, 
+                  (const DataType*)ip_emb_ffn_d2_w_, num_inputs, buf1, num_inputs, 0.0f, buf2, num_outputs); 
+      
+      LayerNorm<DataType>(N * 64, embedding_ffn_size_, flow, buf2, ip_emb_ffn_d2_b_, temp, 
+                          ip_emb_ffn_ln_g_, ip_emb_ffn_ln_b_, default_epsilon_, alpha_, ACTIVATION_NONE, stream);
+      }
+
+      current_channels = embedding_op_size_;
+  }
+  else if (starts_with_mobilenet_ || starts_with_convnext_) {
+      input_conv_->Eval(N, flow, buf0, nullptr, (DataType*)scratch, scratch_size, cudnn, cublas, stream, offset_pointers);
+      current_channels = input_conv_output_channels_;
+  }
+
+
+  //int b_idx = -1;
+  for (auto& node : tower_nodes_) {
+      //b_idx ++;
+      DataType* temp_flow = flow;
+      DataType* temp_spare = buf0;
+
+
+      if (node.requires_NCHW_NHWC_conversion) {
+          convertNCHWtoNHWC(temp_spare, temp_flow, N, current_channels, N, current_channels, 8, 8, stream);
+          std::swap(temp_flow, temp_spare);
+      } 
+      else if (node.requires_NHWC_NCHW_conversion) {
+          convertNHWCtoNCHW(temp_spare, temp_flow, N, current_channels, N, current_channels, 8, 8, stream);
+          std::swap(temp_flow, temp_spare);
+      }
+
+      if (node.dense_w != nullptr) {
+          const int batch = N * 64; 
+          const int num_inputs = node.in_channels;
+          const int num_outputs = node.out_channels;
+
+          cublasXgemm<DataType>(
+              cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch, num_inputs, 1.0f, 
+              (const DataType*)node.dense_w, num_inputs, temp_flow, num_inputs, 0.0f, temp_spare, num_outputs
+          );
+          std::swap(temp_flow, temp_spare);
+          LayerNorm<DataType>(batch, num_outputs, temp_spare, temp_flow, node.dense_b, (DataType*)nullptr, 
+                              node.ln_gammas, node.ln_betas, default_epsilon_, 1.0, ACTIVATION_NONE, stream);
+          std::swap(temp_flow, temp_spare);
+          if (node.mult_gate != nullptr) {
+              applyInputGating<DataType>(temp_flow, temp_flow, node.mult_gate, node.add_gate, N, 64, num_outputs, stream);
+          }
+          current_channels = node.out_channels;
+      }
+      else if (node.transition_cnn != nullptr) {
+          node.transition_cnn->Eval(N, temp_spare, temp_flow, nullptr, (DataType*)scratch, scratch_size, cudnn, cublas, stream, offset_pointers);
+          std::swap(temp_flow, temp_spare);
+      }
+
+      current_channels = node.out_channels;
+
+
+
+      if (temp_flow != flow) {
+        cudaMemcpyAsync(flow, temp_flow, N * current_channels * 64 * sizeof(DataType), cudaMemcpyDeviceToDevice, stream);
+        //copyTypeConverted((DataType*)flow, (DataType*)temp_flow, N * current_channels * 64, stream);
+      }
+      
+      if (node.type == TowerNode::TRANSFORMER) {
+          node.encoder->Eval(N, flow, (DataType*)scratch, buf1, buf2, cublas, stream, offset_pointers);
+      } 
+      
+      else if (node.type == TowerNode::MOBILENET) {  
+          temp_flow = flow;    
+          temp_spare = buf0;   
+          DataType* temp_alt = buf1; 
+
+          for (int i = 0; i < node.cnn_layers.size(); ++i) {
+              if (i == node.skip_idx) {
+                  node.cnn_layers[i]->Eval(N, flow, temp_flow, flow, temp, scratch_size, cudnn, cublas, stream, offset_pointers);
+                  temp_flow = flow;
+              } 
+              else {
+                  node.cnn_layers[i]->Eval(N, temp_spare, temp_flow, nullptr, temp, scratch_size, cudnn, cublas, stream, offset_pointers);
+                  temp_flow = temp_spare;
+                  std::swap(temp_spare, temp_alt); 
+              }
+          }
+      }
+
+      else if (node.type == TowerNode::CONVNEXT) {
+
+        node.cnn_layers[0]->Eval(N, buf0, flow, nullptr, temp, scratch_size, cudnn, cublas, stream, offset_pointers);
+
+        LayerNorm<DataType>(N * 64, current_channels, buf1, buf0, nullptr,
+                      nullptr, node.convnext_ln1_gammas, node.convnext_ln1_betas, default_epsilon_,
+                      alpha_, ACTIVATION_NONE, stream);
+
+        // #FFN dense 1, scratch -> in_out_tensor
+        {
+        const int batch = N * 64;
+        cublasXgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, node.dff_channels, batch,
+                    current_channels, 1.0f, (const DataType*)node.convnext_ffn_dense1_w, current_channels,
+                    buf1, current_channels, 0.0f, buf0, node.dff_channels);
+        addBiasBatched(buf0, buf0, node.convnext_ffn_dense1_b, 1, batch,
+                        node.dff_channels, activations_.ffn_activation, stream);
+        }
+        {
+        const int batch = N * 64;
+        cublasXgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, current_channels, batch,
+                  node.dff_channels, 1.0f, (const DataType*)node.convnext_ffn_dense2_w, node.dff_channels,
+                  buf0, node.dff_channels, 0.0f, buf1, current_channels);
+
+        LayerNorm<DataType>(N * 64, current_channels, flow, buf1,
+                            node.convnext_ffn_dense2_b, flow, node.convnext_ln2_gammas, 
+                            node.convnext_ln2_betas, default_epsilon_, alpha_, ACTIVATION_NONE, stream);
+        }
+      }
+
+      // Update channels for the next block
+      current_channels = node.out_channels;
+  }
+
+  if (cnn_enc_ln_gammas_ != nullptr) {
+      DataType* temp_flow = flow;
+      DataType* temp_spare = buf0;
+      DataType* temp_alt = buf1;
+      const int batch = N * 64; 
+      const int num_inputs = current_channels;     
+      const int num_outputs = embedding_op_size_;  
+
+      if (final_layout_transform_) {;
+          final_layout_transform_->Eval(N, temp_spare, temp_flow, nullptr, temp, scratch_size, cudnn, cublas, stream, offset_pointers);
+          temp_flow = temp_spare;
+          std::swap(temp_spare, temp_alt);
+      }
+      
+      if (cnn_enc_w_ != nullptr) {
+        cublasXgemm<DataType>(
+            cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch, num_inputs, 1.0f, 
+            (const DataType*)cnn_enc_w_, num_inputs, temp_flow, num_inputs, 0.0f, temp_spare, num_outputs
+        );
+        temp_flow = temp_spare;
+        std::swap(temp_spare, temp_alt);
+      }
+
+      
+      LayerNorm<DataType>(batch, num_outputs, temp_spare, temp_flow, nullptr, (DataType*)nullptr, 
+                  cnn_enc_ln_gammas_, cnn_enc_ln_betas_, default_epsilon_, 1.0, act_, stream);
+
+      applyInputGating<DataType>(flow, temp_spare, cnn_enc_mult_gate_, cnn_enc_add_gate_, N, 64, num_outputs, stream);
+  
+      current_channels = num_outputs;
+  }
+}
+
+template <typename DataType>
+Backbone<DataType>::~Backbone() {
+  if (starts_with_encoder_) {
+    if (ip_emb_w_) ReportCUDAErrors(cudaFree(ip_emb_w_));
+    if (ip_emb_b_) ReportCUDAErrors(cudaFree(ip_emb_b_));
+
+  
+    if (ip_emb_pre_w_) ReportCUDAErrors(cudaFree(ip_emb_pre_w_));
+    if (ip_emb_pre_b_) ReportCUDAErrors(cudaFree(ip_emb_pre_b_));
+    if (ip_emb_ln_g_) ReportCUDAErrors(cudaFree(ip_emb_ln_g_));
+    if (ip_emb_ln_b_) ReportCUDAErrors(cudaFree(ip_emb_ln_b_));
+    
+    if (ip_emb_ffn_d1_w_) ReportCUDAErrors(cudaFree(ip_emb_ffn_d1_w_));
+    if (ip_emb_ffn_d1_b_) ReportCUDAErrors(cudaFree(ip_emb_ffn_d1_b_));
+    if (ip_emb_ffn_d2_w_) ReportCUDAErrors(cudaFree(ip_emb_ffn_d2_w_));
+    if (ip_emb_ffn_d2_b_) ReportCUDAErrors(cudaFree(ip_emb_ffn_d2_b_));
+    
+    if (ip_emb_ffn_ln_g_) ReportCUDAErrors(cudaFree(ip_emb_ffn_ln_g_));
+    if (ip_emb_ffn_ln_b_) ReportCUDAErrors(cudaFree(ip_emb_ffn_ln_b_));
+
+
+    if (has_gating_) {
+      if (ip_mult_gate_) ReportCUDAErrors(cudaFree(ip_mult_gate_));
+      if (ip_add_gate_) ReportCUDAErrors(cudaFree(ip_add_gate_));
+    }
+    
+    if (has_smolgen_ && smolgen_global_) {
+      ReportCUDAErrors(cudaFree(smolgen_global_));
+    }
+
+  }
+
+  for (auto& node : tower_nodes_) {
+      if (node.dense_w) ReportCUDAErrors(cudaFree(node.dense_w));
+      if (node.dense_b) ReportCUDAErrors(cudaFree(node.dense_b));
+      
+      if (node.ln_gammas) {
+        ReportCUDAErrors(cudaFree(node.ln_gammas));
+        ReportCUDAErrors(cudaFree(node.ln_betas));
+      }
+      
+      if (node.mult_gate) {
+        ReportCUDAErrors(cudaFree(node.mult_gate));
+        ReportCUDAErrors(cudaFree(node.add_gate));
+      }
+
+      if (node.type == TowerNode::CONVNEXT) {
+        ReportCUDAErrors(cudaFree(node.convnext_ln1_betas));
+        ReportCUDAErrors(cudaFree(node.convnext_ln1_gammas));
+        ReportCUDAErrors(cudaFree(node.convnext_ffn_dense1_w));
+        ReportCUDAErrors(cudaFree(node.convnext_ffn_dense1_b));
+        ReportCUDAErrors(cudaFree(node.convnext_ffn_dense2_w));
+        ReportCUDAErrors(cudaFree(node.convnext_ffn_dense2_b));
+        ReportCUDAErrors(cudaFree(node.convnext_ln2_betas));
+        ReportCUDAErrors(cudaFree(node.convnext_ln2_gammas));
+      }
+  }
+
+  if (cnn_enc_w_ != nullptr ) {
+      ReportCUDAErrors(cudaFree(cnn_enc_w_));
+      ReportCUDAErrors(cudaFree(cnn_enc_b_));
+  }
+
+  if (cnn_enc_ln_gammas_ != nullptr) {
+      ReportCUDAErrors(cudaFree(cnn_enc_ln_gammas_));
+      ReportCUDAErrors(cudaFree(cnn_enc_ln_betas_));
+  }
+
+  if (cnn_enc_mult_gate_ != nullptr) {
+      ReportCUDAErrors(cudaFree(cnn_enc_mult_gate_));
+      ReportCUDAErrors(cudaFree(cnn_enc_add_gate_));
+  }
+}
+
 
 template <typename DataType>
 AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
@@ -3504,6 +3831,13 @@ template class AttentionPolicyHead<float>;
 
 template class EncoderBlock<half>;
 template class EncoderBlock<float>;
+
+template class Backbone<half>;
+template class Backbone<float>;
+
+template class LayoutTransformLayer<half>;
+template class LayoutTransformLayer<float>;
+
 
 template class AttentionBody<half>;
 template class AttentionBody<float>;

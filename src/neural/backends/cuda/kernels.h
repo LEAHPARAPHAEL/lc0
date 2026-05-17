@@ -70,6 +70,11 @@ void convertNCHWtoNHWC(DstType* output_tensor, const SrcType* input_tensor,
                        int Nin, int Cin, int Nout, int Cout, int H, int W,
                        cudaStream_t stream);
 
+template <typename DstType, typename SrcType>
+void convertNHWCtoNCHW(DstType* output_tensor, const SrcType* input_tensor,
+                       int Nin, int Cin, int Nout, int Cout, int H, int W,
+                       cudaStream_t stream);
+
 // Plain data-type conversion (no layout conversion).
 template <typename DstType, typename SrcType>
 void copyTypeConverted(DstType* op, SrcType* ip, int N, cudaStream_t stream);
@@ -177,14 +182,16 @@ void convert_float_to_half2_nhwc(const float* input, half2* output, int C, int H
 void FusedDWPWevalHalf2(int N, int C_in, int C, half* output, const half* input, void* scratch,
                               const half2* w1, const half2* b1, const half2* w2, cudaStream_t stream);
 
-void DepthwiseEvalNCHW(int N, int C_in, MaskType mask_type, half* output, const half* input, void* scratch,
-                              const half2* w1, ActivationFunction activation, cudaStream_t stream);
+void DepthwiseEvalNCHW(int N, int C_in, half* output, const half* input, void* scratch,
+                              const half2* w1, ActivationFunction activation, int rook_channels, int bishop_channels,
+                              int knight_channels, cudaStream_t stream);
 
 void convert_half_to_half2_nchw(const half* input, half2* output,
                                 int N, int C, int H, int W, cudaStream_t stream);
 
-void DepthwiseEvalNHWC(int N, int C_in, MaskType mask_type, half* output, const half* input, void* scratch,
-                              const half2* w1, ActivationFunction activation, cudaStream_t stream);
+void DepthwiseEvalNHWC(int N, int C_in, half* output, const half* input, void* scratch,
+                              const half2* w1, ActivationFunction activation, int rook_channels, int bishop_channels,
+                              int knight_channels, cudaStream_t stream);
 
 void convert_half_to_half2_nhwc(const half* input, half2* output,
                                 int N, int C, int H, int W);

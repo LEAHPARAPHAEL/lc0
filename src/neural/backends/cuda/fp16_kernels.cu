@@ -220,9 +220,9 @@ void convert_half_to_half2_nchw(const half* input, half2* output,
 }
 
 
-template <MaskType mask_type>
 __global__ void DepthwiseKernelNCHW(int C_in, half* output, const half2* input,
-                              const half2* weights, ActivationFunction activation) {
+                              const half2* weights, ActivationFunction activation, 
+                              int rook_channels, int bishop_channels, int knight_channels) {
 #if __CUDA_ARCH__ >= 700 
 
     const int block_depth = C_in / (2 * PARALLEL_BLOCKS);
@@ -287,73 +287,42 @@ __global__ void DepthwiseKernelNCHW(int C_in, half* output, const half2* input,
         // Accumulator
         half2 sum = make_half2(0.0f, 0.0f);
 
-        if (mask_type == MaskType::RBK){
-          // Rook filter
-          if (2 * current_d < (C_in / 3)) {
-              sum = __hfma2(w0, get_input_half2_at(input, abs_h_input, abs_w_input + 2, index_input + 2), sum);
-              sum = __hfma2(w1, get_input_half2_at(input, abs_h_input + 1, abs_w_input + 2, index_input + 10), sum);
-              sum = __hfma2(w2, get_input_half2_at(input, abs_h_input + 2, abs_w_input, index_input + 16), sum);
-              sum = __hfma2(w3, get_input_half2_at(input, abs_h_input + 2 , abs_w_input + 1, index_input + 17), sum);
-              sum = __hfma2(w4, get_input_half2_at(input, abs_h_input + 2, abs_w_input + 2, index_input + 18), sum);
-              sum = __hfma2(w5, get_input_half2_at(input, abs_h_input + 2, abs_w_input + 3, index_input + 19), sum);
-              sum = __hfma2(w6, get_input_half2_at(input, abs_h_input + 2, abs_w_input + 4, index_input + 20), sum);
-              sum = __hfma2(w7, get_input_half2_at(input, abs_h_input + 3, abs_w_input + 2, index_input + 26), sum);
-              sum = __hfma2(w8, get_input_half2_at(input, abs_h_input + 4, abs_w_input + 2, index_input + 34), sum);
-          }
-
-          // Bishop filter
-          else if (2 * current_d < (2 * C_in / 3)) {
-              sum = __hfma2(w0, get_input_half2_at(input, abs_h_input, abs_w_input, index_input), sum);
-              sum = __hfma2(w1, get_input_half2_at(input, abs_h_input, abs_w_input + 4, index_input + 4), sum);
-              sum = __hfma2(w2, get_input_half2_at(input, abs_h_input + 1, abs_w_input + 1, index_input + 9), sum);
-              sum = __hfma2(w3, get_input_half2_at(input, abs_h_input + 1 , abs_w_input + 3, index_input + 11), sum);
-              sum = __hfma2(w4, get_input_half2_at(input, abs_h_input + 2, abs_w_input + 2, index_input + 18), sum);
-              sum = __hfma2(w5, get_input_half2_at(input, abs_h_input + 3, abs_w_input + 1, index_input + 25), sum);
-              sum = __hfma2(w6, get_input_half2_at(input, abs_h_input + 3, abs_w_input + 3, index_input + 27), sum);
-              sum = __hfma2(w7, get_input_half2_at(input, abs_h_input + 4, abs_w_input, index_input + 32), sum);
-              sum = __hfma2(w8, get_input_half2_at(input, abs_h_input + 4, abs_w_input + 4, index_input + 36), sum);
-          }
-
-          // Knight filter
-          else {
-              sum = __hfma2(w0, get_input_half2_at(input, abs_h_input, abs_w_input + 1, index_input + 1), sum);
-              sum = __hfma2(w1, get_input_half2_at(input, abs_h_input, abs_w_input + 3, index_input + 3), sum);
-              sum = __hfma2(w2, get_input_half2_at(input, abs_h_input + 1, abs_w_input, index_input + 8), sum);
-              sum = __hfma2(w3, get_input_half2_at(input, abs_h_input + 1 , abs_w_input + 4, index_input + 12), sum);
-              sum = __hfma2(w4, get_input_half2_at(input, abs_h_input + 2, abs_w_input + 2, index_input + 18), sum);
-              sum = __hfma2(w5, get_input_half2_at(input, abs_h_input + 3, abs_w_input, index_input + 24), sum);
-              sum = __hfma2(w6, get_input_half2_at(input, abs_h_input + 3, abs_w_input + 4, index_input + 28), sum);
-              sum = __hfma2(w7, get_input_half2_at(input, abs_h_input + 4, abs_w_input + 1, index_input + 33), sum);
-              sum = __hfma2(w8, get_input_half2_at(input, abs_h_input + 4, abs_w_input + 3, index_input + 35), sum);
-          }
+        if (2 * current_d < rook_channels) {
+            sum = __hfma2(w0, get_input_half2_at(input, abs_h_input, abs_w_input + 2, index_input + 2), sum);
+            sum = __hfma2(w1, get_input_half2_at(input, abs_h_input + 1, abs_w_input + 2, index_input + 10), sum);
+            sum = __hfma2(w2, get_input_half2_at(input, abs_h_input + 2, abs_w_input, index_input + 16), sum);
+            sum = __hfma2(w3, get_input_half2_at(input, abs_h_input + 2 , abs_w_input + 1, index_input + 17), sum);
+            sum = __hfma2(w4, get_input_half2_at(input, abs_h_input + 2, abs_w_input + 2, index_input + 18), sum);
+            sum = __hfma2(w5, get_input_half2_at(input, abs_h_input + 2, abs_w_input + 3, index_input + 19), sum);
+            sum = __hfma2(w6, get_input_half2_at(input, abs_h_input + 2, abs_w_input + 4, index_input + 20), sum);
+            sum = __hfma2(w7, get_input_half2_at(input, abs_h_input + 3, abs_w_input + 2, index_input + 26), sum);
+            sum = __hfma2(w8, get_input_half2_at(input, abs_h_input + 4, abs_w_input + 2, index_input + 34), sum);
         }
 
-        else {
-          // Rook filter
-          if (2 * current_d < (C_in / 2)) {
-              sum = __hfma2(w0, get_input_half2_at(input, abs_h_input, abs_w_input + 2, index_input + 2), sum);
-              sum = __hfma2(w1, get_input_half2_at(input, abs_h_input + 1, abs_w_input + 2, index_input + 10), sum);
-              sum = __hfma2(w2, get_input_half2_at(input, abs_h_input + 2, abs_w_input, index_input + 16), sum);
-              sum = __hfma2(w3, get_input_half2_at(input, abs_h_input + 2 , abs_w_input + 1, index_input + 17), sum);
-              sum = __hfma2(w4, get_input_half2_at(input, abs_h_input + 2, abs_w_input + 2, index_input + 18), sum);
-              sum = __hfma2(w5, get_input_half2_at(input, abs_h_input + 2, abs_w_input + 3, index_input + 19), sum);
-              sum = __hfma2(w6, get_input_half2_at(input, abs_h_input + 2, abs_w_input + 4, index_input + 20), sum);
-              sum = __hfma2(w7, get_input_half2_at(input, abs_h_input + 3, abs_w_input + 2, index_input + 26), sum);
-              sum = __hfma2(w8, get_input_half2_at(input, abs_h_input + 4, abs_w_input + 2, index_input + 34), sum);
-          }
+        // Bishop filter
+        else if (2 * current_d < bishop_channels) {
+            sum = __hfma2(w0, get_input_half2_at(input, abs_h_input, abs_w_input, index_input), sum);
+            sum = __hfma2(w1, get_input_half2_at(input, abs_h_input, abs_w_input + 4, index_input + 4), sum);
+            sum = __hfma2(w2, get_input_half2_at(input, abs_h_input + 1, abs_w_input + 1, index_input + 9), sum);
+            sum = __hfma2(w3, get_input_half2_at(input, abs_h_input + 1 , abs_w_input + 3, index_input + 11), sum);
+            sum = __hfma2(w4, get_input_half2_at(input, abs_h_input + 2, abs_w_input + 2, index_input + 18), sum);
+            sum = __hfma2(w5, get_input_half2_at(input, abs_h_input + 3, abs_w_input + 1, index_input + 25), sum);
+            sum = __hfma2(w6, get_input_half2_at(input, abs_h_input + 3, abs_w_input + 3, index_input + 27), sum);
+            sum = __hfma2(w7, get_input_half2_at(input, abs_h_input + 4, abs_w_input, index_input + 32), sum);
+            sum = __hfma2(w8, get_input_half2_at(input, abs_h_input + 4, abs_w_input + 4, index_input + 36), sum);
+        }
 
-          // Bishop filter
-          else {
-              sum = __hfma2(w0, get_input_half2_at(input, abs_h_input, abs_w_input, index_input), sum);
-              sum = __hfma2(w1, get_input_half2_at(input, abs_h_input, abs_w_input + 4, index_input + 4), sum);
-              sum = __hfma2(w2, get_input_half2_at(input, abs_h_input + 1, abs_w_input + 1, index_input + 9), sum);
-              sum = __hfma2(w3, get_input_half2_at(input, abs_h_input + 1 , abs_w_input + 3, index_input + 11), sum);
-              sum = __hfma2(w4, get_input_half2_at(input, abs_h_input + 2, abs_w_input + 2, index_input + 18), sum);
-              sum = __hfma2(w5, get_input_half2_at(input, abs_h_input + 3, abs_w_input + 1, index_input + 25), sum);
-              sum = __hfma2(w6, get_input_half2_at(input, abs_h_input + 3, abs_w_input + 3, index_input + 27), sum);
-              sum = __hfma2(w7, get_input_half2_at(input, abs_h_input + 4, abs_w_input, index_input + 32), sum);
-              sum = __hfma2(w8, get_input_half2_at(input, abs_h_input + 4, abs_w_input + 4, index_input + 36), sum);
-          }
+        // Knight filter
+        else {
+            sum = __hfma2(w0, get_input_half2_at(input, abs_h_input, abs_w_input + 1, index_input + 1), sum);
+            sum = __hfma2(w1, get_input_half2_at(input, abs_h_input, abs_w_input + 3, index_input + 3), sum);
+            sum = __hfma2(w2, get_input_half2_at(input, abs_h_input + 1, abs_w_input, index_input + 8), sum);
+            sum = __hfma2(w3, get_input_half2_at(input, abs_h_input + 1 , abs_w_input + 4, index_input + 12), sum);
+            sum = __hfma2(w4, get_input_half2_at(input, abs_h_input + 2, abs_w_input + 2, index_input + 18), sum);
+            sum = __hfma2(w5, get_input_half2_at(input, abs_h_input + 3, abs_w_input, index_input + 24), sum);
+            sum = __hfma2(w6, get_input_half2_at(input, abs_h_input + 3, abs_w_input + 4, index_input + 28), sum);
+            sum = __hfma2(w7, get_input_half2_at(input, abs_h_input + 4, abs_w_input + 1, index_input + 33), sum);
+            sum = __hfma2(w8, get_input_half2_at(input, abs_h_input + 4, abs_w_input + 3, index_input + 35), sum);
         }
 
         sum = __hadd2(sum, b);
@@ -381,8 +350,9 @@ __global__ void DepthwiseKernelNCHW(int C_in, half* output, const half2* input,
 
 
 
-void DepthwiseEvalNCHW(int N, int C_in, MaskType mask_type, half* output, const half* input, void* scratch,
-                              const half2* w1, ActivationFunction activation, cudaStream_t stream) {
+void DepthwiseEvalNCHW(int N, int C_in, half* output, const half* input, void* scratch,
+                              const half2* w1, ActivationFunction activation, int rook_channels, int bishop_channels,
+                              int knight_channels, cudaStream_t stream) {
 
     //std::cout << "Number of positions in the batch : " << N << std::endl;
     convert_half_to_half2_nchw(input, (half2*)scratch,
@@ -391,17 +361,16 @@ void DepthwiseEvalNCHW(int N, int C_in, MaskType mask_type, half* output, const 
     dim3 threads(DW_BLOCK_W, DW_BLOCK_H, DW_PARALLEL_D);
 
     dim3 blocks(N, PARALLEL_BLOCKS, 8 / DW_BLOCK_H);
-    switch (mask_type) {
-      case MaskType::RBK:
-          DepthwiseKernelNCHW<MaskType::RBK><<<blocks, threads, 0, stream>>>(
-              C_in, output, (half2*)scratch, w1, activation);
-          break;
 
-      case MaskType::RB:
-          DepthwiseKernelNCHW<MaskType::RB><<<blocks, threads, 0, stream>>>(
-              C_in, output, (half2*)scratch, w1, activation);
-          break;
-    }
+    int cum_rook_channels = rook_channels;
+    int cum_bishop_channels = cum_rook_channels + bishop_channels;
+    int cum_knight_channels = cum_bishop_channels + knight_channels;
+
+    DepthwiseKernelNCHW<<<blocks, threads, 0, stream>>>(
+        C_in, output, (half2*)scratch, w1, activation,
+      cum_rook_channels, cum_bishop_channels, cum_knight_channels);
+
+
 }
 
 
@@ -538,11 +507,9 @@ __global__ void DepthwiseKernelNHWC_fp32(int total_c_half2, half2* output, const
 }
 
 
-template <MaskType mask_type>
 __global__ void DepthwiseKernelNHWC_fp16(int total_c_half2, half2* output, const half2* input, const half2* weights,
-  ActivationFunction activation) {
+  ActivationFunction activation, int rook_channels, int bishop_channels, int knight_channels) {
 #if __CUDA_ARCH__ >= 700 
-    // threadIdx.x is mapped to Channel
     int c_half2 = blockIdx.y * blockDim.x + threadIdx.x;
     if (c_half2 >= total_c_half2) return;
 
@@ -550,8 +517,6 @@ __global__ void DepthwiseKernelNHWC_fp16(int total_c_half2, half2* output, const
     int h = blockIdx.z;
     int n = blockIdx.x;
 
-    // Load all 9 weights and 1 bias natively as half2
-    // No conversion to float2 needed, saving registers and instructions
     half2 w_h2[9];
     #pragma unroll
     for(int i = 0; i < 9; ++i) {
@@ -562,76 +527,50 @@ __global__ void DepthwiseKernelNHWC_fp16(int total_c_half2, half2* output, const
     int abs_h_input = h - 2;
     int abs_w_input = w - 2;
 
-    // Initialize accumulator in strict fp16
     half2 sum = __float2half2_rn(0.0f);
 
-    if (mask_type == MaskType::RBK) {
-        if (c_half2 < (total_c_half2 / 3)) { // Rook
-            sum = __hfma2(w_h2[0], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input + 2, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[1], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 2, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[2], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[3], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 1, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[4], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 2, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[5], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 3, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[6], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 4, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[7], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 2, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[8], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input + 2, c_half2, total_c_half2), sum);
-        }
-        else if (c_half2 < (2 * total_c_half2 / 3)) { // Bishop
-            sum = __hfma2(w_h2[0], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[1], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input + 4, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[2], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 1, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[3], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 3, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[4], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 2, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[5], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 1, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[6], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 3, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[7], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[8], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input + 4, c_half2, total_c_half2), sum);
-        }
-        else { // Knight
-            sum = __hfma2(w_h2[0], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input + 1, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[1], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input + 3, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[2], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[3], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 4, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[4], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 2, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[5], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[6], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 4, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[7], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input + 1, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[8], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input + 3, c_half2, total_c_half2), sum);
-        }
-    } else {
-        if (c_half2 < total_c_half2 / 2) { // Rook
-            sum = __hfma2(w_h2[0], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input + 2, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[1], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 2, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[2], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[3], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 1, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[4], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 2, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[5], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 3, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[6], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 4, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[7], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 2, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[8], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input + 2, c_half2, total_c_half2), sum);
-        } else { // Bishop
-            sum = __hfma2(w_h2[0], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[1], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input + 4, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[2], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 1, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[3], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 3, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[4], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 2, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[5], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 1, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[6], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 3, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[7], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input, c_half2, total_c_half2), sum);
-            sum = __hfma2(w_h2[8], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input + 4, c_half2, total_c_half2), sum);
-        }
+    if (2 * c_half2 < rook_channels) { 
+        sum = __hfma2(w_h2[0], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input + 2, c_half2, total_c_half2), sum);
+        sum = __hfma2(w_h2[1], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 2, c_half2, total_c_half2), sum);
+        sum = __hfma2(w_h2[2], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input, c_half2, total_c_half2), sum);
+        sum = __hfma2(w_h2[3], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 1, c_half2, total_c_half2), sum);
+        sum = __hfma2(w_h2[4], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 2, c_half2, total_c_half2), sum);
+        sum = __hfma2(w_h2[5], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 3, c_half2, total_c_half2), sum);
+        sum = __hfma2(w_h2[6], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 4, c_half2, total_c_half2), sum);
+        sum = __hfma2(w_h2[7], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 2, c_half2, total_c_half2), sum);
+        sum = __hfma2(w_h2[8], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input + 2, c_half2, total_c_half2), sum);
     }
+    else if (2 * c_half2 < bishop_channels) { 
+        sum = __hfma2(w_h2[0], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input, c_half2, total_c_half2), sum);
+        sum = __hfma2(w_h2[1], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input + 4, c_half2, total_c_half2), sum);
+        sum = __hfma2(w_h2[2], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 1, c_half2, total_c_half2), sum);
+        sum = __hfma2(w_h2[3], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 3, c_half2, total_c_half2), sum);
+        sum = __hfma2(w_h2[4], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 2, c_half2, total_c_half2), sum);
+        sum = __hfma2(w_h2[5], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 1, c_half2, total_c_half2), sum);
+        sum = __hfma2(w_h2[6], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 3, c_half2, total_c_half2), sum);
+        sum = __hfma2(w_h2[7], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input, c_half2, total_c_half2), sum);
+        sum = __hfma2(w_h2[8], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input + 4, c_half2, total_c_half2), sum);
+    }
+    else { 
+        sum = __hfma2(w_h2[0], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input + 1, c_half2, total_c_half2), sum);
+        sum = __hfma2(w_h2[1], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input + 3, c_half2, total_c_half2), sum);
+        sum = __hfma2(w_h2[2], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input, c_half2, total_c_half2), sum);
+        sum = __hfma2(w_h2[3], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 4, c_half2, total_c_half2), sum);
+        sum = __hfma2(w_h2[4], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 2, c_half2, total_c_half2), sum);
+        sum = __hfma2(w_h2[5], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input, c_half2, total_c_half2), sum);
+        sum = __hfma2(w_h2[6], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 4, c_half2, total_c_half2), sum);
+        sum = __hfma2(w_h2[7], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input + 1, c_half2, total_c_half2), sum);
+        sum = __hfma2(w_h2[8], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input + 3, c_half2, total_c_half2), sum);
+    }
+
 
     sum = __hadd2(sum, b_h2);
     
     float2 sum_f32 = __half22float2(sum);
     sum_f32.x = activate(sum_f32.x, activation);
     sum_f32.y = activate(sum_f32.y, activation);
-    // Pack back to strict FP16
     sum = __float22half2_rn(sum_f32);
 
-    // Write coalesced output back to VRAM (no conversion needed)
     int out_index = (n * 64 * total_c_half2) + (h * 8 * total_c_half2) + (w * total_c_half2) + c_half2;
     output[out_index] = sum;
 #endif
@@ -648,7 +587,6 @@ __global__ void DepthwiseKernelNHWC_dense(int total_c_half2, half2* output, cons
     int h = blockIdx.z;
     int n = blockIdx.x;
 
-    // Load all 25 weights and 1 bias into ultra-fast FP32 registers.
     float2 w_f32[25];
     #pragma unroll
     for(int i = 0; i < 25; ++i) {
@@ -683,31 +621,27 @@ __global__ void DepthwiseKernelNHWC_dense(int total_c_half2, half2* output, cons
 #endif
 }
 
-void DepthwiseEvalNHWC(int N, int C_in, MaskType mask_type, half* output, const half* input, void* scratch,
-                       const half2* w1, ActivationFunction activation, cudaStream_t stream) {
+void DepthwiseEvalNHWC(int N, int C_in, half* output, const half* input, void* scratch,
+                       const half2* w1, ActivationFunction activation, int rook_channels, 
+                       int bishop_channels, int knight_channels, cudaStream_t stream) {
     
     const half2* input_half2 = reinterpret_cast<const half2*>(input);
     half2* output_half2 = reinterpret_cast<half2*>(output);
 
     int total_c_half2 = C_in / 2;
 
-    // Block: 32 Channels (x) * 8 Width (y) * 1 Height (z) = 256 threads.
-    // threadIdx.x perfectly traverses the fast-moving Channel dimension.
     dim3 threads(32, 8, 1);
     
-    // Grid: Batch (x), Channel Blocks (y), Height (z)
     dim3 blocks(N, (total_c_half2 + 31) / 32, 8);
 
-    switch (mask_type) {
-      case MaskType::RBK:
-          DepthwiseKernelNHWC_fp16<MaskType::RBK><<<blocks, threads, 0, stream>>>(
-              total_c_half2, output_half2, input_half2, w1, activation);
-          break;
-      case MaskType::RB:
-          DepthwiseKernelNHWC_fp16<MaskType::RB><<<blocks, threads, 0, stream>>>(
-              total_c_half2, output_half2, input_half2, w1, activation);
-          break;
-    }
+    int cum_rook_channels = rook_channels;
+    int cum_bishop_channels = cum_rook_channels + bishop_channels;
+    int cum_knight_channels = cum_bishop_channels + knight_channels;
+
+    DepthwiseKernelNHWC_fp16<<<blocks, threads, 0, stream>>>(
+        total_c_half2, output_half2, input_half2, w1, activation,
+      cum_rook_channels, cum_bishop_channels, cum_knight_channels);
+
 }
 
 
@@ -873,6 +807,27 @@ bool Se_Fp16_NHWC(int N, int C, int numFc1Out, half* output, const half* skip,
                                                   w2, b2, bPrev, activation);
     } else {
       // TODO: support other channel counts.
+      return false;
+    }
+  } else if (numFc1Out == 48) {
+    if (C == 96) {
+      SE_Layer_NHWC<96, 48><<<N, C, 0, stream>>>(output, skip, input, w1, b1,
+                                                 w2, b2, bPrev, activation);      
+    } else {
+      return false;
+    }
+  } else if (numFc1Out == 24) {
+    if (C == 96) {
+      SE_Layer_NHWC<96, 24><<<N, C, 0, stream>>>(output, skip, input, w1, b1,
+                                                 w2, b2, bPrev, activation);      
+    } else {
+      return false;
+    }
+  } else if (numFc1Out == 96) {
+    if (C == 192) {
+      SE_Layer_NHWC<192, 96><<<N, C, 0, stream>>>(output, skip, input, w1, b1,
+                                                 w2, b2, bPrev, activation);      
+    } else {
       return false;
     }
   } else {
@@ -1254,6 +1209,20 @@ template void OutputTransform<half, false, ACTIVATION_MISH, true, false, false,
                                     const half* b2, cudaStream_t stream);
 
 template void OutputTransform<half, true, ACTIVATION_MISH, true, true, true,
+                              true>(int N, int C, int se_K, half* output,
+                                    const half* input, const half* skip,
+                                    const half* bias, const half* w1,
+                                    const half* b1, const half* w2,
+                                    const half* b2, cudaStream_t stream);
+
+template void OutputTransform<half, false, ACTIVATION_MISH, true, true, true,
+                              true>(int N, int C, int se_K, half* output,
+                                    const half* input, const half* skip,
+                                    const half* bias, const half* w1,
+                                    const half* b1, const half* w2,
+                                    const half* b2, cudaStream_t stream);
+
+template void OutputTransform<half, false, ACTIVATION_RELU, true, true, true,
                               true>(int N, int C, int se_K, half* output,
                                     const half* input, const half* skip,
                                     const half* bias, const half* w1,

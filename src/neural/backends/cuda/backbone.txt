@@ -1,0 +1,772 @@
+
+template <typename DataType>
+Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
+                            void* scratch, 
+                            Activations activations,
+                            int input_c,
+                            int residual_blocks,
+                            int mobilenet_blocks,
+                            int convnext_blocks,
+                            int encoder_blocks,
+                            std::string first_block,
+                            int min_batch_size,
+                            int max_batch_size,
+                            bool use_gemm_ex, 
+                            bool fused_mha,
+                            bool nhwc,
+                            bool use_res_block_winograd_fuse_opt,
+                            bool allow_cache_opt,
+                            int l2_cache_size,
+                            int shared_mem_per_block_optin,
+                            bool use_custom_depthwise,
+                            cudnnHandle_t cudnn)     
+  : BaseLayer<DataType>(weights.ip_emb_b.size(), 8, 8, nullptr, nhwc, use_gemm_ex),
+    embedding_op_size_(weights.ip_emb_b.size()),
+    encoder_head_count_(weights.encoder_head_count),
+    activations_(activations),
+    act_(activations.default_activation),
+    input_c_(input_c),
+    residual_blocks_(residual_blocks),
+    mobilenet_blocks_(mobilenet_blocks),
+    encoder_blocks_(encoder_blocks),
+    convnext_blocks_(convnext_blocks),
+    has_gating_(weights.ip_mult_gate.size() > 0 &&
+                weights.ip_add_gate.size() > 0),
+    has_smolgen_(weights.has_smolgen),
+    use_fused_mha_(fused_mha),
+    nhwc_(nhwc),
+    use_res_block_winograd_fuse_opt_(use_res_block_winograd_fuse_opt),
+    allow_cache_opt_(allow_cache_opt),
+    l2_cache_size_(l2_cache_size),
+    shared_mem_per_block_optin_(shared_mem_per_block_optin),
+    use_custom_depthwise_(use_custom_depthwise),
+    smolgen_global_(nullptr),
+    ip_mult_gate_(nullptr),
+    ip_add_gate_(nullptr),
+    cnn_enc_w_(nullptr),
+    cnn_enc_b_(nullptr),
+    cnn_enc_ln_gammas_(nullptr),
+    cnn_enc_ln_betas_(nullptr),
+    cnn_enc_mult_gate_(nullptr),
+    cnn_enc_add_gate_(nullptr) {
+    
+  starts_with_encoder_ = first_block == "T";
+  starts_with_residual_ = first_block == "R";
+  starts_with_mobilenet_ = first_block == "M";
+  starts_with_convnext_ = first_block == "C";
+  
+  BaseLayer<DataType>* prev_layer = nullptr;
+  
+  int current_channels = input_c_;
+
+  alpha_ = (encoder_blocks_ + convnext_blocks_) > 0 ? (float)pow(2.0 * (encoder_blocks_ + convnext_blocks_), -0.25) : 1.0f;
+
+  if (has_smolgen_) {
+    allocAndUpload<DataType>(&smolgen_global_, weights.smolgen_w, scratch);
+    smolgen_global_size_ = 64*64;
+  }
+
+  if (has_gating_) {
+    allocAndUpload<DataType>(&ip_mult_gate_, weights.ip_mult_gate, scratch);
+    allocAndUpload<DataType>(&ip_add_gate_, weights.ip_add_gate, scratch);
+  }
+
+  if (starts_with_encoder_) {
+    allocAndUpload<DataType>(&ip_emb_w_, weights.ip_emb_w, scratch);
+    allocAndUpload<DataType>(&ip_emb_b_, weights.ip_emb_b, scratch);
+    allocAndUpload<DataType>(&ip_emb_pre_w_, weights.ip_emb_preproc_w, scratch);
+    allocAndUpload<DataType>(&ip_emb_pre_b_, weights.ip_emb_preproc_b, scratch);
+
+    allocAndUpload<DataType>(&ip_emb_ln_g_, weights.ip_emb_ln_gammas, scratch);
+    allocAndUpload<DataType>(&ip_emb_ln_b_, weights.ip_emb_ln_betas, scratch);
+
+    allocAndUpload<DataType>(&ip_emb_ffn_d1_w_, weights.ip_emb_ffn.dense1_w,
+                             scratch);
+    allocAndUpload<DataType>(&ip_emb_ffn_d1_b_, weights.ip_emb_ffn.dense1_b,
+                             scratch);
+
+    allocAndUpload<DataType>(&ip_emb_ffn_d2_w_, weights.ip_emb_ffn.dense2_w,
+                             scratch);
+    allocAndUpload<DataType>(&ip_emb_ffn_d2_b_, weights.ip_emb_ffn.dense2_b,
+                             scratch);
+
+    allocAndUpload<DataType>(&ip_emb_ffn_ln_g_, weights.ip_emb_ffn_ln_gammas,
+                             scratch);
+    allocAndUpload<DataType>(&ip_emb_ffn_ln_b_, weights.ip_emb_ffn_ln_betas,
+                             scratch);
+
+    embedding_dense_size_ = weights.ip_emb_preproc_b.size() / 64;
+    embedding_ffn_size_ = weights.ip_emb_ffn.dense2_b.size();
+    embedding_ffn_dff_ = weights.ip_emb_ffn.dense1_b.size();
+    prev_layer = this;
+    current_channels = embedding_op_size_;
+  }
+
+  else if (starts_with_residual_){
+    auto input_conv = std::make_unique<FusedWinogradConvSELayer<DataType>>(
+        prev_layer, weights.input.biases.size(), 8, 8, current_channels, act_, true, false, false, 0,
+        use_gemm_ex, use_res_block_winograd_fuse_opt_ && starts_with_residual_             
+    );
+    
+    input_conv->LoadWeights(const_cast<float*>(weights.input.weights.data()),
+                                const_cast<float*>(weights.input.biases.data()),
+                                scratch);
+    
+    prev_layer = input_conv.get();
+
+    input_conv_ = std::move(input_conv);
+    
+    current_channels = weights.input.biases.size();
+    input_conv_output_channels_ = current_channels;
+  }
+  else if (starts_with_mobilenet_ || starts_with_convnext_){
+    auto input_conv = std::make_unique<Conv1Layer<DataType>>(
+              prev_layer, weights.input.biases.size(), 8, 8, current_channels,
+              act_, true, use_gemm_ex, nhwc_
+          );
+    
+    input_conv->LoadWeights(const_cast<float*>(weights.input.weights.data()),
+                                const_cast<float*>(weights.input.biases.data()),
+                                scratch);
+    
+    prev_layer = input_conv.get();
+
+    input_conv_ = std::move(input_conv);
+    
+    current_channels = weights.input.biases.size();
+    input_conv_output_channels_ = current_channels;    
+  }
+
+  for (size_t i = 0; i < weights.tower.size(); ++i) {
+      const auto& pb_block = weights.tower[i];
+      TowerNode node;
+      // CNN -> ENC
+      if (!pb_block.dense_w.empty()) {
+          node.out_channels = pb_block.dense_b.size(); 
+          node.in_channels = current_channels;
+          allocAndUpload<DataType>(&node.dense_w, pb_block.dense_w, scratch);
+          allocAndUpload<DataType>(&node.dense_b, pb_block.dense_b, scratch);
+          allocAndUpload<DataType>(&node.ln_gammas, pb_block.ln_gammas, scratch);
+          allocAndUpload<DataType>(&node.ln_betas, pb_block.ln_betas, scratch);
+          allocAndUpload<DataType>(&node.mult_gate, pb_block.mult_gate, scratch);
+          allocAndUpload<DataType>(&node.add_gate, pb_block.add_gate, scratch);
+          current_channels = node.out_channels; 
+          if (!nhwc_) {
+            node.requires_NCHW_NHWC_conversion = true;
+          }
+          embedding_op_size_ = current_channels;
+      }
+
+      // ENC -> CNN
+      else if (!pb_block.enc_cnn.biases.empty()) {
+          node.transition_cnn = std::make_unique<Conv1Layer<DataType>>(
+              prev_layer, pb_block.enc_cnn.biases.size(), 8, 8, current_channels,
+              act_, true, use_gemm_ex, nhwc_
+          );
+          node.transition_cnn->LoadWeights(const_cast<float*>(pb_block.enc_cnn.weights.data()),
+                                           const_cast<float*>(pb_block.enc_cnn.biases.data()), 
+                                           scratch);
+
+          current_channels = pb_block.enc_cnn.biases.size();
+          prev_layer = node.transition_cnn.get();
+          if (!nhwc_) {
+            node.requires_NHWC_NCHW_conversion = true;
+          }
+      }
+
+      // CNN -> CNN
+      else if (!pb_block.cnn_cnn.biases.empty()) {
+          node.transition_cnn = std::make_unique<Conv1Layer<DataType>>(
+              prev_layer, pb_block.cnn_cnn.biases.size(), 8, 8, current_channels,
+              act_, true, use_gemm_ex, nhwc_
+          );
+
+          node.transition_cnn->LoadWeights(const_cast<float*>(pb_block.cnn_cnn.weights.data()),
+                                  const_cast<float*>(pb_block.cnn_cnn.biases.data()), 
+                                  scratch);
+          
+          current_channels = pb_block.cnn_cnn.biases.size();
+          prev_layer = node.transition_cnn.get();
+      }
+
+      int skip_idx = 0;
+
+      if (std::holds_alternative<BaseWeights::EncoderLayer>(pb_block.block)) {
+          node.type = TowerNode::TRANSFORMER;
+          const auto& enc_weights = std::get<BaseWeights::EncoderLayer>(pb_block.block);
+          node.encoder = std::make_unique<EncoderBlock<DataType>>(
+              enc_weights, scratch, encoder_head_count_, embedding_op_size_, 
+              alpha_,
+              smolgen_global_, smolgen_global_size_, max_batch_size,
+              activations_.smolgen_activation, activations_.ffn_activation,
+              starts_with_encoder_ ? 1e-3 : 1e-6, use_gemm_ex, use_fused_mha_
+          );
+      } 
+      else if (std::holds_alternative<BaseWeights::MobileNet>(pb_block.block)) {
+        node.type = TowerNode::MOBILENET;
+        const auto& m_weights = std::get<BaseWeights::MobileNet>(pb_block.block);
+
+
+        int se_k = m_weights.se.b1.size();
+        int c_expand = m_weights.conv1.biases.size();
+
+        auto conv1 = std::make_unique<Conv1Layer<DataType>>(prev_layer, 
+          c_expand, 8, 8, current_channels, act_, true, use_gemm_ex, nhwc_);
+        conv1->LoadWeights(const_cast<float*>(m_weights.conv1.weights.data()),
+                          const_cast<float*>(m_weights.conv1.biases.data()),
+                          scratch);
+        prev_layer = conv1.get();
+        node.cnn_layers.push_back(std::move(conv1));
+        current_channels = c_expand;
+        skip_idx++;
+
+
+        if (nhwc_ || use_custom_depthwise_) {
+          auto d_conv = std::make_unique<DepthwiseCustom<DataType>>(c_expand, 8, 8, act_, nhwc_,
+                m_weights.d_conv.rook_channels,
+                m_weights.d_conv.bishop_channels,
+                m_weights.d_conv.knight_channels);
+          d_conv->LoadWeights(const_cast<float*>(m_weights.d_conv.weights.data()),
+                              const_cast<float*>(m_weights.d_conv.biases.data()),
+                            scratch);
+          prev_layer = d_conv.get();
+          node.cnn_layers.push_back(std::move(d_conv));
+          skip_idx++;
+          
+        }
+        #ifdef USE_CUDNN
+        else {
+          auto d_conv = std::make_unique<DepthwiseConvLayer<DataType>>(prev_layer, 
+          c_expand, 8, 8, act_, use_gemm_ex, min_batch_size, max_batch_size, cudnn);
+
+          d_conv->LoadWeights(const_cast<float*>(m_weights.d_conv.weights.data()),
+                              const_cast<float*>(m_weights.d_conv.biases.data()),
+                            scratch);
+          prev_layer = d_conv.get();
+          node.cnn_layers.push_back(std::move(d_conv));
+          skip_idx++;
+        }
+        #endif
+
+
+        auto conv2 = std::make_unique<Conv1Layer<DataType>>(prev_layer, 
+          m_weights.conv2.biases.size(), 8, 8, current_channels, ACTIVATION_NONE, false, use_gemm_ex, nhwc_);
+        conv2->LoadWeights(const_cast<float*>(m_weights.conv2.weights.data()),
+                          nullptr,
+                          scratch);
+        prev_layer = conv2.get();
+        node.cnn_layers.push_back(std::move(conv2));
+        current_channels = m_weights.conv2.biases.size();
+        skip_idx++;
+
+        auto se = std::make_unique<SELayer<DataType>>(prev_layer,
+        se_k, false, act_);
+        se->LoadWeights(const_cast<float*>(m_weights.se.w1.data()),
+                        const_cast<float*>(m_weights.se.b1.data()),
+                        const_cast<float*>(m_weights.se.w2.data()),
+                        const_cast<float*>(m_weights.se.b2.data()),
+                        const_cast<float*>(m_weights.conv2.biases.data()),
+                        scratch);
+
+        prev_layer = se.get();
+        node.cnn_layers.push_back(std::move(se));
+        node.skip_idx = skip_idx;
+      }
+      else if (std::holds_alternative<BaseWeights::ConvNext>(pb_block.block)) {
+        node.type = TowerNode::CONVNEXT;
+        const auto& c_weights = std::get<BaseWeights::ConvNext>(pb_block.block);
+        allocAndUpload<DataType>(&node.convnext_ln1_betas, pb_block.ln1_betas, scratch);
+        allocAndUpload<DataType>(&node.convnext_ln1_gammas, pb_block.ln1_gammas, scratch);
+        allocAndUpload<DataType>(&node.convnext_fnn_dense1_w, pb_block.ffn.dense1_w, scratch);
+        allocAndUpload<DataType>(&node.convnext_ffn_dense1_b, pb_block.ffn.dense1_b, scratch);
+        allocAndUpload<DataType>(&node.convnext_ffn_dense2_w, pb_block.ffn.dense2_w, scratch);
+        allocAndUpload<DataType>(&node.convnext_ffn_dense2_b, pb_block.ffn.dense2_b, scratch);
+        allocAndUpload<DataType>(&node.convnext_ln2_betas, pb_block.ln2_betas, scratch);
+        allocAndUpload<DataType>(&node.convnext_ln2_gammas, pb_block.ln2_gammas, scratch);
+
+        if (nhwc_ || use_custom_depthwise_) {
+          auto d_conv = std::make_unique<DepthwiseCustom<DataType>>(current_channels, 8, 8, act_, nhwc_,
+                c_weights.d_conv.rook_channels,
+                c_weights.d_conv.bishop_channels,
+                c_weights.d_conv.knight_channels);
+          d_conv->LoadWeights(const_cast<float*>(c_weights.d_conv.weights.data()),
+                              const_cast<float*>(c_weights.d_conv.biases.data()),
+                            scratch);
+          prev_layer = d_conv.get();
+          node.cnn_layers.push_back(std::move(d_conv));
+          skip_idx++;
+        }
+        #ifdef USE_CUDNN
+        else {
+          auto d_conv = std::make_unique<DepthwiseConvLayer<DataType>>(prev_layer, 
+          current_channels, 8, 8, act_, use_gemm_ex, min_batch_size, max_batch_size, cudnn);
+
+          d_conv->LoadWeights(const_cast<float*>(c_weights.d_conv.weights.data()),
+                              const_cast<float*>(c_weights.d_conv.biases.data()),
+                            scratch);
+          prev_layer = d_conv.get();
+          node.cnn_layers.push_back(std::move(d_conv));
+          skip_idx++;
+        }
+        #endif
+
+      }      
+      
+      else if (std::holds_alternative<BaseWeights::Residual>(pb_block.block)) {
+        node.type = TowerNode::RESIDUAL;
+
+        const auto& res_weights = std::get<BaseWeights::Residual>(pb_block.block);
+        residual_filters_ = res_weights.conv1.biases.size();
+        
+        bool has_se = res_weights.has_se;
+        int se_k = has_se ? res_weights.se.b1.size() : 0;
+
+        bool is_first = (i == 0 || !std::holds_alternative<BaseWeights::Residual>(weights.tower[i - 1].block));
+        bool is_last = (i == weights.tower.size() - 1 || !std::holds_alternative<BaseWeights::Residual>(weights.tower[i + 1].block));
+        
+        if (use_res_block_winograd_fuse_opt_) {
+
+            if (is_first && !nhwc_) {
+              auto pre_trans = std::make_unique<LayoutTransformLayer<DataType>>(prev_layer, current_channels, true);
+              prev_layer = pre_trans.get();
+              node.cnn_layers.push_back(std::move(pre_trans));
+              skip_idx++;
+            }
+            auto layer = std::make_unique<ResidualBlock<DataType>>(
+                prev_layer, current_channels, has_se, se_k, use_gemm_ex,
+                is_first, is_last, act_, 
+                shared_mem_per_block_optin_,
+                nhwc_
+            );
+            
+            layer->LoadWeights0(const_cast<float*>(res_weights.conv1.weights.data()),
+                                const_cast<float*>(res_weights.conv1.biases.data()), scratch);
+            layer->LoadWeights1(const_cast<float*>(res_weights.conv2.weights.data()),
+                                const_cast<float*>(res_weights.conv2.biases.data()), scratch);
+            if (has_se) {
+                layer->LoadSEWeights(const_cast<float*>(res_weights.se.w1.data()),
+                                      const_cast<float*>(res_weights.se.b1.data()),
+                                      const_cast<float*>(res_weights.se.w2.data()),
+                                      const_cast<float*>(res_weights.se.b2.data()), scratch);
+            }
+            
+            prev_layer = layer.get(); 
+            node.cnn_layers.push_back(std::move(layer)); 
+            node.skip_idx = skip_idx;
+            
+        } else {
+            if (is_first && nhwc_) {
+              auto pre_trans = std::make_unique<LayoutTransformLayer<DataType>>(prev_layer, current_channels, false); // NHWC -> NCHW
+              prev_layer = pre_trans.get();
+              node.cnn_layers.push_back(std::move(pre_trans));
+              skip_idx++;
+            }
+           
+            auto conv1 = std::make_unique<FusedWinogradConvSELayer<DataType>>(
+                prev_layer, current_channels, 8, 8, current_channels, act_, true, false,
+                false, 0, use_gemm_ex
+            );
+            conv1->LoadWeights(const_cast<float*>(res_weights.conv1.weights.data()),
+                                const_cast<float*>(res_weights.conv1.biases.data()), scratch);
+            prev_layer = conv1.get();
+            node.cnn_layers.push_back(std::move(conv1));
+            skip_idx++;
+
+            auto conv2 = std::make_unique<FusedWinogradConvSELayer<DataType>>(
+                prev_layer, current_channels, 8, 8, current_channels, act_, true, true,
+                has_se, se_k, use_gemm_ex
+            );
+            conv2->LoadWeights(const_cast<float*>(res_weights.conv2.weights.data()),
+                                const_cast<float*>(res_weights.conv2.biases.data()), scratch);
+            if (has_se) {
+                conv2->LoadSEWeights(const_cast<float*>(res_weights.se.w1.data()),
+                                    const_cast<float*>(res_weights.se.b1.data()),
+                                    const_cast<float*>(res_weights.se.w2.data()),
+                                    const_cast<float*>(res_weights.se.b2.data()), 
+                                    scratch);
+            }
+            prev_layer = conv2.get();
+            node.cnn_layers.push_back(std::move(conv2));
+            node.skip_idx = skip_idx;
+
+            if (is_last && nhwc_) {
+              auto post_trans = std::make_unique<LayoutTransformLayer<DataType>>(prev_layer, current_channels, true);
+              prev_layer = post_trans.get();
+              node.cnn_layers.push_back(std::move(post_trans));
+            }
+
+        }
+      }
+      
+
+      
+      node.out_channels = current_channels;
+      tower_nodes_.push_back(std::move(node));
+  }
+
+  if (!weights.cnn_enc_b.empty()) {
+    if (!nhwc_) {
+      final_layout_transform_ = std::make_unique<LayoutTransformLayer<DataType>>(prev_layer, current_channels, true);
+      prev_layer = final_layout_transform_.get();
+    }
+    allocAndUpload<DataType>(&cnn_enc_w_, weights.cnn_enc_w, scratch);
+    allocAndUpload<DataType>(&cnn_enc_b_, weights.cnn_enc_b, scratch);
+    allocAndUpload<DataType>(&cnn_enc_ln_gammas_, weights.cnn_enc_ln_gammas, scratch);
+    allocAndUpload<DataType>(&cnn_enc_ln_betas_, weights.cnn_enc_ln_betas, scratch);
+    allocAndUpload<DataType>(&cnn_enc_mult_gate_, weights.cnn_enc_mult_gate, scratch);
+    allocAndUpload<DataType>(&cnn_enc_add_gate_, weights.cnn_enc_add_gate, scratch);
+    prev_layer = this;
+  }
+
+  this->C = current_channels;
+}
+
+template <typename DataType>
+void Backbone<DataType>::Eval(int N, DataType* output,
+                              const DataType* input,
+                              const DataType* input2, void* scratch,
+                              size_t scratch_size, cudnnHandle_t cudnn,
+                              cublasHandle_t cublas, cudaStream_t stream,
+                              DataType*** offset_pointers) {
+  DataType* flow = (DataType*)output; 
+  DataType* buf0 = (DataType*)input;  
+  DataType* buf1 = (DataType*)input2;  
+  DataType* buf2 = buf1 + scratch_size / (2 * sizeof(DataType));
+
+  DataType* temp = (DataType*)scratch;
+
+  int inputC = input_c_;
+  int current_channels = inputC;
+  bool enableCacheOpt = false;
+  int transformed_tensor_size;
+  int res_block_mem;
+
+  
+  #if CUDART_VERSION >= 11000
+  if (residual_blocks_ > 0) {
+    const int pre_transform_tensor_size = N * max_residual_filters_ * 8 * 8 * sizeof(DataType);
+    transformed_tensor_size = pre_transform_tensor_size * 36 / 16;
+    res_block_mem = transformed_tensor_size * 2 + pre_transform_tensor_size;
+
+    if (allow_cache_opt_ && use_res_block_winograd_fuse_opt_ &&
+        (static_cast<size_t>(res_block_mem) <= scratch_size) &&
+        (res_block_mem <= l2_cache_size_)) {
+      enableCacheOpt = true;
+    }
+  }
+  #endif  
+  
+
+  if (starts_with_encoder_) {
+      const int num_outputs = 64 * embedding_dense_size_;
+      const int num_inputs = 64 * 12;
+      const int batch = N;
+
+      convertNCHWtoNHWC(temp, buf0, N, inputC, N, 12, 8, 8, stream);
+      cublasXgemm<DataType>(
+          cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch, num_inputs,
+          1.0f, (const DataType*)ip_emb_pre_w_, num_inputs,
+          temp, num_inputs, 0.0f, buf1, num_outputs);
+
+      const int size = num_outputs * N;
+      addVectors(buf1, buf1, ip_emb_pre_b_, size, size, num_outputs, ACTIVATION_NONE, stream);
+      inputPreprocessForAttentionBody(temp, buf0, buf1, N, kInputPlanes, embedding_dense_size_, true, stream);
+      inputC += embedding_dense_size_;
+
+      
+      const int num_outputs = embedding_op_size_;
+      const int num_inputs = inputC;
+      const int batch = N * 64;
+      cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs,
+                            batch, num_inputs, 1.0f, (const DataType*)ip_emb_w_,
+                            num_inputs, temp, num_inputs, 0.0f, flow, num_outputs);
+      LayerNorm<DataType>(N * 64, embedding_op_size_, temp, flow,
+                          ip_emb_b_, (DataType*)nullptr, ip_emb_ln_g_,
+                          ip_emb_ln_b_, 1e-3, 1.0, act_, stream);
+    
+
+      if (has_gating_) {
+        applyInputGating<DataType>(temp, temp, ip_mult_gate_, ip_add_gate_, N, 64, embedding_op_size_, stream);
+      }
+
+      
+      const int num_inputs = embedding_ffn_size_;
+      const int num_outputs = embedding_ffn_dff_; 
+      const int batch = N * 64;
+      cublasXgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch, num_inputs, 1.0f, 
+                  (const DataType*)ip_emb_ffn_d1_w_, num_inputs, temp, num_inputs, 0.0f, buf1, num_outputs);
+      addBiasBatched(buf1, buf1, ip_emb_ffn_d1_b_, 1, batch, num_outputs, activations_.ffn_activation, stream);
+    
+
+      
+      const int num_inputs = embedding_ffn_dff_; 
+      const int num_outputs = embedding_ffn_size_;
+      const int batch = N * 64;
+      
+      cublasXgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch, num_inputs, 1.0f, 
+                  (const DataType*)ip_emb_ffn_d2_w_, num_inputs, buf1, num_inputs, 0.0f, buf2, num_outputs); 
+      
+      LayerNorm<DataType>(N * 64, embedding_ffn_size_, flow, buf2, ip_emb_ffn_d2_b_, temp, 
+                          ip_emb_ffn_ln_g_, ip_emb_ffn_ln_b_, 1e-3, alpha_, ACTIVATION_NONE, stream);
+    
+      current_channels = embedding_op_size_;
+  }
+  else if (starts_with_residual_) {
+      input_conv_->Eval(N, flow, buf0, nullptr, (DataType*)scratch, scratch_size, cudnn, cublas, stream, offset_pointers);
+      current_channels = input_conv_output_channels_;
+  }
+  else if (starts_with_mobilenet_) {
+      input_conv_->Eval(N, flow, buf0, nullptr, (DataType*)scratch, scratch_size, cudnn, cublas, stream, offset_pointers);
+      current_channels = input_conv_output_channels_;
+      //cudaMemcpyAsync(flow, buf0, N * current_channels * 64 * sizeof(DataType), cudaMemcpyDeviceToDevice, stream);
+      //copyTypeConverted((DataType*)flow, (DataType*)buf0, N * current_channels * 64, stream);
+  }
+
+  else if (starts_with_convnext_) {
+    
+  }
+
+  //int b_idx = -1;
+  for (auto& node : tower_nodes_) {
+      //b_idx ++;
+      DataType* temp_flow = flow;
+      DataType* temp_spare = buf0;
+
+
+      if (node.requires_NCHW_NHWC_conversion) {
+          convertNCHWtoNHWC(temp_spare, temp_flow, N, current_channels, N, current_channels, 8, 8, stream);
+          std::swap(temp_flow, temp_spare);
+      } 
+      else if (node.requires_NHWC_NCHW_conversion) {
+          convertNHWCtoNCHW(temp_spare, temp_flow, N, current_channels, N, current_channels, 8, 8, stream);
+          std::swap(temp_flow, temp_spare);
+      }
+
+      if (node.dense_w != nullptr) {
+          const int batch = N * 64; 
+          const int num_inputs = node.in_channels;
+          const int num_outputs = node.out_channels;
+
+          cublasXgemm<DataType>(
+              cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch, num_inputs, 1.0f, 
+              (const DataType*)node.dense_w, num_inputs, temp_flow, num_inputs, 0.0f, temp_spare, num_outputs
+          );
+          std::swap(temp_flow, temp_spare);
+          LayerNorm<DataType>(batch, num_outputs, temp_spare, temp_flow, node.dense_b, (DataType*)nullptr, 
+                              node.ln_gammas, node.ln_betas, 1e-3, 1.0, ACTIVATION_NONE, stream);
+          std::swap(temp_flow, temp_spare);
+          if (node.mult_gate != nullptr) {
+              applyInputGating<DataType>(temp_flow, temp_flow, node.mult_gate, node.add_gate, N, 64, num_outputs, stream);
+          }
+          current_channels = node.out_channels;
+      }
+      else if (node.transition_cnn != nullptr) {
+          node.transition_cnn->Eval(N, temp_spare, temp_flow, nullptr, (DataType*)scratch, scratch_size, cudnn, cublas, stream, offset_pointers);
+          std::swap(temp_flow, temp_spare);
+      }
+
+      current_channels = node.out_channels;
+
+
+
+      if (temp_flow != flow) {
+        cudaMemcpyAsync(flow, temp_flow, N * current_channels * 64 * sizeof(DataType), cudaMemcpyDeviceToDevice, stream);
+        //copyTypeConverted((DataType*)flow, (DataType*)temp_flow, N * current_channels * 64, stream);
+      }
+      
+      if (node.type == TowerNode::TRANSFORMER) {
+          node.encoder->Eval(N, flow, (DataType*)scratch, buf1, buf2, cublas, stream, offset_pointers);
+      } 
+      
+      else if (node.type == TowerNode::MOBILENET || (node.type == TowerNode::RESIDUAL && !use_res_block_winograd_fuse_opt_)) {  
+          temp_flow = flow;    
+          temp_spare = buf0;   
+          DataType* temp_alt = buf1; 
+
+          for (int i = 0; i < node.cnn_layers.size(); ++i) {
+              if (i == node.skip_idx) {
+                  node.cnn_layers[i]->Eval(N, flow, temp_flow, flow, temp, scratch_size, cudnn, cublas, stream, offset_pointers);
+                  temp_flow = flow;
+              } 
+              else {
+                  node.cnn_layers[i]->Eval(N, temp_spare, temp_flow, nullptr, temp, scratch_size, cudnn, cublas, stream, offset_pointers);
+                  temp_flow = temp_spare;
+                  std::swap(temp_spare, temp_alt); 
+              }
+          }
+      }
+
+      else if (node.type == TowerNode::CONVNEXT) {
+        LayerNorm<DataType>(N * 64, embedding_op_size_, scratch, buffer1, mha_dense_b,
+                      in_out_tensor, ln1_gammas, ln1_betas, default_eps_,
+                      alpha_, ACTIVATION_NONE, stream);
+
+        // #FFN dense 1, scratch -> in_out_tensor
+  
+        const int num_inputs = embedding_op_size_;
+        const int num_outputs = ffn_dense1_size_;  // encoder_dff
+        const int batch = N * 64;
+        cublasXgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch,
+                    num_inputs, 1.0f, (const DataType*)ffn_dense1_w, num_inputs,
+                    scratch, num_inputs, 0.0f, in_out_tensor, num_outputs);
+        addBiasBatched(in_out_tensor, in_out_tensor, ffn_dense1_b, 1, batch,
+                        num_outputs, ffn_activation_, stream);
+  
+
+        // #FFN dense 2, in_out_tensor -> buffer1
+
+        const int num_inputs = ffn_dense1_size_;  // encoder_dff
+        const int num_outputs = embedding_op_size_;
+        const int batch = N * 64;
+        cublasXgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch,
+                  num_inputs, 1.0f, (const DataType*)ffn_dense2_w, num_inputs,
+                  in_out_tensor, num_inputs, 0.0f, buffer1, num_outputs);
+
+
+        // LN2: skip connection and layer normilization (also bias add of prev gemm)
+        // buffer1/scratch -> in_out_tensor
+        LayerNorm<DataType>(N * 64, embedding_op_size_, in_out_tensor, buffer1,
+                            ffn_dense2_b, scratch, ln2_gammas, ln2_betas,
+                            default_eps_, alpha_, ACTIVATION_NONE, stream);
+      }
+
+
+      
+      else if (node.type == TowerNode::RESIDUAL) {
+          DataType* skip_conn = flow; 
+          DataType* fused_out = free1; 
+
+          temp_flow = flow;    
+          temp_spare = buf0;   
+          DataType* temp_alt = buf1; 
+
+          void* current_scratch = temp;
+
+          #if CUDART_VERSION >= 11000
+          cudaStreamAttrValue stream_attribute = {}; 
+          if (enableCacheOpt) {
+              stream_attribute.accessPolicyWindow.base_ptr = flow; 
+              stream_attribute.accessPolicyWindow.num_bytes = res_block_mem;
+              stream_attribute.accessPolicyWindow.hitRatio = 1.0f;
+              stream_attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+              stream_attribute.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+
+              cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &stream_attribute);
+              
+              skip_conn = flow + 2 * transformed_tensor_size / sizeof(DataType);
+              current_scratch = nullptr; 
+          }
+          #endif
+
+          for (auto& cnn_layer : node.cnn_layers) {
+              cnn_layer->Eval(N, fused_out, skip_conn, nullptr, current_scratch, scratch_size, cudnn, cublas, stream, offset_pointers);
+          }
+
+          flow = fused_out; 
+
+          #if CUDART_VERSION >= 11000
+          if (enableCacheOpt) {
+              stream_attribute.accessPolicyWindow.num_bytes = 0;
+              cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &stream_attribute);
+              cudaCtxResetPersistingL2Cache();
+          }
+          #endif
+
+      } 
+      
+      
+      
+      // Update channels for the next block
+      current_channels = node.out_channels;
+  }
+
+  if (cnn_enc_w_ != nullptr) {
+      DataType* temp_flow = flow;
+      const int batch = N * 64; 
+      const int num_inputs = current_channels;     
+      const int num_outputs = embedding_op_size_;  
+
+      if (final_layout_transform_) {;
+          final_layout_transform_->Eval(N, buf1, flow, nullptr, temp, scratch_size, cudnn, cublas, stream, offset_pointers);
+          temp_flow = buf1;
+      }
+      
+
+      cublasXgemm<DataType>(
+          cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch, num_inputs, 1.0f, 
+          (const DataType*)cnn_enc_w_, num_inputs, temp_flow, num_inputs, 0.0f, buf0, num_outputs
+      );
+      
+      LayerNorm<DataType>(batch, num_outputs, flow, buf0, cnn_enc_b_, (DataType*)nullptr, 
+                          cnn_enc_ln_gammas_, cnn_enc_ln_betas_, 1e-3, 1.0, act_, stream);
+
+      if (cnn_enc_mult_gate_ != nullptr) {
+          applyInputGating<DataType>(flow, flow, cnn_enc_mult_gate_, cnn_enc_add_gate_, N, 64, num_outputs, stream);
+      }
+      current_channels = num_outputs;
+  }
+}
+
+template <typename DataType>
+Backbone<DataType>::~Backbone() {
+  if (starts_with_encoder_) {
+    if (ip_emb_w_) ReportCUDAErrors(cudaFree(ip_emb_w_));
+    if (ip_emb_b_) ReportCUDAErrors(cudaFree(ip_emb_b_));
+
+  
+    if (ip_emb_pre_w_) ReportCUDAErrors(cudaFree(ip_emb_pre_w_));
+    if (ip_emb_pre_b_) ReportCUDAErrors(cudaFree(ip_emb_pre_b_));
+    if (ip_emb_ln_g_) ReportCUDAErrors(cudaFree(ip_emb_ln_g_));
+    if (ip_emb_ln_b_) ReportCUDAErrors(cudaFree(ip_emb_ln_b_));
+    
+    if (ip_emb_ffn_d1_w_) ReportCUDAErrors(cudaFree(ip_emb_ffn_d1_w_));
+    if (ip_emb_ffn_d1_b_) ReportCUDAErrors(cudaFree(ip_emb_ffn_d1_b_));
+    if (ip_emb_ffn_d2_w_) ReportCUDAErrors(cudaFree(ip_emb_ffn_d2_w_));
+    if (ip_emb_ffn_d2_b_) ReportCUDAErrors(cudaFree(ip_emb_ffn_d2_b_));
+    
+    if (ip_emb_ffn_ln_g_) ReportCUDAErrors(cudaFree(ip_emb_ffn_ln_g_));
+    if (ip_emb_ffn_ln_b_) ReportCUDAErrors(cudaFree(ip_emb_ffn_ln_b_));
+
+
+    if (has_gating_) {
+      if (ip_mult_gate_) ReportCUDAErrors(cudaFree(ip_mult_gate_));
+      if (ip_add_gate_) ReportCUDAErrors(cudaFree(ip_add_gate_));
+    }
+    
+    if (has_smolgen_ && smolgen_global_) {
+      ReportCUDAErrors(cudaFree(smolgen_global_));
+    }
+
+
+  }
+
+  for (auto& node : tower_nodes_) {
+      if (node.dense_w) ReportCUDAErrors(cudaFree(node.dense_w));
+      if (node.dense_b) ReportCUDAErrors(cudaFree(node.dense_b));
+      
+      if (node.ln_gammas) {
+          ReportCUDAErrors(cudaFree(node.ln_gammas));
+          ReportCUDAErrors(cudaFree(node.ln_betas));
+      }
+      
+      if (node.mult_gate) {
+          ReportCUDAErrors(cudaFree(node.mult_gate));
+          ReportCUDAErrors(cudaFree(node.add_gate));
+      }
+  }
+
+  if (cnn_enc_w_ != nullptr) {
+      ReportCUDAErrors(cudaFree(cnn_enc_w_));
+      ReportCUDAErrors(cudaFree(cnn_enc_b_));
+
+      if (cnn_enc_ln_gammas_ != nullptr) {
+          ReportCUDAErrors(cudaFree(cnn_enc_ln_gammas_));
+          ReportCUDAErrors(cudaFree(cnn_enc_ln_betas_));
+      }
+
+      if (cnn_enc_mult_gate_ != nullptr) {
+          ReportCUDAErrors(cudaFree(cnn_enc_mult_gate_));
+          ReportCUDAErrors(cudaFree(cnn_enc_add_gate_));
+      }
+  }
+}

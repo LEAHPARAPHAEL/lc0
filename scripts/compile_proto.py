@@ -63,6 +63,7 @@ TYPES = {**VARINT_TYPES, **FIXED32_TYPES, **FIXED64_TYPES, **BYTES_TYPES}
 RESERVED_WORDS = [
     "enum",
     "message",
+    "oneof",
     "optional",
     "package",
     "repeated",
@@ -286,12 +287,18 @@ class ProtoTypeParser:
 
 
 class ProtoFieldParser:
-    def __init__(self, lexer, object_stack):
+    def __init__(self, lexer, object_stack, is_in_oneof=False):
         token, match = lexer.Pick()
-        if token not in ["repeated", "optional", "required"]:
-            lexer.Error("repeated, optional or required expected")
-        self.category = token
-        lexer.Consume(token)
+        
+        # If inside a oneof, fake the category as optional
+        if is_in_oneof:
+            self.category = "optional"
+        else:
+            if token not in ["repeated", "optional", "required"]:
+                lexer.Error("repeated, optional or required expected")
+            self.category = token
+            lexer.Consume(token)
+            
         self.type = ProtoTypeParser(lexer, object_stack)
         self.name = lexer.Consume("identifier")
         lexer.Consume("=")
@@ -670,12 +677,25 @@ class ProtoMessageParser:
                 self.types.append(ProtoEnumParser(lexer, self.scope + [self]))
             elif token in ["repeated", "optional", "required"]:
                 self.fields.append(ProtoFieldParser(lexer, [self.types, *type_stack]))
+            elif token == "oneof":
+                self.ParseOneof(lexer, [self.types, *type_stack]) 
             elif token == "reserved":
                 self.reserved.update(ParseReservedFields(lexer))
             else:
                 lexer.Error("Expected field or type")
         lexer.Consume("}")
         self.CheckReserved()
+
+    def ParseOneof(self, lexer, object_stack):
+        lexer.Consume("oneof")
+        oneof_name = lexer.Consume("identifier").group(0)
+        lexer.Consume("{")
+        while True:
+            token, match = lexer.Pick()
+            if token == "}":
+                lexer.Consume("}")
+                break
+            self.fields.append(ProtoFieldParser(lexer, object_stack, is_in_oneof=True))
 
     def GetName(self):
         return self.name

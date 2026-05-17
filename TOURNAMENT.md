@@ -8,7 +8,7 @@ fastchess -event 'Custom VS CUDNN 1000 nodes' -engine name='CUDNN' args='-w /hom
 
 fastchess -event 'NHWC' -engine name='cudnn' args='-w /home/raph/leela/networks/8x384x12h-2rbk-relu/8x384x12h-2rbk-relu-150000.pb.gz' cmd=./engines/fp32 -engine name='fp16' args='-w /home/raph/leela/networks/8x384x12h-2rbk-relu/8x384x12h-2rbk-relu-150000.pb.gz -o custom_depthwise=true,nhwc=true' cmd=./engines/fp16 -engine name='fp32' args='-w /home/raph/leela/networks/8x384x12h-2rbk-relu/8x384x12h-2rbk-relu-150000.pb.gz -o custom_depthwise=true,nhwc=true' cmd=./engines/fp32 -engine name='dense' args='-w /home/raph/leela/networks/8x384x12h-2rbk-relu/8x384x12h-2rbk-relu-150000.pb.gz -o custom_depthwise=true,nhwc=true' cmd=./engines/dense -openings file='/home/raph/leela/books/book-6-ply-unbalanced.pgn' format=pgn order=sequential -each nodes=1000 -rounds 100 -concurrency 1 -pgnout file=/home/raph/leela/pgns/precision_nhwc-1000n -config outname=/home/raph/leela/configs/precision_nhwc-1000n.json
 
-fastchess -event 'NHWC' -engine name='fp16' args='-w /home/raph/leela/networks/8x384x12h-2rbk-256/8x384x12h-2rbk-256-150000.pb.gz -o custom_depthwise=true,nhwc=true' cmd=./engines/fp16 -engine name='fp32' args='-w /home/raph/leela/networks/8x384x12h-2rbk-256/8x384x12h-2rbk-256-150000.pb.gz -o custom_depthwise=true,nhwc=true' cmd=./engines/fp32 -openings file='/home/raph/leela/books/book-6-ply-unbalanced.pgn' format=pgn order=sequential -each tc=60+0.1 -rounds 100 -concurrency 1 -pgnout file=/home/raph/leela/pgns/precision_nhwc-60s -config outname=/home/raph/leela/configs/precision_nhwc-60s.json
+fastchess -event 'NHWC' -engine name='fp16' args='-w /home/raph/leela/networks/8x384x12h-2rbk-256/8x384x12h-2rbk-256-150000.pb.gz -o custom_depthwise=true,nhwc=true' cmd=./engines/fp16 -engine name='cudnn' args='-w /home/raph/leela/networks/8x384x12h-2rbk-256/8x384x12h-2rbk-256-150000.pb.gz' cmd=./engines/fp32 -openings file='/home/raph/leela/books/book-6-ply-unbalanced.pgn' format=pgn order=sequential -each tc=60+0.1 -rounds 100 -concurrency 1 -pgnout file=/home/raph/leela/pgns/precision_nhwc-60s -config outname=/home/raph/leela/configs/precision_nhwc-60s.json
 
 
 
@@ -25,3 +25,10 @@ fastchess -config file=/home/raph/leela/configs/rbk_vs_new-60s.json
 
 fastchess -event 'NHWC' -engine name='standard' args='-w /home/raph/leela/networks/8x384x12h-256/8x384x12h-256-150000.pb.gz' cmd=./build/release/lc0 -engine name='res' args='-w /home/raph/leela/networks/8x384x12h-2res-256/8x384x12h-2res-256-150000.pb.gz' cmd=./build/release/lc0 -openings file='/home/raph/leela/books/book-6-ply-unbalanced.pgn' format=pgn order=sequential -each nodes=1000 -rounds 100 -concurrency 1 -pgnout file=/home/raph/leela/pgns/res_vs_new-1000n -config outname=/home/raph/leela/configs/res_vs_new-1000n.json
 
+# Mx2-Tx8 VS Tx8
+
+fastchess -event 'NHWC' -engine name='Tx8' args='-w /home/raph/leela/networks/Tx8/Tx8-150000.pb.gz -o nhwc=true' cmd=./build/release/lc0 -engine name='Mx2-Tx8-balanced' args='-w /home/raph/leela/networks/Mx2-Tx8-balanced/Mx2-Tx8-balanced-150000.pb.gz -o custom_depthwise=true,nhwc=true' cmd=./build/release/lc0 -openings file='/home/raph/leela/books/book-6-ply-unbalanced.pgn' format=pgn order=sequential -each tc=60+0.1 -rounds 100 -concurrency 1 -pgnout file=/home/raph/leela/pgns/Tx8_vs_Mx2-Tx8-60s -config outname=/home/raph/leela/configs/Tx8_vs_Mx2-Tx8-60s.json
+
+# Epsilon comp
+
+fastchess -event 'NHWC' -engine name='eps-3' args='-w /home/raph/leela/networks/Tx8/Tx8-150000.pb.gz -o nhwc=true' cmd=./build/release/lc0 -engine name='eps-5' args='-w /home/raph/leela/networks/Tx8-eps-5/Tx8-eps-5-150000.pb.gz -o custom_depthwise=true,nhwc=true' cmd=./build/release/lc0 -openings file='/home/raph/leela/books/book-6-ply-unbalanced.pgn' format=pgn order=sequential -each nodes=1000 -rounds 100 -concurrency 1 -pgnout file=/home/raph/leela/pgns/eps-1000n -config outname=/home/raph/leela/configs/eps-1000n.json
