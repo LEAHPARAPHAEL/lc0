@@ -220,9 +220,9 @@ BaseWeights::EncoderLayer::EncoderLayer(
     : mha(MHA(encoder.mha())),
       ln1_gammas(LayerAdapter(encoder.ln1_gammas()).as_vector()),
       ln1_betas(LayerAdapter(encoder.ln1_betas()).as_vector()),
-      ffn(FFN(encoder.ffn())) {}
-      //ln2_gammas(LayerAdapter(encoder.ln2_gammas()).as_vector()),
-      //ln2_betas(LayerAdapter(encoder.ln2_betas()).as_vector()) {}
+      ffn(FFN(encoder.ffn())),
+      ln2_gammas(LayerAdapter(encoder.ln2_gammas()).as_vector()),
+      ln2_betas(LayerAdapter(encoder.ln2_betas()).as_vector()) {}
 
 BaseWeights::ConvNext::ConvNext(
     const pblczero::Weights::ConvNext& block)

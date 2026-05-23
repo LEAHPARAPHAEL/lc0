@@ -3245,17 +3245,14 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
       tower_nodes_.push_back(std::move(node));
   }
 
-  if (!weights.cnn_enc_ln_gammas.empty()) {
-    if (!weights.cnn_enc_b.empty()) {
-        allocAndUpload<DataType>(&cnn_enc_w_, weights.cnn_enc_w, scratch);
-        allocAndUpload<DataType>(&cnn_enc_b_, weights.cnn_enc_b, scratch);
-    }
+  if (!weights.cnn_enc_b.empty()) {
+    allocAndUpload<DataType>(&cnn_enc_w_, weights.cnn_enc_w, scratch);
+    allocAndUpload<DataType>(&cnn_enc_b_, weights.cnn_enc_b, scratch);
     allocAndUpload<DataType>(&cnn_enc_ln_gammas_, weights.cnn_enc_ln_gammas, scratch);
     allocAndUpload<DataType>(&cnn_enc_ln_betas_, weights.cnn_enc_ln_betas, scratch);
     allocAndUpload<DataType>(&cnn_enc_mult_gate_, weights.cnn_enc_mult_gate, scratch);
     allocAndUpload<DataType>(&cnn_enc_add_gate_, weights.cnn_enc_add_gate, scratch);
     prev_layer = this;
-    embedding_op_size_ = weights.cnn_enc_ln_gammas.size();
   }
 
   this->C = current_channels;
@@ -3456,7 +3453,7 @@ void Backbone<DataType>::Eval(int N, DataType* output,
 
       
       LayerNorm<DataType>(batch, num_outputs, temp_spare, temp_flow, nullptr, (DataType*)nullptr, 
-                  cnn_enc_ln_gammas_, cnn_enc_ln_betas_, default_epsilon_, 1.0, ACTIVATION_NONE, stream);
+                  cnn_enc_ln_gammas_, cnn_enc_ln_betas_, default_epsilon_, 1.0, act_, stream);
 
       applyInputGating<DataType>(flow, temp_spare, cnn_enc_mult_gate_, cnn_enc_add_gate_, N, 64, num_outputs, stream);
   
