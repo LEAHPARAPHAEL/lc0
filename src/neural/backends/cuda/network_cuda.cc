@@ -24,6 +24,7 @@
   terms of the respective license agreement, the licensors of this
   Program grant you additional permission to convey the resulting work.
 */
+#include <iostream>
 #include <algorithm>
 #include <cassert>
 #include <list>
@@ -1132,9 +1133,7 @@ class CudaNetwork : public Network {
   cudaStream_t download_stream_ = nullptr;
   cudaEvent_t compute_ordering_event_ = nullptr;
   cublasHandle_t cublas_;
-  #ifdef USE_CUDNN
   cudnnHandle_t cudnn_;
-  #endif
   DataType* tensor_mem_[3];
 
   mutable std::mutex inputs_outputs_lock_;

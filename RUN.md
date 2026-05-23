@@ -1,7 +1,7 @@
 # Build the project
 meson setup --reconfigure build 
 ninja -C build 
-./build.sh release -Dcudnn=true 
+./build.sh release 
 
 
 position startpos moves e2e4 c7c6 d2d4 d7d5 b1c3 d5e4 c3e4
