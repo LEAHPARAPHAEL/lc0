@@ -123,11 +123,11 @@ static size_t getMaxAttentionHeadSize(
 
   if (weights.pol_encoder.size() > 0) {
     encoder_d_model = weights.pol_encoder[0].mha.q_b.size();
-    encoder_dff = weights.pol_encoder[0].ffn.dense1_b.size();
+    encoder_dff = weights.pol_encoder[0].ffn.dense1.biases.size();
 
     assert(encoder_d_model == weights.pol_encoder[0].mha.k_b.size());
     assert(encoder_d_model == weights.pol_encoder[0].mha.v_b.size());
-    assert(embedding_op_size == weights.pol_encoder[0].ffn.dense2_b.size());
+    assert(embedding_op_size == weights.pol_encoder[0].ffn.dense2.biases.size());
   }
 
   const size_t encoder_heads = weights.pol_encoder_head_count;
@@ -160,11 +160,11 @@ static size_t getMaxBackboneScratchSize(const MultiHeadWeights& weights, int N) 
           const auto& enc_weights = std::get<BaseWeights::EncoderLayer>(pb_block.block);
           
           encoder_d_model = enc_weights.mha.q_b.size();
-          encoder_dff = enc_weights.ffn.dense1_b.size();
+          encoder_dff = enc_weights.ffn.dense1.biases.size();
 
           assert(encoder_d_model == enc_weights.mha.k_b.size());
           assert(encoder_d_model == enc_weights.mha.v_b.size());
-          assert(embedding_op_size == enc_weights.ffn.dense2_b.size());
+          assert(embedding_op_size == enc_weights.ffn.dense2.biases.size());
           
           break; // We only need the dimensions from the first encoder
       }
@@ -325,8 +325,8 @@ class CudaNetwork : public Network {
 
     multi_stream_ = options.GetOrDefault<bool>("multi_stream", false);
 
-    nhwc_ = options.GetOrDefault<bool>("nhwc", false);
-    custom_depthwise_ = options.GetOrDefault<bool>("custom_depthwise", false);
+    nhwc_ = options.GetOrDefault<bool>("nhwc", true);
+    custom_depthwise_ = options.GetOrDefault<bool>("custom_depthwise", true);
 
     std::cout<<"NHWC layout : "<<nhwc_<<std::endl;
     std::cout<<"Custom depthwise : "<<custom_depthwise_<<std::endl;
@@ -538,12 +538,12 @@ class CudaNetwork : public Network {
         max_batch_size_,
         use_gemm_ex,
         use_fused_mha,
-        nhwc_,
+        true,
         use_res_block_winograd_fuse_opt_,
         allow_cache_opt_,
         l2_cache_size_,
         deviceProp.sharedMemPerBlockOptin,
-        custom_depthwise_,
+        true,
         cudnn_
       );
      
@@ -557,7 +557,7 @@ class CudaNetwork : public Network {
       if (attn_policy_) {
         auto AttentionPolicy = std::make_unique<AttentionPolicyHead<DataType>>(
             getLastLayer(), head, scratch_mem_, use_unified_backbone_, act,
-            max_batch_size_, use_gemm_ex);
+            max_batch_size_, use_gemm_ex, weights.epsilon);
         network_.emplace_back(std::move(AttentionPolicy));
 
         auto policymap = std::make_unique<PolicyMapLayer<DataType>>(
@@ -818,6 +818,7 @@ class CudaNetwork : public Network {
 #endif
     }
 
+    
     if (nhwc_ && (first_block_ == "M" || first_block_ == "C")) {
       expandPlanes_NHWC(tensor_mem[0], ipDataMasks, ipDataValues,
                 batchSize * kInputPlanes, compute_stream);
@@ -826,6 +827,8 @@ class CudaNetwork : public Network {
       expandPlanes_NCHW(tensor_mem[0], ipDataMasks, ipDataValues,
                 batchSize * kInputPlanes, compute_stream);
     }
+    
+
 
     auto* opPol = io->op_policy_mem_gpu_;
     auto* opVal = io->op_value_mem_gpu_;
@@ -1097,8 +1100,8 @@ class CudaNetwork : public Network {
   int max_convnext_filters_ = 0;
   int encoder_blocks_ = 0;
   std::string first_block_;
-  bool nhwc_ = false;
-  bool custom_depthwise_ = false;
+  bool nhwc_ = true;
+  bool custom_depthwise_ = true;
 
   int numBlocks_;
   int numFilters_;

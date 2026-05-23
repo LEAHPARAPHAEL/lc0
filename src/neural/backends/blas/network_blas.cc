@@ -276,7 +276,7 @@ void BlasComputation<use_eigen>::ForwardEncoderLayer(
     int embedding_size, int heads, ActivationFunction smolgen_activation,
     ActivationFunction ffn_activation, float alpha, float default_eps) {
   const int d_model = layer.mha.q_b.size();
-  const int dff_size = layer.ffn.dense1_b.size();
+  const int dff_size = layer.ffn.dense1.biases.size();
   const int hidden_channels =
       layer.mha.has_smolgen ? layer.mha.smolgen.compress.size() / embedding_size
                             : 0;
@@ -454,13 +454,13 @@ void BlasComputation<use_eigen>::ForwardEncoderLayer(
   // FFN.
   FullyConnectedLayer<use_eigen>::Forward1D(
       batch_size * kSquares, embedding_size, dff_size, encoder_buffer.data(),
-      layer.ffn.dense1_w.data(), layer.ffn.dense1_b.data(), ffn_activation,
+      layer.ffn.dense1.weights.data(), layer.ffn.dense1.biases.data(), ffn_activation,
       encoder_buffer4.data());
 
   FullyConnectedLayer<use_eigen>::Forward1D(
-      batch_size * kSquares, dff_size, layer.ffn.dense2_b.size(),
-      encoder_buffer4.data(), layer.ffn.dense2_w.data(),
-      layer.ffn.dense2_b.data(), ACTIVATION_NONE, encoder_buffer3.data());
+      batch_size * kSquares, dff_size, layer.ffn.dense2.biases.size(),
+      encoder_buffer4.data(), layer.ffn.dense2.weights.data(),
+      layer.ffn.dense2.biases.data(), ACTIVATION_NONE, encoder_buffer3.data());
 
   // Layer Norm + skip connection.
   LayerNorm2DWithSkipConnection(batch_size * kSquares, embedding_size,
@@ -498,7 +498,7 @@ void BlasComputation<use_eigen>::ComputeBlocking() {
                                 : kNumPosEncodingChannels;
   const auto input_channels =
       static_cast<size_t>(kInputPlanes + (attn_body_ ? enc_channels : 0));
-  const auto input_embed_dff = weights_.ip_emb_ffn.dense1_b.size();
+  const auto input_embed_dff = weights_.ip_emb_ffn.dense1.biases.size();
 
   const auto max_channels =
       std::max(std::max(output_channels, input_channels), input_embed_dff);
@@ -685,25 +685,25 @@ void BlasComputation<use_eigen>::ComputeBlocking() {
 
       // FFN in embedding for new encoding.
       if (is_pe_dense_embedding_) {
-        const auto dff_size = weights_.ip_emb_ffn.dense1_b.size();
+        const auto dff_size = weights_.ip_emb_ffn.dense1.biases.size();
         // FFN dense 1.
         FullyConnectedLayer<use_eigen>::Forward1D(
             batch_size * kSquares, embedding_size, dff_size, buffer1.data(),
-            weights_.ip_emb_ffn.dense1_w.data(),
-            weights_.ip_emb_ffn.dense1_b.data(), ffn_activation_,
+            weights_.ip_emb_ffn.dense1.weights.data(),
+            weights_.ip_emb_ffn.dense1.biases.data(), ffn_activation_,
             buffer3.data());
 
         // FFN dense 2.
         FullyConnectedLayer<use_eigen>::Forward1D(
             batch_size * kSquares, dff_size,
-            weights_.ip_emb_ffn.dense2_b.size(), buffer3.data(),
-            weights_.ip_emb_ffn.dense2_w.data(),
-            weights_.ip_emb_ffn.dense2_b.data(), ACTIVATION_NONE,
+            weights_.ip_emb_ffn.dense2.biases.size(), buffer3.data(),
+            weights_.ip_emb_ffn.dense2.weights.data(),
+            weights_.ip_emb_ffn.dense2.biases.data(), ACTIVATION_NONE,
             buffer2.data());
 
         // Layer Norm.
         LayerNorm2DWithSkipConnection(
-            batch_size * kSquares, weights_.ip_emb_ffn.dense2_b.size(),
+            batch_size * kSquares, weights_.ip_emb_ffn.dense2.biases.size(),
             buffer2.data(), alpha, buffer1.data(),
             weights_.ip_emb_ffn_ln_gammas.data(),
             weights_.ip_emb_ffn_ln_betas.data(), 1e-3);

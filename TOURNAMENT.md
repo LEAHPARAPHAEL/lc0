@@ -27,8 +27,18 @@ fastchess -event 'NHWC' -engine name='standard' args='-w /home/raph/leela/networ
 
 # Mx2-Tx8 VS Tx8
 
-fastchess -event 'NHWC' -engine name='Tx8' args='-w /home/raph/leela/networks/Tx8/Tx8-150000.pb.gz -o nhwc=true' cmd=./build/release/lc0 -engine name='Mx2-Tx8-balanced' args='-w /home/raph/leela/networks/Mx2-Tx8-balanced/Mx2-Tx8-balanced-150000.pb.gz -o custom_depthwise=true,nhwc=true' cmd=./build/release/lc0 -openings file='/home/raph/leela/books/book-6-ply-unbalanced.pgn' format=pgn order=sequential -each tc=60+0.1 -rounds 100 -concurrency 1 -pgnout file=/home/raph/leela/pgns/Tx8_vs_Mx2-Tx8-60s -config outname=/home/raph/leela/configs/Tx8_vs_Mx2-Tx8-60s.json
+fastchess -event 'NHWC' -engine name='Tx8' args='-w /home/raph/leela/networks/Tx8/Tx8-150000.pb.gz -o nhwc=true' cmd=./build/release/lc0 -engine name='Mx2-Tx8' args='-w /home/raph/leela/networks/Mx2-Tx8/Mx2-Tx8-150000.pb.gz -o custom_depthwise=true,nhwc=true' cmd=./build/release/lc0 -openings file='/home/raph/leela/books/book-6-ply-unbalanced.pgn' format=pgn order=sequential -each tc=60+0.1 -rounds 100 -concurrency 1 -pgnout file=/home/raph/leela/pgns/Tx8_vs_Mx2-Tx8-60s -config outname=/home/raph/leela/configs/Tx8_vs_Mx2-Tx8-60s.json
 
-# Epsilon comp
+# Mx2-Tx8 VS Mx4-Tx6
 
-fastchess -event 'NHWC' -engine name='eps-3' args='-w /home/raph/leela/networks/Tx8/Tx8-150000.pb.gz -o nhwc=true' cmd=./build/release/lc0 -engine name='eps-5' args='-w /home/raph/leela/networks/Tx8-eps-5/Tx8-eps-5-150000.pb.gz -o custom_depthwise=true,nhwc=true' cmd=./build/release/lc0 -openings file='/home/raph/leela/books/book-6-ply-unbalanced.pgn' format=pgn order=sequential -each nodes=1000 -rounds 100 -concurrency 1 -pgnout file=/home/raph/leela/pgns/eps-1000n -config outname=/home/raph/leela/configs/eps-1000n.json
+fastchess -event 'NHWC' -engine name='Mx2-Tx8' args='-w /home/raph/leela/networks/Mx2-Tx8/Mx2-Tx8-150000.pb.gz' cmd=./build/release/lc0 -engine name='Mx4-Tx6' args='-w /home/raph/leela/networks/Mx4-Tx6/Mx4-Tx6-150000.pb.gz' cmd=./build/release/lc0 -openings file='/home/raph/leela/books/book-6-ply-unbalanced.pgn' format=pgn order=sequential -each tc=60+0.1 -rounds 100 -concurrency 1 -pgnout file=/home/raph/leela/pgns/Mx2-Tx8_vs_Mx4-Tx6-60s -config outname=/home/raph/leela/configs/Mx2-Tx8_vs_Mx4-Tx6-60s.json
+
+
+
+fastchess -event 'Tx8_vs_Mx6-Tx4' -engine name='Mx6-Tx4' args='-w /home/raph/leela/networks/Mx6-Tx4/Mx6-Tx4-150000.pb.gz' cmd=./build/release/lc0 -engine name='Tx8' args='-w /home/raph/leela/networks/Tx8/Tx8-150000.pb.gz' cmd=./build/release/lc0 -openings file='/home/raph/leela/books/book-6-ply-unbalanced.pgn' format=pgn order=sequential -each tc=60+0.1 -rounds 100 -concurrency 1 -pgnout file=/home/raph/leela/pgns/Tx8_vs_Mx6-Tx4-60s -config outname=/home/raph/leela/configs/Tx8_vs_Mx6-Tx4-60s.json
+
+fastchess -config file=/home/raph/leela/configs/Tx8_vs_Mx6-Tx4-60s.json
+
+fastchess -event 'Tx8_vs_Mx6-Tx4' -engine name='Mx6-Tx4' args='-w /home/raph/leela/networks/Mx6-Tx4/Mx6-Tx4-150000.pb.gz' cmd=./build/release/lc0 -engine name='Tx8' args='-w /home/raph/leela/networks/Tx8/Tx8-150000.pb.gz' cmd=./build/release/lc0 -openings file='/home/raph/leela/books/book-6-ply-unbalanced.pgn' format=pgn order=sequential -each nodes=1000 -rounds 100 -concurrency 1 -pgnout file=/home/raph/leela/pgns/Tx8_vs_Mx6-Tx4-1000n -config outname=/home/raph/leela/configs/Tx8_vs_Mx6-Tx4-1000n.json
+
+fastchess -config file=/home/raph/leela/configs/Tx8_vs_Mx6-Tx4-1000n.json

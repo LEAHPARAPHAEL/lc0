@@ -65,6 +65,7 @@ BaseWeights::BaseWeights(const pblczero::Weights& weights)
   }
   encoder_head_count = weights.headcount();
   epsilon = weights.epsilon();
+  //epsilon = 1e-6;
 }
 
 BaseWeights::SEunit::SEunit(const pblczero::Weights::SEunit& se)
@@ -207,24 +208,21 @@ BaseWeights::MHA::MHA(const pblczero::Weights::MHA& mha)
       has_rpe_v(mha.has_rpe_v()) {}
     */
 
-
-
-
-
 BaseWeights::FFN::FFN(const pblczero::Weights::FFN& ffn)
-    : dense1_w(LayerAdapter(ffn.dense1_w()).as_vector()),
-      dense1_b(LayerAdapter(ffn.dense1_b()).as_vector()),
-      dense2_w(LayerAdapter(ffn.dense2_w()).as_vector()),
-      dense2_b(LayerAdapter(ffn.dense2_b()).as_vector()) {}
+    : dense1(ConvBlock(ffn.dense1())),
+      dense2(ConvBlock(ffn.dense2())),
+      d_conv(DepthwiseConvBlock(ffn.d_conv())) {}
+      //ln_betas(LayerAdapter(ffn.ln_betas()).as_vector()),
+      //ln_gammas(LayerAdapter(ffn.ln_gammas()).as_vector()) {}
 
 BaseWeights::EncoderLayer::EncoderLayer(
     const pblczero::Weights::EncoderLayer& encoder)
     : mha(MHA(encoder.mha())),
       ln1_gammas(LayerAdapter(encoder.ln1_gammas()).as_vector()),
       ln1_betas(LayerAdapter(encoder.ln1_betas()).as_vector()),
-      ffn(FFN(encoder.ffn())),
-      ln2_gammas(LayerAdapter(encoder.ln2_gammas()).as_vector()),
-      ln2_betas(LayerAdapter(encoder.ln2_betas()).as_vector()) {}
+      ffn(FFN(encoder.ffn())) {}
+      //ln2_gammas(LayerAdapter(encoder.ln2_gammas()).as_vector()),
+      //ln2_betas(LayerAdapter(encoder.ln2_betas()).as_vector()) {}
 
 BaseWeights::ConvNext::ConvNext(
     const pblczero::Weights::ConvNext& block)

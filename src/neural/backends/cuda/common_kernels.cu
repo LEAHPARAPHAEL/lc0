@@ -1161,21 +1161,28 @@ __global__ void layer_norm_kernel(int N, int C, T* output, const T* input,
       for (int i = 0; i < 8; i++) val[i] = (float)inp[i];
       copyAs<uint4>(&inp[0], &input[tensorIndex + 8]);
       for (int i = 0; i < 8; i++) val[i + 8] = (float)inp[i];
-      copyAs<uint4>(&inp[0], &bias[biasIndex]);
-      for (int i = 0; i < 8; i++) oth[i] = (float)inp[i];
-      copyAs<uint4>(&inp[0], &bias[biasIndex + 8]);
-      for (int i = 0; i < 8; i++) oth[i + 8] = (float)inp[i];
-      for (int i = 0; i < 16; i++) val[i] += oth[i];
+      
+      if (bias != nullptr) {
+        copyAs<uint4>(&inp[0], &bias[biasIndex]);
+        for (int i = 0; i < 8; i++) oth[i] = (float)inp[i];
+        copyAs<uint4>(&inp[0], &bias[biasIndex + 8]);
+        for (int i = 0; i < 8; i++) oth[i + 8] = (float)inp[i];
+        for (int i = 0; i < 16; i++) val[i] += oth[i];
+      }
+      
     } else {
       copyAs<uint4>(&val[0], &input[tensorIndex]);
       copyAs<uint4>(&val[4], &input[tensorIndex + 4]);
       copyAs<uint4>(&val[8], &input[tensorIndex + 8]);
       copyAs<uint4>(&val[12], &input[tensorIndex + 12]);
-      copyAs<uint4>(&oth[0], &bias[biasIndex]);
-      copyAs<uint4>(&oth[4], &bias[biasIndex + 4]);
-      copyAs<uint4>(&oth[8], &bias[biasIndex + 8]);
-      copyAs<uint4>(&oth[12], &bias[biasIndex + 12]);
-      for (int i = 0; i < 16; i++) val[i] += oth[i];
+      
+      if (bias != nullptr) {
+        copyAs<uint4>(&oth[0], &bias[biasIndex]);
+        copyAs<uint4>(&oth[4], &bias[biasIndex + 4]);
+        copyAs<uint4>(&oth[8], &bias[biasIndex + 8]);
+        copyAs<uint4>(&oth[12], &bias[biasIndex + 12]);
+        for (int i = 0; i < 16; i++) val[i] += oth[i];
+      }
     }
   }
 
@@ -1286,7 +1293,6 @@ __global__ void layer_norm_kernel(int N, int C, T* output, const T* input,
     }
   }
 }
-
 // add (optional) skip connection to input, and then perform Layer normalization
 // normalization is done across C dimension (i.e, sums and std deviations taken
 // over elements in C dim)

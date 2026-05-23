@@ -645,14 +645,164 @@ void DepthwiseEvalNHWC(int N, int C_in, half* output, const half* input, void* s
 }
 
 
+/*
+__global__ void FusedDWPWKernelNHWC_fp16(
+    int total_cin_half2, 
+    int total_cout_half2, 
+    half2* output, 
+    const half2* input, 
+    const half2* dw_weights, 
+    const half2* pw_weights, 
+    const half2* pw_biases,
+    ActivationFunction dw_act, 
+    ActivationFunction pw_act, 
+    int rook_channels, int bishop_channels, int knight_channels) 
+{
+#if __CUDA_ARCH__ >= 700 
+    // 1 Block = 1 Spatial Square
+    int w = blockIdx.x;
+    int h = blockIdx.y;
+    int n = blockIdx.z;
+
+    int tid = threadIdx.x;
+
+    // Dynamically allocated shared memory to hold the DW output
+    extern __shared__ half2 smem_dw[]; 
+
+    // ==========================================
+    // PHASE 1: DEPTHWISE (Spatial Math)
+    // ==========================================
+    if (tid < total_cin_half2) {
+        half2 w_h2[9];
+        #pragma unroll
+        for(int i = 0; i < 9; ++i) {
+            w_h2[i] = dw_weights[i * total_cin_half2 + tid];
+        }
+        half2 b_h2 = dw_weights[9 * total_cin_half2 + tid];
+
+        int abs_h_input = h - 2;
+        int abs_w_input = w - 2;
+        half2 sum = __float2half2_rn(0.0f);
+
+        if (2 * tid < rook_channels) { 
+            sum = __hfma2(w_h2[0], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input + 2, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[1], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 2, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[2], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[3], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 1, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[4], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 2, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[5], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 3, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[6], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 4, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[7], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 2, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[8], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input + 2, c_half2, total_c_half2), sum);
+        }
+        else if (2 * tid < bishop_channels) { 
+            sum = __hfma2(w_h2[0], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[1], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input + 4, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[2], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 1, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[3], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 3, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[4], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 2, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[5], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 1, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[6], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 3, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[7], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[8], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input + 4, c_half2, total_c_half2), sum);
+        }
+        else { 
+            sum = __hfma2(w_h2[0], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input + 1, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[1], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input + 3, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[2], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[3], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 4, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[4], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 2, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[5], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[6], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 4, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[7], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input + 1, c_half2, total_c_half2), sum);
+            sum = __hfma2(w_h2[8], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input + 3, c_half2, total_c_half2), sum);
+        }
+
+        sum = __hadd2(sum, b_h2);
+        
+        float2 sum_f32 = __half22float2(sum);
+        sum_f32.x = activate(sum_f32.x, dw_act);
+        sum_f32.y = activate(sum_f32.y, dw_act);
+        sum = __float22half2_rn(sum_f32);
+
+        smem_dw[tid] = sum;
+    }
+
+    __syncthreads();
+
+    if (tid < total_cout_half2) {
+        
+        float sum0 = 0.0f; 
+        float sum1 = 0.0f;
+
+        for (int k = 0; k < total_cin_half2; ++k) {
+            half2 in_val = smem_dw[k]; 
+
+            half2 w0 = pw_weights[(2 * tid) * total_cin_half2 + k];
+            half2 w1 = pw_weights[(2 * tid + 1) * total_cin_half2 + k];
+
+            half2 dp0 = __hmul2(in_val, w0);
+            half2 dp1 = __hmul2(in_val, w1);
+
+            float2 f_dp0 = __half22float2(dp0);
+            float2 f_dp1 = __half22float2(dp1);
+
+            sum0 += (f_dp0.x + f_dp0.y);
+            sum1 += (f_dp1.x + f_dp1.y);
+        }
+
+        float2 b = __half22float2(pw_biases[tid]);
+        sum0 += b.x;
+        sum1 += b.y;
+
+        sum0 = activate(sum0, pw_act);
+        sum1 = activate(sum1, pw_act);
+
+        float2 final_f32;
+        final_f32.x = sum0;
+        final_f32.y = sum1;
+        
+        int out_index = (n * 64 * total_cout_half2) + (h * 8 * total_cout_half2) + (w * total_cout_half2) + tid;
+        output[out_index] = __float22half2_rn(final_f32);
+    }
+#endif
+}
 
 
 
 
+void FusedDWPWEvalNHWC(int N, int C_in, int C_out, half* output, const half* input,
+                       const half2* dw_weights, const half2* pw_weights, const half2* pw_biases,
+                       ActivationFunction dw_act, ActivationFunction pw_act, 
+                       int rook_channels, int bishop_channels, int knight_channels, 
+                       cudaStream_t stream) {
+    
+    int total_cin_half2 = C_in / 2;
+    int total_cout_half2 = C_out / 2;
 
+    // We need enough threads to cover the largest channel dimension
+    int threads_per_block = std::max(total_cin_half2, total_cout_half2);
 
+    // 1 Block = 1 Spatial Square (8x8) across N batches
+    dim3 blocks(8, 8, N);
+    dim3 threads(threads_per_block, 1, 1);
+    
+    // Shared memory required to hold the Depthwise intermediate results
+    size_t smem_bytes = total_cin_half2 * sizeof(half2);
 
+    int cum_rook = rook_channels;
+    int cum_bishop = cum_rook + bishop_channels;
+    int cum_knight = cum_bishop + knight_channels;
 
+    FusedDWPWKernelNHWC_fp16<<<blocks, threads, smem_bytes, stream>>>(
+        total_cin_half2, total_cout_half2, 
+        (half2*)output, (const half2*)input, 
+        dw_weights, pw_weights, pw_biases,
+        dw_act, pw_act, cum_rook, cum_bishop, cum_knight
+    );
+    ReportCUDAErrors(cudaGetLastError());
+}
+*/
 
 // SE layer implementation using single fused kernel.
 

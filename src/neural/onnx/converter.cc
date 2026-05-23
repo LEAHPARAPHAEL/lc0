@@ -61,10 +61,7 @@ class Converter {
                     pblczero::NetworkFormat::DEFAULT_ACTIVATION_MISH
                 ? ACTIVATION_MISH
                 : ACTIVATION_RELU),
-        default_eps_(net.format().network_format().input_embedding() ==
-                             pblczero::NetworkFormat::INPUT_EMBEDDING_PE_DENSE
-                         ? 1e-3
-                         : 1e-6) {}
+        default_eps_(net.weights().epsilon()) {}
 
   void Convert(pblczero::Net* dst);
 
@@ -502,18 +499,18 @@ std::string Converter::MakeFFN(OnnxBuilder* builder,
                                int embedding_size, const std::string& ffn_in,
                                const std::string& name,
                                ActivationFunction activation, float alpha) {
-  const int dff_size = ffn.dense1_b.size();
+  const int dff_size = ffn.dense1.biases.size();
   auto flow = builder->MatMul(
       name + "/ffn/dense1/w", ffn_in,
-      *GetWeghtsConverter(ffn.dense1_w, {embedding_size, dff_size}, {1, 0}));
+      *GetWeghtsConverter(ffn.dense1.weights, {embedding_size, dff_size}, {1, 0}));
   flow = builder->Add(name + "/ffn/dense1/b", flow,
-                      *GetWeghtsConverter(ffn.dense1_b, {dff_size}));
+                      *GetWeghtsConverter(ffn.dense1.biases, {dff_size}));
   flow = MakeActivation(builder, flow, name + "/ffn/dense1", activation);
   flow = builder->MatMul(
       name + "/ffn/dense2/w", flow,
-      *GetWeghtsConverter(ffn.dense2_w, {dff_size, embedding_size}, {1, 0}));
+      *GetWeghtsConverter(ffn.dense2.weights, {dff_size, embedding_size}, {1, 0}));
   flow = builder->Add(name + "/ffn/dense2/b", flow,
-                      *GetWeghtsConverter(ffn.dense2_b, {embedding_size}));
+                      *GetWeghtsConverter(ffn.dense2.biases, {embedding_size}));
   if (alpha != 1.0) {
     flow = builder->Mul(name + "/ffn/alpha", flow, *GetScalarConverter(alpha));
   }

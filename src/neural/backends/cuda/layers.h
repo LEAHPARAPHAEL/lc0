@@ -466,6 +466,38 @@ class DepthwiseCustom : public BaseLayer<DataType> {
 
 };
 
+/*
+template <typename DataType>
+class FusedDWPWLayer : public BaseLayer<DataType> {
+ public:
+  FusedDWPWLayer(int C_in, int C_out, int H, int W, 
+                 ActivationFunction dw_act, ActivationFunction pw_act, bool nhwc,
+                 int rook_channels, int bishop_channels, int knight_channels);
+  ~FusedDWPWLayer();
+
+  void LoadWeights(float* p_dw_filter, float* p_dw_bias, 
+                   float* p_pw_filter, float* p_pw_bias, void* scratch);
+
+  void Eval(int N, DataType* output, const DataType* input,
+            const DataType* input2, void* scratch, size_t scratch_size,
+            cudnnHandle_t cudnn, cublasHandle_t cublas, cudaStream_t stream,
+            DataType*** offset_pointers) override;
+
+ private:
+  int c_input_;
+  int c_output_;
+  ActivationFunction dw_act_;
+  ActivationFunction pw_act_;
+  int rook_channels_;
+  int bishop_channels_;
+  int knight_channels_;
+
+  half* dw_weights_ = nullptr;
+  half* pw_weights_ = nullptr;
+  half* pw_biases_ = nullptr;
+};
+*/
+
 
 template <typename DataType>
 class EncoderBlock {
@@ -493,6 +525,10 @@ class EncoderBlock {
 
   DataType *ffn_dense1_w, *ffn_dense1_b;
   DataType *ffn_dense2_w, *ffn_dense2_b;
+  //DataType *ffn_ln_betas = nullptr;
+  //DataType *ffn_ln_gammas = nullptr;
+
+  std::unique_ptr<DepthwiseCustom<DataType>> d_conv = nullptr;
 
   DataType *ln2_gammas, *ln2_betas;
 
@@ -530,7 +566,6 @@ class EncoderBlock {
   const int max_batch_size_;
   const bool use_fused_mha_;
   const bool use_gemm_ex_;
-
   /*
   DataType* rpe_q_expanded_ = nullptr;
   DataType* rpe_k_expanded_ = nullptr;
@@ -559,7 +594,7 @@ class AttentionPolicyHead : public BaseLayer<DataType> {
                       const MultiHeadWeights::PolicyHead& weights,
                       void* scratch, bool attention_body,
                       ActivationFunction act, int max_batch_size,
-                      bool use_gemm_ex);
+                      bool use_gemm_ex, float epsilon);
   ~AttentionPolicyHead();
   void Eval(int N, DataType* output, const DataType* input,
             const DataType* input2, void* scratch, size_t scratch_size,
@@ -583,6 +618,8 @@ class AttentionPolicyHead : public BaseLayer<DataType> {
   int policy_d_model_;
   bool attention_body_;
   ActivationFunction act_;
+
+  float default_epsilon_;
 
   std::vector<EncoderBlock<DataType>*> encoder_weights_;
 };
@@ -731,6 +768,10 @@ class Backbone : public BaseLayer<DataType> {
   DataType *ip_emb_ffn_d1_w_, *ip_emb_ffn_d1_b_;  // input embedding FFN dense1 weights
   DataType *ip_emb_ffn_d2_w_, *ip_emb_ffn_d2_b_;  // input embedding FFN dense2 weights
   DataType *ip_emb_ffn_ln_g_, *ip_emb_ffn_ln_b_;  // input embedding FFN layernorm gamma and beta
+  //DataType *ip_emb_ffn_ln_gammas_ = nullptr;
+  //DataType *ip_emb_ffn_ln_betas_ = nullptr;
+  std::unique_ptr<DepthwiseCustom<DataType>> ip_emb_ffn_d_conv_ = nullptr;
+
   DataType *smolgen_global_;  // global smolgen weights for all encoder layers
   DataType *pos_encoding_;
   int embedding_dense_size_;
@@ -767,8 +808,6 @@ class Backbone : public BaseLayer<DataType> {
 
     enum BlockType { TRANSFORMER, RESIDUAL, MOBILENET, CONVNEXT };
     BlockType type;
-
-    int skip_idx = 0;
 
     bool requires_NHWC_NCHW_conversion = false;
     bool requires_NCHW_NHWC_conversion = false;

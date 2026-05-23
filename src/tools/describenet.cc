@@ -151,7 +151,7 @@ void ShowNetworkWeightsBodyInfo(const pblczero::Net& weights) {
     COUT << Justify("Embedding size") << w.ip_emb_b().params().size() / 2;
     COUT << Justify("Dmodel") << w.encoder(0).mha().q_b().params().size() / 2;
     COUT << Justify("Encoder DFF")
-         << w.encoder(0).ffn().dense1_b().params().size() / 2;
+         << w.encoder(0).ffn().dense1().biases().params().size() / 2;
   } else {
     COUT << Justify("Blocks") << w.residual_size();
     int se_count = 0;
@@ -190,7 +190,7 @@ void ShowNetworkWeightsPolicyInfo(const pblczero::Net& weights) {
       COUT << Justify("Policy encoder Dmodel")
            << w.pol_encoder(0).mha().q_b().params().size() / 2;
       COUT << Justify("Policy encoder DFF")
-           << w.pol_encoder(0).ffn().dense1_b().params().size() / 2;
+           << w.pol_encoder(0).ffn().dense1().biases().params().size() / 2;
       COUT << Justify("Policy FFN activation")
            << NetworkFormat::ActivationFunction_Name(ffn_activation);
     }

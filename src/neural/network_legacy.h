@@ -118,11 +118,12 @@ struct BaseWeights {
   };
 
   struct FFN {
-    explicit FFN(const pblczero::Weights::FFN& mha);
-    Vec dense1_w;
-    Vec dense1_b;
-    Vec dense2_w;
-    Vec dense2_b;
+    explicit FFN(const pblczero::Weights::FFN& ffn);
+    ConvBlock dense1;
+    ConvBlock dense2;
+    DepthwiseConvBlock d_conv;
+    //Vec ln_betas;
+    //Vec ln_gammas;
   };
 
   struct EncoderLayer {
