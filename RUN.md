@@ -15,17 +15,19 @@ position startpos moves e2e4 c7c6 d2d4 d7d5 b1c3 d5e4 c3e4
 
 ./build/release/lc0 backendbench --weights=/home/raph/leela/networks/8x384x12h-2rbk-256/8x384x12h-2rbk-256-150000.pb.gz -o custom_depthwise=true,nhwc=true
 
-./build/release/lc0 --weights=/home/raph/leela/networks/Mx2-Tx8/Mx2-Tx8-150000.pb.gz -o custom_depthwise=true,nhwc=true
+./build/release/lc0 --weights=/home/raph/leela/networks/Mx2-Tx8/Mx2-Tx8-150000.pb.gz 
 
-./build/release/lc0 backendbench --weights=/home/raph/leela/networks/Mx2-Tx8/Mx2-Tx8-150000.pb.gz -o custom_depthwise=true,nhwc=true
+./engines/eps-6 --weights=/home/raph/leela/networks/Mx2-Tx8/Mx2-Tx8-150000.pb.gz
+
+./build/release/lc0 backendbench --weights=/home/raph/leela/networks/Mx2-Tx8/Mx2-Tx8-150000.pb.gz 
 
 ./build/release/lc0 --weights=/home/raph/leela/networks/Tx8/Tx8-150000.pb.gz 
 
 ./build/release/lc0 backendbench --weights=/home/raph/leela/networks/Tx8/Tx8-150000.pb.gz 
 
-./build/release/lc0 --weights=/home/raph/leela/networks/Tx8-depthwise/Tx8-depthwise-10000.pb.gz 
+./build/release/lc0 --weights=/home/raph/leela/networks/Tx8-LNDW-deep/Tx8-LNDW-deep-150000.pb.gz 
 
-./build/release/lc0 backendbench --weights=/home/raph/leela/networks/Tx8-depthwise/Tx8-depthwise-10000.pb.gz
+./build/release/lc0 backendbench --weights=/home/raph/leela/networks/Tx8-LNDW-deep/Tx8-LNDW-deep-150000.pb.gz
 
 ./build/release/lc0 --weights=/home/raph/leela/networks/Mx4-Tx6/Mx4-Tx6-150000.pb.gz 
 
@@ -38,6 +40,10 @@ position startpos moves e2e4 c7c6 d2d4 d7d5 b1c3 d5e4 c3e4
 ./build/release/lc0 --weights=/home/raph/leela/networks/Cx6-Tx6/Cx6-Tx6-150000.pb.gz
 
 ./build/release/lc0 backendbench --weights=/home/raph/leela/networks/Cx6-Tx6/Cx6-Tx6-150000.pb.gz
+
+./build/release/lc0 --weights=/home/raph/leela/networks/L-Mx4-Tx4/L-Mx4-Tx4-2000.pb.gz
+
+./build/release/lc0 backendbench --weights=/home/raph/leela/networks/L-Mx4-Tx4/L-Mx4-Tx4-2000.pb.gz
 
 # CUDNN
 

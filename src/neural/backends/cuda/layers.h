@@ -809,9 +809,6 @@ class Backbone : public BaseLayer<DataType> {
     enum BlockType { TRANSFORMER, RESIDUAL, MOBILENET, CONVNEXT };
     BlockType type;
 
-    bool requires_NHWC_NCHW_conversion = false;
-    bool requires_NCHW_NHWC_conversion = false;
-
     std::unique_ptr<EncoderBlock<DataType>> encoder;
     std::vector<std::unique_ptr<BaseLayer<DataType>>> cnn_layers;
 
@@ -832,7 +829,6 @@ class Backbone : public BaseLayer<DataType> {
   DataType *cnn_enc_ln_gammas_, *cnn_enc_ln_betas_;
   DataType *cnn_enc_mult_gate_, *cnn_enc_add_gate_;
   std::unique_ptr<BaseLayer<DataType>> input_conv_;
-  //std::unique_ptr<ConvLayer<DataType>> input_conv_;
 
   bool use_res_block_winograd_fuse_opt_;
   int shared_mem_per_block_optin_;

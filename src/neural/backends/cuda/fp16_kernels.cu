@@ -980,6 +980,13 @@ bool Se_Fp16_NHWC(int N, int C, int numFc1Out, half* output, const half* skip,
     } else {
       return false;
     }
+  } else if (numFc1Out == 128) {
+    if (C == 256) {
+      SE_Layer_NHWC<256, 128><<<N, C, 0, stream>>>(output, skip, input, w1, b1,
+                                                 w2, b2, bPrev, activation);      
+    } else {
+      return false;
+    }
   } else {
     // TODO: support other sizes.
     return false;

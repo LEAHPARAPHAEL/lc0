@@ -137,7 +137,7 @@ inline int GetPaddedBatchSize(int batch_size) {
 // Use Single kernel for entire SE operation.
 // Right now supported only for fp16 with nhwc and it's quite a bit faster
 // than using multiple passes. The flag can be set to false for debugging.
-static constexpr bool kUseFusedSELayer = true;
+static constexpr bool kUseFusedSELayer = false;
 
 template <typename DataType>
 BaseLayer<DataType>::BaseLayer(int c, int h, int w, BaseLayer* ip, bool nhwc)
@@ -2190,6 +2190,8 @@ AttentionPolicyHead<DataType>::AttentionPolicyHead(
   encoder_heads_ = weights.pol_encoder_head_count;
   policy_d_model_ = wq_op_size_;
 
+  //default_epsilon_ = 1e-6;
+
   allocAndUpload<DataType>(&ip_pol_w_, weights.ip_pol_w, scratch);
   allocAndUpload<DataType>(&ip_pol_b_, weights.ip_pol_b, scratch);
 
@@ -2493,7 +2495,7 @@ void Conv1Layer<DataType>::Eval(int N, DataType* output, const DataType* input,
 
   if (use_bias_) {
       if (nhwc_) {
-          addBiasBatched(output, output, biases_, 1, N * H * W, C, act_, stream);
+        addBiasBatched(output, output, biases_, 1, N * H * W, C, act_, stream);
       } else {
           addBias_NCHW(output, output, biases_, N, C, H, W, act_, stream);
       }
@@ -3035,6 +3037,7 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
   
   int current_channels = input_c_;
 
+  // Deep norm scaling for residual stream
   alpha_ = (encoder_blocks_ + convnext_blocks_) > 0 ? (float)pow(2.0 * encoder_blocks_ + 1.0 * convnext_blocks_, -0.25) : 1.0f;
 
   if (has_smolgen_) {
@@ -3075,8 +3078,10 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
     embedding_ffn_size_ = weights.ip_emb_ffn.dense2.biases.size();
     embedding_ffn_dff_ = weights.ip_emb_ffn.dense1.biases.size();
 
+    // Potential depthwise convolution between the two FFN dense layers of the embedding
     if (weights.ip_emb_ffn.d_conv.biases.size() > 0) {
-        ip_emb_ffn_d_conv_ = std::make_unique<DepthwiseCustom<DataType>>(embedding_ffn_size_, 8, 8, activations_.ffn_activation, true,
+        ip_emb_ffn_d_conv_ = std::make_unique<DepthwiseCustom<DataType>>(embedding_ffn_size_, 8, 8, 
+            activations_.ffn_activation, true,
             weights.ip_emb_ffn.d_conv.rook_channels,
             weights.ip_emb_ffn.d_conv.bishop_channels,
             weights.ip_emb_ffn.d_conv.knight_channels);
@@ -3087,6 +3092,8 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
     prev_layer = this;
     current_channels = embedding_op_size_;
   }
+
+  // CNN start for the network : 1x1 input conv
   else if (starts_with_mobilenet_ || starts_with_convnext_){
     auto input_conv = std::make_unique<Conv1Layer<DataType>>(
               prev_layer, weights.input.biases.size(), 8, 8, current_channels,
@@ -3105,10 +3112,11 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
     input_conv_output_channels_ = current_channels;    
   }
 
+  // Iterates over each block of the main backbone tower
   for (size_t i = 0; i < weights.tower.size(); ++i) {
       const auto& pb_block = weights.tower[i];
       TowerNode node;
-      // CNN -> ENC
+      // CNN -> ENC transition between a CNN block and an encoder one.
       if (!pb_block.ln_betas.empty()) {
           node.in_channels = current_channels;
           // Optional in case the number of channels is already equal to the embedding size
@@ -3123,8 +3131,11 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
           }
           allocAndUpload<DataType>(&node.ln_gammas, pb_block.ln_gammas, scratch);
           allocAndUpload<DataType>(&node.ln_betas, pb_block.ln_betas, scratch);
-          allocAndUpload<DataType>(&node.mult_gate, pb_block.mult_gate, scratch);
-          allocAndUpload<DataType>(&node.add_gate, pb_block.add_gate, scratch);
+
+          if (!pb_block.mult_gate.empty()){
+            allocAndUpload<DataType>(&node.mult_gate, pb_block.mult_gate, scratch);
+            allocAndUpload<DataType>(&node.add_gate, pb_block.add_gate, scratch);
+          }
           current_channels = node.out_channels; 
           embedding_op_size_ = current_channels;
       }
@@ -3158,6 +3169,7 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
           prev_layer = node.transition_cnn.get();
       }
 
+      // Encoder block
       if (std::holds_alternative<BaseWeights::EncoderLayer>(pb_block.block)) {
           node.type = TowerNode::TRANSFORMER;
           const auto& enc_weights = std::get<BaseWeights::EncoderLayer>(pb_block.block);
@@ -3169,6 +3181,8 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
               default_epsilon_, use_gemm_ex, use_fused_mha_
           );
       } 
+
+      // Mobile Net block
       else if (std::holds_alternative<BaseWeights::MobileNet>(pb_block.block)) {
         node.type = TowerNode::MOBILENET;
         const auto& m_weights = std::get<BaseWeights::MobileNet>(pb_block.block);
@@ -3216,6 +3230,8 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
         prev_layer = se.get();
         node.cnn_layers.push_back(std::move(se));
       }
+
+      // ConvNext block
       else if (std::holds_alternative<BaseWeights::ConvNext>(pb_block.block)) {
         node.type = TowerNode::CONVNEXT;
         const auto& c_weights = std::get<BaseWeights::ConvNext>(pb_block.block);
@@ -3245,6 +3261,7 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
       tower_nodes_.push_back(std::move(node));
   }
 
+  // Final encoding for the different heads if the last layer is convolutional
   if (!weights.cnn_enc_ln_gammas.empty()) {
     if (!weights.cnn_enc_b.empty()) {
         allocAndUpload<DataType>(&cnn_enc_w_, weights.cnn_enc_w, scratch);
@@ -3375,7 +3392,11 @@ void Backbone<DataType>::Eval(int N, DataType* output,
           LayerNorm<DataType>(batch, num_outputs, temp_spare, temp_flow, node.dense_b, (DataType*)nullptr, 
                               node.ln_gammas, node.ln_betas, default_epsilon_, 1.0, ACTIVATION_NONE, stream);
           std::swap(temp_flow, temp_spare);
-          applyInputGating<DataType>(flow, temp_flow, node.mult_gate, node.add_gate, N, 64, num_outputs, stream);
+
+          if (node.mult_gate != nullptr) {
+            applyInputGating<DataType>(flow, temp_flow, node.mult_gate, node.add_gate, N, 64, num_outputs, stream);
+          }
+
           current_channels = node.out_channels;
       }
 

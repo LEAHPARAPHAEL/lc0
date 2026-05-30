@@ -137,7 +137,7 @@ inline int GetPaddedBatchSize(int batch_size) {
 // Use Single kernel for entire SE operation.
 // Right now supported only for fp16 with nhwc and it's quite a bit faster
 // than using multiple passes. The flag can be set to false for debugging.
-static constexpr bool kUseFusedSELayer = true;
+static constexpr bool kUseFusedSELayer = false;
 
 template <typename DataType>
 BaseLayer<DataType>::BaseLayer(int c, int h, int w, BaseLayer* ip, bool nhwc)
@@ -2190,6 +2190,8 @@ AttentionPolicyHead<DataType>::AttentionPolicyHead(
   encoder_heads_ = weights.pol_encoder_head_count;
   policy_d_model_ = wq_op_size_;
 
+  //default_epsilon_ = 1e-6;
+
   allocAndUpload<DataType>(&ip_pol_w_, weights.ip_pol_w, scratch);
   allocAndUpload<DataType>(&ip_pol_b_, weights.ip_pol_b, scratch);
 
@@ -2493,7 +2495,7 @@ void Conv1Layer<DataType>::Eval(int N, DataType* output, const DataType* input,
 
   if (use_bias_) {
       if (nhwc_) {
-          addBiasBatched(output, output, biases_, 1, N * H * W, C, act_, stream);
+        addBiasBatched(output, output, biases_, 1, N * H * W, C, act_, stream);
       } else {
           addBias_NCHW(output, output, biases_, N, C, H, W, act_, stream);
       }
@@ -3245,14 +3247,17 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
       tower_nodes_.push_back(std::move(node));
   }
 
-  if (!weights.cnn_enc_b.empty()) {
-    allocAndUpload<DataType>(&cnn_enc_w_, weights.cnn_enc_w, scratch);
-    allocAndUpload<DataType>(&cnn_enc_b_, weights.cnn_enc_b, scratch);
+  if (!weights.cnn_enc_ln_gammas.empty()) {
+    if (!weights.cnn_enc_b.empty()) {
+        allocAndUpload<DataType>(&cnn_enc_w_, weights.cnn_enc_w, scratch);
+        allocAndUpload<DataType>(&cnn_enc_b_, weights.cnn_enc_b, scratch);
+    }
     allocAndUpload<DataType>(&cnn_enc_ln_gammas_, weights.cnn_enc_ln_gammas, scratch);
     allocAndUpload<DataType>(&cnn_enc_ln_betas_, weights.cnn_enc_ln_betas, scratch);
     allocAndUpload<DataType>(&cnn_enc_mult_gate_, weights.cnn_enc_mult_gate, scratch);
     allocAndUpload<DataType>(&cnn_enc_add_gate_, weights.cnn_enc_add_gate, scratch);
     prev_layer = this;
+    embedding_op_size_ = weights.cnn_enc_ln_gammas.size();
   }
 
   this->C = current_channels;
@@ -3453,7 +3458,7 @@ void Backbone<DataType>::Eval(int N, DataType* output,
 
       
       LayerNorm<DataType>(batch, num_outputs, temp_spare, temp_flow, nullptr, (DataType*)nullptr, 
-                  cnn_enc_ln_gammas_, cnn_enc_ln_betas_, default_epsilon_, 1.0, act_, stream);
+                  cnn_enc_ln_gammas_, cnn_enc_ln_betas_, default_epsilon_, 1.0, ACTIVATION_NONE, stream);
 
       applyInputGating<DataType>(flow, temp_spare, cnn_enc_mult_gate_, cnn_enc_add_gate_, N, 64, num_outputs, stream);
   
