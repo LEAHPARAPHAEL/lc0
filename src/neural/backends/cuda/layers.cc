@@ -1857,8 +1857,7 @@ ResidualBlock<DataType>::ResidualBlock(BaseLayer<DataType>* ip, int C, bool se,
                                        int se_k, bool use_gemm_ex, bool first,
 
                                        bool last, ActivationFunction activation,
-                                       int shared_mem_size,
-                                       bool output_nhwc)
+                                       int shared_mem_size)
     : BaseLayer<DataType>(C, 8, 8, ip, ip->isNHWC(), use_gemm_ex),
       has_se_(se),
       se_k_(se_k),
@@ -1866,8 +1865,7 @@ ResidualBlock<DataType>::ResidualBlock(BaseLayer<DataType>* ip, int C, bool se,
       first_block_(first),
       last_block_(last),
       shared_mem_size_(shared_mem_size),
-      act_(activation),
-      output_nhwc_(output_nhwc) {
+      act_(activation) {
   if (act_ != ACTIVATION_RELU && act_ != ACTIVATION_MISH) {
     throw Exception("Unsupported activation for residual block.");
   }
@@ -2051,29 +2049,14 @@ void ResidualBlock<DataType>::Eval(int N, DataType* output,
 
   if (act_ == ACTIVATION_RELU) {
     if (last_block_) {
-      if (has_se_) {
-        if (output_nhwc_)
-          OutputTransform<DataType, true, ACTIVATION_RELU, true, true, true,
-                  true>(N, C, se_k_, output, transformed_output, input,
-                          biases1_, w1_, b1_, w2_, b2_, stream);
-        else
-          OutputTransform<DataType, true, ACTIVATION_RELU, true, true, true,
-                  false>(N, C, se_k_, output, transformed_output, input,
-                          biases1_, w1_, b1_, w2_, b2_, stream);
-      }
-
-      else {
-        if (output_nhwc_)
-          OutputTransform<DataType, false, ACTIVATION_RELU, true, true, true,
-                true>(N, C, se_k_, output, transformed_output, input,
-                        biases1_, w1_, b1_, w2_, b2_, stream);
-        else
-          OutputTransform<DataType, false, ACTIVATION_RELU, true, true, true,
-                false>(N, C, se_k_, output, transformed_output, input,
-                        biases1_, w1_, b1_, w2_, b2_, stream);
-
-      }
-
+      if (has_se_)
+        OutputTransform<DataType, true, ACTIVATION_RELU, true, true, true,
+                        false>(N, C, se_k_, output, transformed_output, input,
+                               biases1_, w1_, b1_, w2_, b2_, stream);
+      else
+        OutputTransform<DataType, false, ACTIVATION_RELU, true, true, true,
+                        false>(N, C, se_k_, output, transformed_output, input,
+                               biases1_, w1_, b1_, w2_, b2_, stream);
     } else {
       if (has_se_) {
         if (allowFusing) {
@@ -2095,29 +2078,14 @@ void ResidualBlock<DataType>::Eval(int N, DataType* output,
     }
   } else if (act_ == ACTIVATION_MISH) {
     if (last_block_) {
-      if (has_se_) {
-        if (output_nhwc_)
-          OutputTransform<DataType, true, ACTIVATION_MISH, true, true, true,
-                  true>(N, C, se_k_, output, transformed_output, input,
-                          biases1_, w1_, b1_, w2_, b2_, stream);
-        else
-          OutputTransform<DataType, true, ACTIVATION_MISH, true, true, true,
-                  false>(N, C, se_k_, output, transformed_output, input,
-                          biases1_, w1_, b1_, w2_, b2_, stream);
-      }
-
-      else {
-        if (output_nhwc_)
-          OutputTransform<DataType, false, ACTIVATION_MISH, true, true, true,
-                true>(N, C, se_k_, output, transformed_output, input,
-                        biases1_, w1_, b1_, w2_, b2_, stream);
-        else
-          OutputTransform<DataType, false, ACTIVATION_MISH, true, true, true,
-                false>(N, C, se_k_, output, transformed_output, input,
-                        biases1_, w1_, b1_, w2_, b2_, stream);
-
-      }
-
+      if (has_se_)
+        OutputTransform<DataType, true, ACTIVATION_MISH, true, true, true,
+                        false>(N, C, se_k_, output, transformed_output, input,
+                               biases1_, w1_, b1_, w2_, b2_, stream);
+      else
+        OutputTransform<DataType, false, ACTIVATION_MISH, true, true, true,
+                        false>(N, C, se_k_, output, transformed_output, input,
+                               biases1_, w1_, b1_, w2_, b2_, stream);
     } else {
       if (has_se_) {
         if (allowFusing) {
@@ -2155,6 +2123,7 @@ ResidualBlock<DataType>::~ResidualBlock() {
     ReportCUDAErrors(cudaFree(b2_));
   }
 }
+
 
 template <typename DataType>
 void allocAndUpload(DataType** gpu_dest, std::vector<float> cpu_src,
@@ -3203,6 +3172,38 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
         node.cnn_layers.push_back(std::move(se));
       }
 
+      else if (std::holds_alternative<BaseWeights::Residual>(pb_block.block)) {
+        node.type = TowerNode::RESIDUAL;
+        const auto& r_weights = std::get<BaseWeights::Residual>(pb_block.block);
+        int se_k = r_weights.se.b1.size();
+
+        // 1. First Convolution Layer: Reads from prev_layer, writes to intermediate buf
+        auto conv1 = std::make_unique<FusedWinogradConvSELayer<DataType>>(
+            prev_layer, current_channels, 8, 8, current_channels, act_, true, false,
+            false, 0, use_gemm_ex
+        );
+        conv1->LoadWeights(const_cast<float*>(r_weights.conv1.weights.data()),
+                            const_cast<float*>(r_weights.conv1.biases.data()), scratch);
+        prev_layer = conv1.get();
+        node.cnn_layers.push_back(std::move(conv1));
+
+        // 2. Second Convolution Layer: Performs the fused residual skip connection & optional SE
+        auto conv2 = std::make_unique<FusedWinogradConvSELayer<DataType>>(
+            prev_layer, current_channels, 8, 8, current_channels, act_, true, true,
+            r_weights.has_se, se_k, use_gemm_ex
+        );
+        conv2->LoadWeights(const_cast<float*>(r_weights.conv2.weights.data()),
+                            const_cast<float*>(r_weights.conv2.biases.data()), scratch);
+        if (r_weights.has_se) {
+            conv2->LoadSEWeights(const_cast<float*>(r_weights.se.w1.data()),
+                                  const_cast<float*>(r_weights.se.b1.data()),
+                                  const_cast<float*>(r_weights.se.w2.data()),
+                                  const_cast<float*>(r_weights.se.b2.data()), scratch);
+        }
+        prev_layer = conv2.get();
+        node.cnn_layers.push_back(std::move(conv2));
+      }
+
       // ConvNext block
       else if (std::holds_alternative<BaseWeights::ConvNext>(pb_block.block)) {
         node.type = TowerNode::CONVNEXT;
@@ -3418,6 +3419,12 @@ void Backbone<DataType>::Eval(int N, DataType* output,
         node.cnn_layers[1]->Eval(N, buf1, buf0, nullptr, temp, scratch_size, cudnn, cublas, stream, offset_pointers);
         node.cnn_layers[2]->Eval(N, buf0, buf1, nullptr, temp, scratch_size, cudnn, cublas, stream, offset_pointers);
         node.cnn_layers[3]->Eval(N, flow, buf0, flow, temp, scratch_size, cudnn, cublas, stream, offset_pointers);
+      }
+
+      else if (node.type == TowerNode::RESIDUAL) {
+        node.cnn_layers[0]->Eval(N, buf0, flow, nullptr, temp, scratch_size, cudnn, cublas, stream, offset_pointers);
+
+        node.cnn_layers[1]->Eval(N, flow, buf0, flow, temp, scratch_size, cudnn, cublas, stream, offset_pointers);
       }
 
       else if (node.type == TowerNode::CONVNEXT) {
