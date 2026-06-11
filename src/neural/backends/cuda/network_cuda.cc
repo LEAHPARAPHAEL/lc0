@@ -394,7 +394,7 @@ class CudaNetwork : public Network {
     max_convnext_filters_ = file.format().network_format().max_convnext_filters();
     encoder_blocks_ = file.format().network_format().encoder_blocks();
     first_block_ = file.format().network_format().first_block();
-
+    prenorm_ = file.format().network_format().prenorm();
     // Warn if the memory required for storing transformed weights is
     // going to exceed 40% of total video memory, force custom_winograd off
     // if it's going to exceed 50% of memory.
@@ -530,6 +530,7 @@ class CudaNetwork : public Network {
         scratch_mem_,
         activations,
         kNumInputPlanes,
+        prenorm_,
         residual_blocks_,
         mobilenet_blocks_,
         convnext_blocks_,       
@@ -558,7 +559,7 @@ class CudaNetwork : public Network {
       if (attn_policy_) {
         auto AttentionPolicy = std::make_unique<AttentionPolicyHead<DataType>>(
             getLastLayer(), head, scratch_mem_, use_unified_backbone_, act,
-            max_batch_size_, use_gemm_ex, weights.epsilon);
+            max_batch_size_, prenorm_, use_gemm_ex, weights.epsilon);
         network_.emplace_back(std::move(AttentionPolicy));
 
         auto policymap = std::make_unique<PolicyMapLayer<DataType>>(
@@ -1103,6 +1104,7 @@ class CudaNetwork : public Network {
   std::string first_block_;
   bool nhwc_ = true;
   bool custom_depthwise_ = true;
+  bool prenorm_ = false;
 
   int numBlocks_;
   int numFilters_;

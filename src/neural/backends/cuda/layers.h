@@ -506,7 +506,9 @@ class EncoderBlock {
                int heads, int size, float alpha,
                DataType* smolgen_global_scratch, int smolgen_global_size,
                int max_batch_size, ActivationFunction smolgen_act,
-               ActivationFunction ffn_act, float default_eps, bool use_gemm_ex,
+               ActivationFunction ffn_act, float default_eps, 
+               bool prenorm,
+               bool use_gemm_ex,
                bool fused_mha);
   ~EncoderBlock();
 
@@ -549,6 +551,7 @@ class EncoderBlock {
 
   int embedding_op_size_;
   int encoder_heads_;
+  bool prenorm_;
 
   float alpha_;  // scale to apply to skip connection add
   float default_eps_;  // value of epsilon where it wasn't specified in training
@@ -593,7 +596,7 @@ class AttentionPolicyHead : public BaseLayer<DataType> {
   AttentionPolicyHead(BaseLayer<DataType>* ip,
                       const MultiHeadWeights::PolicyHead& weights,
                       void* scratch, bool attention_body,
-                      ActivationFunction act, int max_batch_size,
+                      ActivationFunction act, int max_batch_size, bool prenorm,
                       bool use_gemm_ex, float epsilon);
   ~AttentionPolicyHead();
   void Eval(int N, DataType* output, const DataType* input,
@@ -617,6 +620,7 @@ class AttentionPolicyHead : public BaseLayer<DataType> {
   int encoder_heads_;
   int policy_d_model_;
   bool attention_body_;
+  bool prenorm_;
   ActivationFunction act_;
 
   float default_epsilon_;
@@ -737,6 +741,7 @@ class Backbone : public BaseLayer<DataType> {
   Backbone(const MultiHeadWeights& weights, void* scratch,
                 Activations activations,
                 int input_c,
+                bool prenorm,
                 int residual_blocks,
                 int mobilenet_blocks,
                 int convnext_blocks,
@@ -787,6 +792,8 @@ class Backbone : public BaseLayer<DataType> {
   const bool has_smolgen_;
   const bool use_fused_mha_;
   bool nhwc_;
+  bool prenorm_;
+
   struct TowerNode {
     DataType* dense_w = nullptr;
     DataType* dense_b = nullptr;

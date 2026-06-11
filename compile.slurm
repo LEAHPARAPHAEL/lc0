@@ -23,6 +23,6 @@ cd $WORK/lc0
 
 echo "Begin compiling !"
 
-./build.sh
+ninja -C build
 
 echo "Compilation over !"
