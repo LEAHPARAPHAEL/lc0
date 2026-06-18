@@ -390,6 +390,7 @@ class CudaNetwork : public Network {
     max_residual_filters_ = file.format().network_format().max_residual_filters();
     mobilenet_blocks_ = file.format().network_format().mobilenet_blocks();
     max_mobilenet_filters_ = file.format().network_format().max_mobilenet_filters();
+    max_mobilenet_dff_ = file.format().network_format().max_mobilenet_dff();
     convnext_blocks_ = file.format().network_format().convnext_blocks();
     max_convnext_filters_ = file.format().network_format().max_convnext_filters();
     encoder_blocks_ = file.format().network_format().encoder_blocks();
@@ -461,8 +462,9 @@ class CudaNetwork : public Network {
     }
 
     if (mobilenet_blocks_ > 0) {
+        size_t peak_channels = std::max(max_mobilenet_filters_, max_mobilenet_dff_);
         const size_t mobilenet_tensor_size =
-            (size_t)(max_batch_size_ * max_mobilenet_filters_ * 64 * sizeof(DataType));
+            (size_t)(max_batch_size_ * peak_channels * 64 * sizeof(DataType));
 
         scratch_size_ = std::max(scratch_size_, 2 * mobilenet_tensor_size);
     }
@@ -1101,6 +1103,7 @@ class CudaNetwork : public Network {
   int convnext_blocks_ = 0;
   int max_convnext_filters_ = 0;
   int encoder_blocks_ = 0;
+  int max_mobilenet_dff_ = 0;
   std::string first_block_;
   bool nhwc_ = true;
   bool custom_depthwise_ = true;
