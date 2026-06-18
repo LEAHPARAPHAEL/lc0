@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=lc0-backend
 #SBATCH --account=kwf@v100
-#SBATCH --time=00:30:00
+#SBATCH --time=00:03:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
