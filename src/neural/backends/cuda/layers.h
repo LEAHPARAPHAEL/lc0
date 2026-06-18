@@ -187,7 +187,7 @@ class SELayer : public BaseLayer<DataType> {
 
  public:
   SELayer(BaseLayer<DataType>* ip, int numFc1Out, bool addPrevLayerBias,
-          ActivationFunction activation);
+          ActivationFunction activation, bool activateOutput = true);
   ~SELayer();
 
   void LoadWeights(float* w1, float* b1, float* w2, float* b2,
@@ -209,6 +209,7 @@ class SELayer : public BaseLayer<DataType> {
   int numFc1Out_;
   bool addPrevLayerBias_;
   const ActivationFunction act_;
+  bool activateOutput_;
 };
 
 // Multi-pass Winograd Conv fused with (optional) SE
@@ -440,7 +441,7 @@ class DepthwiseCustom : public BaseLayer<DataType> {
 
   ~DepthwiseCustom();
 
-  void LoadWeights(float* pfilter, float* pBias, void* scratch);
+  void LoadWeights(const std::vector<float>& pfilter, float* pBias, void* scratch);
   void Eval(int N, DataType* output, const DataType* input,
             const DataType* input2, void* scratch, size_t scratch_size,
             cudnnHandle_t cudnn, cublasHandle_t cublas, cudaStream_t stream,
@@ -829,9 +830,7 @@ class Backbone : public BaseLayer<DataType> {
 
   bool end_with_cnn_;
 
-  DataType *cnn_enc_w_, *cnn_enc_b_;
-  DataType *cnn_enc_ln_gammas_, *cnn_enc_ln_betas_;
-  DataType *cnn_enc_mult_gate_, *cnn_enc_add_gate_;
+  DataType *final_ln_gammas_, *final_ln_betas_;
   std::unique_ptr<BaseLayer<DataType>> input_conv_;
 
   bool use_res_block_winograd_fuse_opt_;

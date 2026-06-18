@@ -976,58 +976,56 @@ DepthwiseCustom<DataType>::DepthwiseCustom(int C_in, int H, int W, ActivationFun
   }
 
   
-  template <typename DataType>
-  void DepthwiseCustom<DataType>::LoadWeights(float* pfilter, float* pBias, void* scratch) {
-    assert(pfilter != nullptr);
-    assert(scratch != nullptr);
+template <typename DataType>
+void DepthwiseCustom<DataType>::LoadWeights(const std::vector<float>& pfilter, float* pBias, void* scratch) {
+  assert(scratch != nullptr);
 
-    std::vector<float> packed_weights;
-    packed_weights.reserve(c_input_ * 10); 
+  std::vector<float> packed_weights;
+  packed_weights.reserve(c_input_ * 10); 
 
-    const int rook_idx[9]   = {2, 7, 10, 11, 12, 13, 14, 17, 22};
-    const int bishop_idx[9] = {0, 4,  6,  8, 12, 16, 18, 20, 24};
-    const int knight_idx[9] = {1, 3,  5,  9, 12, 15, 19, 21, 23};
+  int weights_per_channel = pfilter.size() / c_input_;
+  assert(weights_per_channel == 25 || weights_per_channel == 9);
 
-    for (int o = 0; o < c_input_; o++) {
-        const int* active_mask = nullptr;
+  if (weights_per_channel == 25) {
+      const int rook_idx[9]   = {2, 7, 10, 11, 12, 13, 14, 17, 22};
+      const int bishop_idx[9] = {0, 4,  6,  8, 12, 16, 18, 20, 24};
+      const int knight_idx[9] = {1, 3,  5,  9, 12, 15, 19, 21, 23};
 
-        if (o < rook_channels_) active_mask = rook_idx;
-        else if (o < (rook_channels_ + bishop_channels_)) active_mask = bishop_idx;
-        else active_mask = knight_idx;
+      for (int o = 0; o < c_input_; o++) {
+          const int* active_mask = nullptr;
 
-        for (int i = 0; i < 9; i++) {
-            packed_weights.push_back(pfilter[o * 25 + active_mask[i]]);
-        }
-        
-        packed_weights.push_back(pBias ? pBias[o] : 0.0f);
-    }
+          if (o < rook_channels_) active_mask = rook_idx;
+          else if (o < (rook_channels_ + bishop_channels_)) active_mask = bishop_idx;
+          else active_mask = knight_idx;
 
-    const size_t packed_size = sizeof(float) * c_input_ * 10;
-
-    // --- OPTIONAL DEBUG BLOCK ---
-    /*
-    if (c_input_ > 0) {
-        std::cout << "\n=== DEBUG: DepthwiseCustom Packing | Channel 0 ===" << std::endl;
-        std::cout << "Packed Array (9 Weights + 1 Bias):\n";
-        for (int i = 0; i < 10; ++i) {
-            std::cout << packed_weights[i] << (i == 9 ? "" : ", ");
-        }
-        std::cout << "\n==================================================\n" << std::endl;
-    }
-    */
-    // ----------------------------
-
-    ReportCUDAErrors(
-        cudaMemcpy(scratch, packed_weights.data(), packed_size, cudaMemcpyHostToDevice));
-        
-    if (nhwc_) {
-      convert_float_to_half2_nhwc((float*)scratch, (half2*)weights, c_input_, 10, 1);
-    }
-    else {
-      convert_float_to_half2_nchw((float*)scratch, (half2*)weights, c_input_, 10, 1);
-    }
-    
+          for (int i = 0; i < 9; i++) {
+              packed_weights.push_back(pfilter[o * 25 + active_mask[i]]);
+          }
+          packed_weights.push_back(pBias ? pBias[o] : 0.0f);
+      }
+  } 
+  else {
+      // COMPRESSED LAYOUT FORMAT (New style: load natively packed weights contiguously)
+      for (int o = 0; o < c_input_; o++) {
+          for (int i = 0; i < 9; i++) {
+              packed_weights.push_back(pfilter[o * 9 + i]);
+          }
+          packed_weights.push_back(pBias ? pBias[o] : 0.0f);
+      }
   }
+
+  // 3. Convert and stage data into standard high-speed register layouts
+  const size_t packed_size = sizeof(float) * c_input_ * 10;
+  ReportCUDAErrors(
+      cudaMemcpy(scratch, packed_weights.data(), packed_size, cudaMemcpyHostToDevice));
+      
+  if (nhwc_) {
+    convert_float_to_half2_nhwc((float*)scratch, (half2*)weights, c_input_, 10, 1);
+  }
+  else {
+    convert_float_to_half2_nchw((float*)scratch, (half2*)weights, c_input_, 10, 1);
+  }
+}
   
   
 
@@ -1196,11 +1194,12 @@ void FusedDWPWLayer<float>::Eval(int N, float* output, const float* input,
 
 template <typename DataType>
 SELayer<DataType>::SELayer(BaseLayer<DataType>* ip, int fc1Outputs,
-                           bool addPrevLayerBias, ActivationFunction activation)
+                           bool addPrevLayerBias, ActivationFunction activation, bool activateOutput)
     : BaseLayer<DataType>(ip->GetC(), ip->GetH(), ip->GetW(), ip),
       numFc1Out_(fc1Outputs),
       addPrevLayerBias_(addPrevLayerBias),
-      act_(activation) {
+      act_(activation),
+      activateOutput_(activateOutput) {
   ReportCUDAErrors(cudaMalloc(&w1_, C * numFc1Out_ * sizeof(DataType)));
   ReportCUDAErrors(cudaMalloc(&w2_, 2 * C * numFc1Out_ * sizeof(DataType)));
 
@@ -1342,7 +1341,13 @@ void SELayer<float>::Eval(int N, float* output, const float* input,
 
   // 4. (Optional prev layer bias add), Global scale, residual add, relu and
   // bias.
-  globalScale(N, C, output, input, op2, bPrev_, false, act_, stream);
+  if (activateOutput_) {
+    globalScale(N, C, output, input, op2, bPrev_, false, act_, stream);
+  }
+  else {
+    globalScale(N, C, output, input, op2, bPrev_, false, ACTIVATION_NONE, stream);
+  }
+
 }
 
 template <>
@@ -1385,7 +1390,13 @@ void SELayer<half>::Eval(int N, half* output, const half* input,
 
     // 4. (Optional prev layer bias add), Global scale, residual add, relu and
     // bias.
-    globalScale(N, C, output, input, op2, bPrev_, nhwc_, act_, stream);
+    if (activateOutput_) {
+      globalScale(N, C, output, input, op2, bPrev_, nhwc_, act_, stream);
+    }
+    else {
+      globalScale(N, C, output, input, op2, bPrev_, nhwc_, ACTIVATION_NONE, stream);
+    }
+
   }
 }
 
@@ -2293,7 +2304,7 @@ EncoderBlock<DataType>::EncoderBlock(
           cpu_weights.ffn.d_conv.rook_channels,
           cpu_weights.ffn.d_conv.bishop_channels,
           cpu_weights.ffn.d_conv.knight_channels);
-    d_conv->LoadWeights(const_cast<float*>(cpu_weights.ffn.d_conv.weights.data()),
+    d_conv->LoadWeights(cpu_weights.ffn.d_conv.weights,
                         const_cast<float*>(cpu_weights.ffn.d_conv.biases.data()),
                       scratch); 
   }
@@ -2684,7 +2695,7 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
                   buffer2, num_inputs, 1.0f, in_out_tensor, num_outputs);
       if (mha_dense_b != nullptr) {
         addBiasBatched<DataType>(in_out_tensor, in_out_tensor, mha_dense_b, 1, batch,
-                                 num_outputs, num_outputs, ACTIVATION_NONE, stream);
+                                 num_outputs, ACTIVATION_NONE, stream);
       }
     } else {
       cublasXgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch,
@@ -2701,7 +2712,6 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
   DataType* ffn_inter_ptr = prenorm_ ? buffer2 : in_out_tensor;
 
   if (prenorm_) {
-    ffn_src_ptr = scratch;
     LayerNorm<DataType>(N * 64, embedding_op_size_, ffn_src_ptr, in_out_tensor,
                         (const DataType*)nullptr, (const DataType*)nullptr,
                         ln2_gammas, ln2_betas, default_eps_, 1.0f, ACTIVATION_NONE, stream);
@@ -2741,7 +2751,7 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
                   ffn_inter_ptr, num_inputs, 1.0f, in_out_tensor, num_outputs);
       if (ffn_dense2_b != nullptr) {
         addBiasBatched<DataType>(in_out_tensor, in_out_tensor, ffn_dense2_b, 1, batch,
-                                 num_outputs, num_outputs, ACTIVATION_NONE, stream);
+                                 num_outputs, ACTIVATION_NONE, stream);
       }
     } else {
       cublasXgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch,
@@ -2963,14 +2973,10 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
     smolgen_global_(nullptr),
     ip_mult_gate_(nullptr),
     ip_add_gate_(nullptr),
-    cnn_enc_w_(nullptr),
-    cnn_enc_b_(nullptr),
-    cnn_enc_ln_gammas_(nullptr),
-    cnn_enc_ln_betas_(nullptr),
-    cnn_enc_mult_gate_(nullptr),
-    cnn_enc_add_gate_(nullptr) {
+    final_ln_gammas_(nullptr),
+    final_ln_betas_(nullptr) {
     
-  starts_with_encoder_ = (first_block == "T" || first_block == "B" || first_block == "L");
+  starts_with_encoder_ = (first_block == "T" || first_block == "B" || first_block == "D");
   starts_with_residual_ = first_block == "R";
   starts_with_mobilenet_ = first_block == "M";
   starts_with_convnext_ = first_block == "C";
@@ -3031,7 +3037,7 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
             weights.ip_emb_ffn.d_conv.rook_channels,
             weights.ip_emb_ffn.d_conv.bishop_channels,
             weights.ip_emb_ffn.d_conv.knight_channels);
-        ip_emb_ffn_d_conv_->LoadWeights(const_cast<float*>(weights.ip_emb_ffn.d_conv.weights.data()),
+        ip_emb_ffn_d_conv_->LoadWeights(weights.ip_emb_ffn.d_conv.weights,
                             const_cast<float*>(weights.ip_emb_ffn.d_conv.biases.data()),
                         scratch); 
     }
@@ -3144,7 +3150,7 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
             m_weights.d_conv.rook_channels,
             m_weights.d_conv.bishop_channels,
             m_weights.d_conv.knight_channels);
-        d_conv->LoadWeights(const_cast<float*>(m_weights.d_conv.weights.data()),
+        d_conv->LoadWeights(m_weights.d_conv.weights,
                             const_cast<float*>(m_weights.d_conv.biases.data()),
                         scratch);
         prev_layer = d_conv.get();
@@ -3160,7 +3166,7 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
         current_channels = m_weights.conv2.biases.size();
 
         auto se = std::make_unique<SELayer<DataType>>(prev_layer,
-        se_k, false, act_);
+        se_k, false, act_, false);
         se->LoadWeights(const_cast<float*>(m_weights.se.w1.data()),
                         const_cast<float*>(m_weights.se.b1.data()),
                         const_cast<float*>(m_weights.se.w2.data()),
@@ -3222,7 +3228,7 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
             c_weights.d_conv.rook_channels,
             c_weights.d_conv.bishop_channels,
             c_weights.d_conv.knight_channels);
-        d_conv->LoadWeights(const_cast<float*>(c_weights.d_conv.weights.data()),
+        d_conv->LoadWeights(c_weights.d_conv.weights,
                             const_cast<float*>(c_weights.d_conv.biases.data()),
                         scratch);
         prev_layer = d_conv.get();
@@ -3232,23 +3238,14 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
       }      
       node.out_channels = current_channels;
       tower_nodes_.push_back(std::move(node));
+
   }
 
-  // Final encoding for the different heads if the last layer is convolutional
-  if (!weights.cnn_enc_b.empty()) {
-    allocAndUpload<DataType>(&cnn_enc_w_, weights.cnn_enc_w, scratch);
-    allocAndUpload<DataType>(&cnn_enc_b_, weights.cnn_enc_b, scratch);
-    embedding_op_size_ = weights.cnn_enc_b.size();
+  if (!weights.final_ln_gammas.empty()) {
+    allocAndUpload<DataType>(&final_ln_gammas_, weights.final_ln_gammas, scratch);
+    allocAndUpload<DataType>(&final_ln_betas_, weights.final_ln_betas, scratch);
   }
-  if (!weights.cnn_enc_ln_gammas.empty()) {
-    allocAndUpload<DataType>(&cnn_enc_ln_gammas_, weights.cnn_enc_ln_gammas, scratch);
-    allocAndUpload<DataType>(&cnn_enc_ln_betas_, weights.cnn_enc_ln_betas, scratch);
-    embedding_op_size_ = weights.cnn_enc_ln_gammas.size();
-  }
-  if (!weights.cnn_enc_mult_gate.empty()) {
-    allocAndUpload<DataType>(&cnn_enc_mult_gate_, weights.cnn_enc_mult_gate, scratch);
-    allocAndUpload<DataType>(&cnn_enc_add_gate_, weights.cnn_enc_add_gate, scratch);
-  }
+
   prev_layer = this;
   this->C = current_channels;
 }
@@ -3260,24 +3257,11 @@ void Backbone<DataType>::Eval(int N, DataType* output,
                               size_t scratch_size, cudnnHandle_t cudnn,
                               cublasHandle_t cublas, cudaStream_t stream,
                               DataType*** offset_pointers) {
-  DataType* flow;
-  DataType* buf0;    
-  
-  if (cnn_enc_w_ == nullptr && cnn_enc_ln_betas_ != nullptr) {
-    /*
-      Final layer norm with no dense layer : maintain the residual flow in the input pointer, 
-      and the final layernorm returns it gracefully to the output tensor without having to copy anything from 
-      global memory. 
-    */
-    flow = (DataType*)input; 
-    buf0 = (DataType*)output; 
-  }
-  else {
-    flow = (DataType*)output; 
-    buf0 = (DataType*)input; 
-  }
- 
+
+  DataType* flow = (DataType*)output; 
+  DataType* buf0 = (DataType*)input; 
   DataType* buf1 = (DataType*)input2;  
+ 
   DataType* buf2 = buf1 + scratch_size / (2 * sizeof(DataType));
 
   DataType* temp = (DataType*)scratch;
@@ -3290,7 +3274,7 @@ void Backbone<DataType>::Eval(int N, DataType* output,
       const int num_inputs = 64 * 12;
       const int batch = N;
 
-      convertNCHWtoNHWC(temp, (DataType*)input, N, inputC, N, 12, 8, 8, stream);
+      convertNCHWtoNHWC(temp, buf0, N, inputC, N, 12, 8, 8, stream);
       cublasXgemm<DataType>(
           cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch, num_inputs,
           1.0f, (const DataType*)ip_emb_pre_w_, num_inputs,
@@ -3460,37 +3444,27 @@ void Backbone<DataType>::Eval(int N, DataType* output,
       current_channels = node.out_channels;
   }
 
-  flow = (DataType*)output;
-  buf0 = (DataType*)input;  
-
-  if (cnn_enc_w_ != nullptr) {
+  
+  if (final_ln_gammas_ != nullptr) {
       const int batch = N * 64; 
-      const int num_inputs = current_channels;     
-      const int num_outputs = embedding_op_size_;  
-      cublasXgemm<DataType>(
-          cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch, num_inputs, 1.0f, 
-          (const DataType*)cnn_enc_w_, num_inputs, flow, num_inputs, 0.0f, buf0, num_outputs
-      );
-
-      if (cnn_enc_ln_gammas_ == nullptr) {
-          addBiasBatched(flow, buf0, cnn_enc_b_, 1, batch, num_outputs, ACTIVATION_NONE, stream);
-      }
+      // Read from flow (output), write out-of-place to buf1 (input2)
+      LayerNormInPlace<DataType>(batch, current_channels, flow, final_ln_gammas_, final_ln_betas_, 
+        default_epsilon_, stream);
   }
+  
 
-  if (cnn_enc_ln_gammas_ != nullptr) {
+  /*
+  if (final_ln_gammas_ != nullptr) {
       const int batch = N * 64; 
-      const int num_inputs = current_channels;     
-      const int num_outputs = embedding_op_size_;  
-      LayerNorm<DataType>(batch, num_outputs, flow, buf0, cnn_enc_b_, (DataType*)nullptr, 
-                  cnn_enc_ln_gammas_, cnn_enc_ln_betas_, default_epsilon_, 1.0, ACTIVATION_NONE, stream);
-  }
+      // Read from flow (output), write out-of-place to buf1 (input2)
+      LayerNorm<DataType>(batch, current_channels, buf1, flow, nullptr, (DataType*)nullptr, 
+                          final_ln_gammas_, final_ln_betas_, default_epsilon_, 1.0, ACTIVATION_NONE, stream);
+      
+      // Copy the final safely-normalized result back into the expected output tensor
+      cudaMemcpyAsync(output, buf1, N * current_channels * 64 * sizeof(DataType), cudaMemcpyDeviceToDevice, stream);
+  }*/
+  
 
-  if (cnn_enc_mult_gate_ != nullptr) {
-    const int num_outputs = embedding_op_size_;  
-    applyInputGating<DataType>(flow, flow, cnn_enc_mult_gate_, cnn_enc_add_gate_, N, 64, num_outputs, stream);
-  }
-
-  current_channels = embedding_op_size_;
 }
 
 template <typename DataType>
@@ -3551,20 +3525,11 @@ Backbone<DataType>::~Backbone() {
       }
   }
 
-  if (cnn_enc_w_ != nullptr ) {
-      ReportCUDAErrors(cudaFree(cnn_enc_w_));
-      ReportCUDAErrors(cudaFree(cnn_enc_b_));
+  if (final_ln_gammas_ != nullptr) {
+      ReportCUDAErrors(cudaFree(final_ln_gammas_));
+      ReportCUDAErrors(cudaFree(final_ln_betas_));
   }
 
-  if (cnn_enc_ln_gammas_ != nullptr) {
-      ReportCUDAErrors(cudaFree(cnn_enc_ln_gammas_));
-      ReportCUDAErrors(cudaFree(cnn_enc_ln_betas_));
-  }
-
-  if (cnn_enc_mult_gate_ != nullptr) {
-      ReportCUDAErrors(cudaFree(cnn_enc_mult_gate_));
-      ReportCUDAErrors(cudaFree(cnn_enc_add_gate_));
-  }
 }
 
 

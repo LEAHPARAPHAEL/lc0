@@ -506,6 +506,51 @@ __global__ void DepthwiseKernelNHWC_fp32(int total_c_half2, half2* output, const
 #endif
 }
 
+template <MaskType mask_type>
+__global__ void DepthwiseKernelNHWC_dense(int total_c_half2, half2* output, const half2* input, const half2* weights,
+ ActivationFunction activation) {
+#if __CUDA_ARCH__ >= 700 
+    int c_half2 = blockIdx.y * blockDim.x + threadIdx.x;
+    if (c_half2 >= total_c_half2) return;
+
+    int w = threadIdx.y;
+    int h = blockIdx.z;
+    int n = blockIdx.x;
+
+    float2 w_f32[25];
+    #pragma unroll
+    for(int i = 0; i < 25; ++i) {
+        w_f32[i] = __half22float2(weights[i * total_c_half2 + c_half2]);
+    }
+    // The bias is sitting at index 25
+    float2 b_f32 = __half22float2(weights[25 * total_c_half2 + c_half2]);
+
+    int abs_h_input = h - 2;
+    int abs_w_input = w - 2;
+
+    float2 sum = make_float2(0.0f, 0.0f);
+
+    // Compute the full, dense 5x5 spatial convolution
+    #pragma unroll
+    for (int dy = 0; dy < 5; ++dy) {
+        #pragma unroll
+        for (int dx = 0; dx < 5; ++dx) {
+            mac_fp32(sum, w_f32[dy * 5 + dx], 
+                     get_input_half2_nhwc_safe(input, n, abs_h_input + dy, abs_w_input + dx, c_half2, total_c_half2));
+        }
+    }
+
+    sum.x += b_f32.x;
+    sum.y += b_f32.y;
+    sum.x = activate(sum.x, activation);
+    sum.y = activate(sum.y, activation);
+
+    // Write coalesced output back to VRAM
+    int out_index = (n * 64 * total_c_half2) + (h * 8 * total_c_half2) + (w * total_c_half2) + c_half2;
+    output[out_index] = __float22half2_rn(sum);
+#endif
+}
+
 
 __global__ void DepthwiseKernelNHWC_fp16(int total_c_half2, half2* output, const half2* input, const half2* weights,
   ActivationFunction activation, int rook_channels, int bishop_channels, int knight_channels) {
@@ -576,51 +621,6 @@ __global__ void DepthwiseKernelNHWC_fp16(int total_c_half2, half2* output, const
 #endif
 }
 
-template <MaskType mask_type>
-__global__ void DepthwiseKernelNHWC_dense(int total_c_half2, half2* output, const half2* input, const half2* weights,
- ActivationFunction activation) {
-#if __CUDA_ARCH__ >= 700 
-    int c_half2 = blockIdx.y * blockDim.x + threadIdx.x;
-    if (c_half2 >= total_c_half2) return;
-
-    int w = threadIdx.y;
-    int h = blockIdx.z;
-    int n = blockIdx.x;
-
-    float2 w_f32[25];
-    #pragma unroll
-    for(int i = 0; i < 25; ++i) {
-        w_f32[i] = __half22float2(weights[i * total_c_half2 + c_half2]);
-    }
-    // The bias is sitting at index 25
-    float2 b_f32 = __half22float2(weights[25 * total_c_half2 + c_half2]);
-
-    int abs_h_input = h - 2;
-    int abs_w_input = w - 2;
-
-    float2 sum = make_float2(0.0f, 0.0f);
-
-    // Compute the full, dense 5x5 spatial convolution
-    #pragma unroll
-    for (int dy = 0; dy < 5; ++dy) {
-        #pragma unroll
-        for (int dx = 0; dx < 5; ++dx) {
-            mac_fp32(sum, w_f32[dy * 5 + dx], 
-                     get_input_half2_nhwc_safe(input, n, abs_h_input + dy, abs_w_input + dx, c_half2, total_c_half2));
-        }
-    }
-
-    sum.x += b_f32.x;
-    sum.y += b_f32.y;
-    sum.x = activate(sum.x, activation);
-    sum.y = activate(sum.y, activation);
-
-    // Write coalesced output back to VRAM
-    int out_index = (n * 64 * total_c_half2) + (h * 8 * total_c_half2) + (w * total_c_half2) + c_half2;
-    output[out_index] = __float22half2_rn(sum);
-#endif
-}
-
 void DepthwiseEvalNHWC(int N, int C_in, half* output, const half* input, void* scratch,
                        const half2* w1, ActivationFunction activation, int rook_channels, 
                        int bishop_channels, int knight_channels, cudaStream_t stream) {
@@ -643,6 +643,150 @@ void DepthwiseEvalNHWC(int N, int C_in, half* output, const half* input, void* s
       cum_rook_channels, cum_bishop_channels, cum_knight_channels);
 
 }
+
+
+
+
+/*
+// ============================================================================
+// DIRECT 128-BIT SHAPE-ALIGNED VECTOR READ
+// ============================================================================
+__device__ __forceinline__ uint4 get_input_uint4_nhwc_safe(const uint4* input, int n, int h, int w, int c_uint4, int total_c_uint4) {
+    if (h < 0 || h >= 8 || w < 0 || w >= 8) {
+        uint4 zero; zero.x = 0; zero.y = 0; zero.z = 0; zero.w = 0;
+        return zero;
+    }
+    return input[(n * 64 * total_c_uint4) + (h * 8 * total_c_uint4) + (w * total_c_uint4) + c_uint4];
+}
+
+// ============================================================================
+// STREAMLINED 128-BIT VECTORIZED DEPTHWISE CONVOLUTION KERNEL
+// ============================================================================
+__global__ void DepthwiseKernelNHWC(int total_c_half2, half2* output, const half2* input, const half2* weights,
+  ActivationFunction activation, int rook_channels, int bishop_channels, int knight_channels) {
+#if __CUDA_ARCH__ >= 700 
+    // Since C is a multiple of 8, total_c_half2 is perfectly divisible by 4.
+    int total_c_uint4 = total_c_half2 / 4;
+    int c_uint4 = blockIdx.y * blockDim.x + threadIdx.x;
+    
+    // Warp-masking boundary check for unaligned global channel structures (e.g., 576 channels)
+    if (c_uint4 >= total_c_uint4) return;
+
+    int w = threadIdx.y;
+    int h = blockIdx.z;
+    int n = blockIdx.x;
+
+    int base_c_half2 = c_uint4 * 4;
+
+    // 1. Direct Coalesced Weight & Bias Loads into Registers
+    half2 w_h2[9][4];
+    #pragma unroll
+    for (int i = 0; i < 9; ++i) {
+        #pragma unroll
+        for (int b = 0; b < 4; ++b) {
+            w_h2[i][b] = weights[i * total_c_half2 + base_c_half2 + b];
+        }
+    }
+    half2 b_h2[4];
+    #pragma unroll
+    for (int b = 0; b < 4; ++b) {
+        b_h2[b] = weights[9 * total_c_half2 + base_c_half2 + b];
+    }
+
+    int abs_h_input = h - 2;
+    int abs_w_input = w - 2;
+
+    // Fixed absolute spatial stencil offsets matching your core network
+    const int rook_dh[9] = {0, 1, 2, 2, 2, 2, 2, 3, 4};
+    const int rook_dw[9] = {2, 2, 0, 1, 2, 3, 4, 2, 2};
+
+    const int bishop_dh[9] = {0, 0, 1, 1, 2, 3, 3, 4, 4};
+    const int bishop_dw[9] = {0, 4, 1, 3, 2, 1, 3, 0, 4};
+
+    const int knight_dh[9] = {0, 0, 1, 1, 2, 3, 3, 4, 4};
+    const int knight_dw[9] = {1, 3, 0, 4, 2, 0, 4, 1, 3};
+
+    // 2. Initialize the 4 half2 accumulation structures (8 channels parallel)
+    half2 sum0 = make_half2(0.0f, 0.0f);
+    half2 sum1 = make_half2(0.0f, 0.0f);
+    half2 sum2 = make_half2(0.0f, 0.0f);
+    half2 sum3 = make_half2(0.0f, 0.0f);
+
+    // 3. Select stencil paths. Guaranteed 100% homogeneous due to multiple-of-8 widths.
+    int dh[9], dw[9];
+    if (2 * base_c_half2 < rook_channels) { 
+        #pragma unroll
+        for(int i = 0; i < 9; ++i) { dh[i] = rook_dh[i]; dw[i] = rook_dw[i]; }
+    } else if (2 * base_c_half2 < bishop_channels) { 
+        #pragma unroll
+        for(int i = 0; i < 9; ++i) { dh[i] = bishop_dh[i]; dw[i] = bishop_dw[i]; }
+    } else { 
+        #pragma unroll
+        for(int i = 0; i < 9; ++i) { dh[i] = knight_dh[i]; dw[i] = knight_dw[i]; }
+    }
+
+    // 4. Core 128-Bit Streamed Spatial Math Loop
+    const uint4* input_uint4 = reinterpret_cast<const uint4*>(input);
+
+    #pragma unroll
+    for (int i = 0; i < 9; ++i) {
+        uint4 raw_in = get_input_uint4_nhwc_safe(input_uint4, n, abs_h_input + dh[i], abs_w_input + dw[i], c_uint4, total_c_uint4);
+        half2* in_h2 = reinterpret_cast<half2*>(&raw_in);
+
+        sum0 = __hfma2(w_h2[i][0], in_h2[0], sum0);
+        sum1 = __hfma2(w_h2[i][1], in_h2[1], sum1);
+        sum2 = __hfma2(w_h2[i][2], in_h2[2], sum2);
+        sum3 = __hfma2(w_h2[i][3], in_h2[3], sum3);
+    }
+
+    // 5. Apply Biases and Inference Engine Activation Function
+    sum0 = __hadd2(sum0, b_h2[0]); sum1 = __hadd2(sum1, b_h2[1]);
+    sum2 = __hadd2(sum2, b_h2[2]); sum3 = __hadd2(sum3, b_h2[3]);
+
+    half2* sums[4] = {&sum0, &sum1, &sum2, &sum3};
+    #pragma unroll
+    for(int s = 0; s < 4; ++s) {
+        float2 f32 = __half22float2(*(sums[s]));
+        f32.x = activate(f32.x, activation);
+        f32.y = activate(f32.y, activation);
+        *(sums[s]) = __float22half2_rn(f32);
+    }
+
+    // 6. Pack and Commit 128 bits back to global VRAM in a single hardware cycle
+    uint4 raw_out;
+    half2* out_ptr = reinterpret_cast<half2*>(&raw_out);
+    out_ptr[0] = sum0; out_ptr[1] = sum1; out_ptr[2] = sum2; out_ptr[3] = sum3;
+
+    uint4* output_uint4 = reinterpret_cast<uint4*>(output);
+    int out_index = (n * 64 * total_c_uint4) + (h * 8 * total_c_uint4) + (w * total_c_uint4) + c_uint4;
+    output_uint4[out_index] = raw_out; 
+#endif
+}
+
+// ============================================================================
+// HOST LAUNCH INTERFACE
+// ============================================================================
+void DepthwiseEvalNHWC(int N, int C_in, half* output, const half* input, void* scratch,
+                       const half2* w1, ActivationFunction activation, int rook_channels, 
+                       int bishop_channels, int knight_channels, cudaStream_t stream) {
+    
+    int total_c_half2 = C_in / 2;
+    int total_c_uint4 = total_c_half2 / 4; 
+
+    dim3 threads(32, 8, 1); 
+    dim3 blocks(N, (total_c_uint4 + 31) / 32, 8); 
+
+    int cum_rook_channels = rook_channels;
+    int cum_bishop_channels = cum_rook_channels + bishop_channels;
+    int cum_knight_channels = cum_bishop_channels + knight_channels;
+
+    DepthwiseKernelNHWC<<<blocks, threads, 0, stream>>>(
+        total_c_half2, reinterpret_cast<half2*>(output), reinterpret_cast<const half2*>(input), 
+        w1, activation, cum_rook_channels, cum_bishop_channels, cum_knight_channels);
+}
+*/
+
+
 
 
 /*

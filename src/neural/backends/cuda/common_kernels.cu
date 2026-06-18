@@ -1319,6 +1319,181 @@ void LayerNorm(int N, int C, T* output, const T* input, const T* bias,
   ReportCUDAErrors(cudaGetLastError());
 }
 
+
+
+template <typename T>
+__global__ void layer_norm_inplace_kernel(int N, int C, T* data, 
+                                         const T* gammas, const T* betas, float ep) {
+  // Identify batch item index
+  int n = blockIdx.x * blockDim.z + threadIdx.z;
+  if (n >= N) return;
+
+  // Each thread handles 16 elements along the channel dimension
+  int c = (threadIdx.y * 32 + threadIdx.x) * 16;
+  bool oobThread = c >= C;
+
+  int tensorIndex = n * C + c;
+  int biasIndex = c;
+
+  float val[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  float oth[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+
+  const bool fp16 = std::is_same<half, T>::value;
+
+  // 1. Coalesced Load into registers
+  if (!oobThread) {
+    if (fp16) {
+      half inp[8];
+      copyAs<uint4>(&inp[0], &data[tensorIndex]);
+      for (int i = 0; i < 8; i++) val[i] = (float)inp[i];
+      copyAs<uint4>(&inp[0], &data[tensorIndex + 8]);
+      for (int i = 0; i < 8; i++) val[i + 8] = (float)inp[i];
+    } else {
+      copyAs<uint4>(&val[0], &data[tensorIndex]);
+      copyAs<uint4>(&val[4], &data[tensorIndex + 4]);
+      copyAs<uint4>(&val[8], &data[tensorIndex + 8]);
+      copyAs<uint4>(&val[12], &data[tensorIndex + 12]);
+    }
+  }
+
+  // 2. Compute Mean
+  float s = 0.0f;
+  if (!oobThread) {
+    for (int i = 0; i < 16; i++) {
+      s += val[i];
+    }
+  }
+
+  // Warp reduction
+  for (int offset = 16; offset > 0; offset /= 2) {
+    s += __shfl_down_sync(0xFFFFFFFF, s, offset);
+  }
+
+  // Block reduction using shared memory tracking isolated by batch item (threadIdx.z)
+  __shared__ float shared_sums[16][16];
+  __shared__ float shared_vars[16][16];
+
+  if (threadIdx.x == 0) {
+    shared_sums[threadIdx.z][threadIdx.y] = s;
+  }
+  __syncthreads(); // Must be collective across the block
+
+  if (threadIdx.x == 0 && threadIdx.y == 0) {
+    float total_sum = 0.0f;
+    for (int j = 0; j < blockDim.y; j++) {
+      total_sum += shared_sums[threadIdx.z][j];
+    }
+    shared_sums[threadIdx.z][0] = total_sum / C;
+  }
+  __syncthreads();
+  float mean = shared_sums[threadIdx.z][0];
+
+  // 3. Compute Variance
+  float var_s = 0.0f;
+  if (!oobThread) {
+    for (int i = 0; i < 16; i++) {
+      float d = val[i] - mean;
+      var_s += d * d;
+    }
+  }
+
+  // Warp reduction for variance
+  for (int offset = 16; offset > 0; offset /= 2) {
+    var_s += __shfl_down_sync(0xFFFFFFFF, var_s, offset);
+  }
+
+  if (threadIdx.x == 0) {
+    shared_vars[threadIdx.z][threadIdx.y] = var_s;
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0 && threadIdx.y == 0) {
+    float total_var = 0.0f;
+    for (int j = 0; j < blockDim.y; j++) {
+      total_var += shared_vars[threadIdx.z][j];
+    }
+    shared_vars[threadIdx.z][0] = rsqrtf((total_var / C) + ep);
+  }
+  __syncthreads();
+  float rsqrt_var = shared_vars[threadIdx.z][0];
+
+  // 4. Load Gammas and Betas, Scale, and Write Back In-Place
+  if (!oobThread) {
+    // Load gammas
+    if (fp16) {
+      half inp[8];
+      copyAs<uint4>(&inp[0], &gammas[biasIndex]);
+      for (int i = 0; i < 8; i++) oth[i] = (float)inp[i];
+      copyAs<uint4>(&inp[0], &gammas[biasIndex + 8]);
+      for (int i = 0; i < 8; i++) oth[i + 8] = (float)inp[i];
+    } else {
+      copyAs<uint4>(&oth[0], &gammas[biasIndex]);
+      copyAs<uint4>(&oth[4], &gammas[biasIndex + 4]);
+      copyAs<uint4>(&oth[8], &gammas[biasIndex + 8]);
+      copyAs<uint4>(&oth[12], &gammas[biasIndex + 12]);
+    }
+
+    // Apply normalization and Gamma scaling
+    for (int i = 0; i < 16; i++) {
+      val[i] = (val[i] - mean) * rsqrt_var * oth[i];
+    }
+
+    // Load betas
+    if (fp16) {
+      half inp[8];
+      copyAs<uint4>(&inp[0], &betas[biasIndex]);
+      for (int i = 0; i < 8; i++) oth[i] = (float)inp[i];
+      copyAs<uint4>(&inp[0], &betas[biasIndex + 8]);
+      for (int i = 0; i < 8; i++) oth[i + 8] = (float)inp[i];
+    } else {
+      copyAs<uint4>(&oth[0], &betas[biasIndex]);
+      copyAs<uint4>(&oth[4], &betas[biasIndex + 4]);
+      copyAs<uint4>(&oth[8], &betas[biasIndex + 8]);
+      copyAs<uint4>(&oth[12], &betas[biasIndex + 12]);
+    }
+
+    // Apply Beta translation
+    for (int i = 0; i < 16; i++) {
+      val[i] += oth[i];
+    }
+
+    // Safe Global Write Back (overwriting the source space)
+    if (fp16) {
+      half op[8];
+      for (int i = 0; i < 8; i++) op[i] = (half)val[i];
+      copyAs<uint4>(&data[tensorIndex], &op[0]);
+      for (int i = 0; i < 8; i++) op[i] = (half)val[i + 8];
+      copyAs<uint4>(&data[tensorIndex + 8], &op[0]);
+    } else {
+      copyAs<uint4>(&data[tensorIndex], &val[0]);
+      copyAs<uint4>(&data[tensorIndex + 4], &val[4]);
+      copyAs<uint4>(&data[tensorIndex + 8], &val[8]);
+      copyAs<uint4>(&data[tensorIndex + 12], &val[12]);
+    }
+  }
+}
+
+template <typename T>
+void LayerNormInPlace(int N, int C, T* data, const T* gammas, const T* betas,
+                      float ep, cudaStream_t stream) {
+  if (C % 16 != 0) throw Exception("unsupported filter size");
+  if (C > 16384) throw Exception("unsupported filter size");
+
+  dim3 blockDim, gridDim;
+  blockDim.x = 32;
+  blockDim.y = DivUp(C / 16, 32);
+  blockDim.z = std::min(std::max(512 / (blockDim.x * blockDim.y), 1u), (unsigned int)N);
+  
+  gridDim.x = DivUp(N, blockDim.z);
+  gridDim.y = 1;
+  gridDim.z = 1;
+
+  layer_norm_inplace_kernel<T><<<gridDim, blockDim, 0, stream>>>(
+      N, C, data, gammas, betas, ep);
+
+  ReportCUDAErrors(cudaGetLastError());
+}
+
 // Compute promotion logits in a single kernel
 // keys matrix is of N * 64 * C (but we use only last 8 from the 'rows'
 // dimension, so N * 8 * C)
@@ -1830,6 +2005,14 @@ template void LayerNorm<float>(int N, int C, float* output, const float* input,
                                const float* gammas, const float* betas,
                                float ep, float alpha, ActivationFunction act,
                                cudaStream_t stream);
+
+template void LayerNormInPlace<float>(int N, int C, float* data,
+                                      const float* gammas, const float* betas,
+                                      float ep, cudaStream_t stream);
+
+template void LayerNormInPlace<half>(int N, int C, half* data,
+                                     const half* gammas, const half* betas,
+                                     float ep, cudaStream_t stream);
 
 template void ComputePromotionLogits<half>(int N, int C, half* output,
                                            const half* keys, const half* ppo,

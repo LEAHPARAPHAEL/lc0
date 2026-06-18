@@ -190,12 +190,8 @@ struct BaseWeights {
 
   std::vector<TowerBlock> tower;
   // CNN -> Encoder
-  Vec cnn_enc_w;
-  Vec cnn_enc_b;
-  Vec cnn_enc_ln_gammas;
-  Vec cnn_enc_ln_betas;
-  Vec cnn_enc_mult_gate;
-  Vec cnn_enc_add_gate;
+  Vec final_ln_gammas;
+  Vec final_ln_betas;
 
   // Encoder stack.
   std::vector<EncoderLayer> encoder;

@@ -58,3 +58,18 @@ fastchess -event 'Tx8 VS Mx4-Tx6' -engine name='Tx8' args='-w /home/raph/leela/n
 # EPS
 
 fastchess -event 'eps' -engine name='eps-3' args='-w /home/raph/leela/networks/Mx2-Tx8/Mx2-Tx8-150000.pb.gz' cmd=./engines/eps-3 -engine name='eps-6' args='-w /home/raph/leela/networks/Mx2-Tx8/Mx2-Tx8-150000.pb.gz' cmd=./engines/eps-6 -openings file='/home/raph/leela/books/book-6-ply-unbalanced.pgn' format=pgn order=sequential -each nodes=1000 -rounds 100 -concurrency 1 -pgnout file=/home/raph/leela/pgns/eps -config outname=/home/raph/leela/configs/eps.json
+
+# Tx8 VS Tx8-pre VS MMTMMTMMT
+
+fastchess -event 'Prenorm VS Postnorm' -engine name='Tx8' args='-w /home/raph/leela/networks/Tx8/Tx8-150000.pb.gz' -engine name='Tx8-pre' args='-w /home/raph/leela/networks/Tx8-pre/Tx8-pre-150000.pb.gz' -engine name='MMTMMTMMT' args='-w /home/raph/leela/networks/MMTMMTMMT-cuda/MMTMMTMMT-cuda-150000.pb.gz' -openings file='/home/raph/leela/books/book-6-ply-unbalanced.pgn' format=pgn order=sequential -each cmd=./build/release/lc0 tc=60+0.1 -rounds 50 -concurrency 1 -pgnout file=/home/raph/leela/pgns/pre_VS_post-60s -config outname=/home/raph/leela/configs/pre_VS_post-60s.json
+
+fastchess -event 'Prenorm VS Postnorm' -engine name='Tx8' args='-w /home/raph/leela/networks/Tx8/Tx8-150000.pb.gz' -engine name='Tx8-pre' args='-w /home/raph/leela/networks/Tx8-pre/Tx8-pre-150000.pb.gz' -engine name='MMTMMTMMT' args='-w /home/raph/leela/networks/MMTMMTMMT-cuda/MMTMMTMMT-cuda-150000.pb.gz' -openings file='/home/raph/leela/books/book-6-ply-unbalanced.pgn' format=pgn order=sequential -each cmd=./build/release/lc0 nodes=1000 -rounds 50 -concurrency 1 -pgnout file=/home/raph/leela/pgns/pre_VS_post-1000n -config outname=/home/raph/leela/configs/pre_VS_post-1000n.json
+
+
+fastchess -event 'Tx8 VS MMTMMTMMT' -engine name='Tx8' args='-w /home/raph/leela/networks/Tx8/Tx8-150000.pb.gz' -engine name='MMTMMTMMT' args='-w /home/raph/leela/networks/MMTMMTMMT-cuda/MMTMMTMMT-cuda-150000.pb.gz' -openings file='/home/raph/leela/books/book-6-ply-unbalanced.pgn' format=pgn order=sequential -each cmd=./build/release/lc0 tc=60+0.1 -rounds 200 -concurrency 1 -pgnout file=/home/raph/leela/pgns/Tx8_VS_MMTMMTMMT-60s -config outname=/home/raph/leela/configs/Tx8_VS_MMTMMTMMT-60s.json
+
+fastchess -event 'Prenorm VS Postnorm' -engine name='Tx8' args='-w /home/raph/leela/networks/Tx8/Tx8-150000.pb.gz' -engine name='Tx8-pre' args='-w /home/raph/leela/networks/Tx8-pre/Tx8-pre-150000.pb.gz' -openings file='/home/raph/leela/books/book-6-ply-unbalanced.pgn' format=pgn order=sequential -each cmd=./build/release/lc0 tc=60+0.1 -rounds 200 -concurrency 1 -pgnout file=/home/raph/leela/pgns/pre_VS_post-60s -config outname=/home/raph/leela/configs/pre_vs_post-60s.json
+
+fastchess -config file=/home/raph/leela/configs/Tx8_VS_MMTMMTMMT-60s.json
+
+fastchess -config file=/home/raph/leela/configs/pre_vs_post-60s.json

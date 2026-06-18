@@ -17,7 +17,6 @@
  */
 
 #include "neural/network_legacy.h"
-
 #include <algorithm>
 #include <cmath>
 #include <utility>
@@ -45,12 +44,8 @@ BaseWeights::BaseWeights(const pblczero::Weights& weights)
           LayerAdapter(weights.ip_emb_ffn_ln_gammas()).as_vector()),
       ip_emb_ffn_ln_betas(
           LayerAdapter(weights.ip_emb_ffn_ln_betas()).as_vector()),
-      cnn_enc_w(LayerAdapter(weights.cnn_enc_w()).as_vector()),
-      cnn_enc_b(LayerAdapter(weights.cnn_enc_b()).as_vector()),
-      cnn_enc_ln_gammas(LayerAdapter(weights.cnn_enc_ln_gammas()).as_vector()),
-      cnn_enc_ln_betas(LayerAdapter(weights.cnn_enc_ln_betas()).as_vector()),
-      cnn_enc_mult_gate(LayerAdapter(weights.cnn_enc_mult_gate()).as_vector()),
-      cnn_enc_add_gate(LayerAdapter(weights.cnn_enc_add_gate()).as_vector()),
+      final_ln_gammas(LayerAdapter(weights.final_ln_gammas()).as_vector()),
+      final_ln_betas(LayerAdapter(weights.final_ln_betas()).as_vector()),
       moves_left(weights.moves_left()),
       ip_mov_w(LayerAdapter(weights.ip_mov_w()).as_vector()),
       ip_mov_b(LayerAdapter(weights.ip_mov_b()).as_vector()),
