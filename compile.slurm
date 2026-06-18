@@ -16,13 +16,13 @@ module load gcc/13.3.0
 # On charge Python car Meson en a besoin pour tourner
 module load python/3.12.7
 
-# 🌟 LA LIGNE MAGIQUE : On dit à Linux de chercher Meson dans vos fichiers personnels d'abord
+# LA LIGNE MAGIQUE : On dit à Linux de chercher Meson dans vos fichiers personnels d'abord
 export PATH="$HOME/.local/bin:$PATH"
 
 cd $WORK/lc0
 
 echo "Begin compiling !"
 
-ninja -C build
+./build.sh release 
 
 echo "Compilation over !"
