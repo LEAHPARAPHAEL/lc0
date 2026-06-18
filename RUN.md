@@ -46,6 +46,8 @@ position startpos moves e2e4 c7c6 d2d4 d7d5 b1c3 d5e4 c3e4
 # Test depthwise 128 bit VS 32 bit
 ./build/release/lc0 backendbench --weights=/home/raph/leela/networks/test.pb.gz
 ./build/release/lc0 backendbench --weights=/home/raph/leela/networks/BT4-1024x15x32h-swa-6147500-policytune-332.pb.gz
+./build/release/lc0 backendbench --weights=/home/raph/leela/networks/mobTnet-Htest/mobTnet-Htest-0.pb.gz -o "max_batch=128"
+./build/release/lc0 backendbench --weights=/home/raph/leela/networks/mobTnet-Ltest/mobTnet-Ltest-0.pb.gz
 
 # CUDNN
 

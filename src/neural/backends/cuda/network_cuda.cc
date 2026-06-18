@@ -476,7 +476,6 @@ class CudaNetwork : public Network {
         scratch_size_ = std::max(scratch_size_, 2 * convnext_tensor_size);
     }
 
-
     std::string policy_head =
         options.GetOrDefault<std::string>("policy_head", "vanilla");
     // Check that selected policy head exists.
