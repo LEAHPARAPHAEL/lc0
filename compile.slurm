@@ -23,6 +23,6 @@ cd $WORK/lc0
 
 echo "Begin compiling !"
 
-./build.sh release 
+./build.sh release -Dcc_cuda=70
 
 echo "Compilation over !"
