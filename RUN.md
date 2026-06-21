@@ -49,6 +49,8 @@ position startpos moves e2e4 c7c6 d2d4 d7d5 b1c3 d5e4 c3e4
 ./build/release/lc0 backendbench --weights=/home/raph/leela/networks/mobTnet-Htest/mobTnet-Htest-0.pb.gz -o "max_batch=128"
 ./build/release/lc0 backendbench --weights=/home/raph/leela/networks/mobTnet-Ltest/mobTnet-Ltest-0.pb.gz
 
+./build/release/lc0 --weights=/home/raph/leela/networks/mobTnet-L/mobTnet-L-100000.pb.gz
+
 # CUDNN
 
 wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
