@@ -95,7 +95,7 @@ done
 FASTCHESS_CMD+=(
     -openings file="${BOOKS_DIR}/book-6-ply-unbalanced.pgn" format=pgn order=sequential
     -each cmd="${LC0_EXEC}" tc=60+0.1
-    -rounds 100
+    -rounds 200
     -concurrency 1
     -pgnout file="${PGNS_DIR}/${TOURNAMENT_NAME}.pgn"
     -config outname="${CONFIGS_DIR}/${TOURNAMENT_NAME}.json"
