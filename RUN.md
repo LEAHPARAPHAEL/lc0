@@ -42,14 +42,28 @@ position startpos moves e2e4 c7c6 d2d4 d7d5 b1c3 d5e4 c3e4
 ./build/release/lc0 backendbench --weights=/home/raph/leela/networks/Tx8-pre/Tx8-pre-150000.pb.gz
 
 
+# Comparison 5x5 VS 3x3 VS custom
 
-# Test depthwise 128 bit VS 32 bit
-./build/release/lc0 backendbench --weights=/home/raph/leela/networks/test.pb.gz
-./build/release/lc0 backendbench --weights=/home/raph/leela/networks/BT4-1024x15x32h-swa-6147500-policytune-332.pb.gz
-./build/release/lc0 backendbench --weights=/home/raph/leela/networks/mobTnet-Htest/mobTnet-Htest-0.pb.gz -o "max_batch=128"
-./build/release/lc0 backendbench --weights=/home/raph/leela/networks/mobTnet-Ltest/mobTnet-Ltest-0.pb.gz
+./engines/custom backendbench --weights=/home/raph/leela/networks/MMTx3/MMTx3-100000.pb.gz
 
-./build/release/lc0 --weights=/home/raph/leela/networks/mobTnet-L/mobTnet-L-100000.pb.gz
+./engines/custom backendbench --weights=/home/raph/leela/networks/MMTx3/MMTx3-100000.pb.gz -o "custom_depthwise=false"
+
+./engines/dense_3x3 backendbench --weights=/home/raph/leela/networks/MMTx3-3x3/MMTx3-3x3-100000.pb.gz -o "custom_depthwise=false"
+
+./engines/dense_3x3 backendbench --weights=/home/raph/leela/networks/MMTx3-3x3/MMTx3-3x3-100000.pb.gz
+
+./engines/dense_5x5 backendbench --weights=/home/raph/leela/networks/MMTx3-dense/MMTx3-dense-100000.pb.gz
+
+./engines/dense_5x5 backendbench --weights=/home/raph/leela/networks/MMTx3-dense/MMTx3-dense-100000.pb.gz -o "custom_depthwise=false"
+
+./engines/dense_5x5 backendbench --weights=/home/raph/leela/networks/MMTx3/MMTx3-100000.pb.gz
+
+
+
+
+
+
+
 
 # CUDNN
 

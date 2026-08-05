@@ -24,6 +24,7 @@
   terms of the respective license agreement, the licensors of this
   Program grant you additional permission to convey the resulting work.
 */
+#include <iostream>
 #include <algorithm>
 #include <cassert>
 #include <list>
@@ -389,11 +390,12 @@ class CudaNetwork : public Network {
     max_residual_filters_ = file.format().network_format().max_residual_filters();
     mobilenet_blocks_ = file.format().network_format().mobilenet_blocks();
     max_mobilenet_filters_ = file.format().network_format().max_mobilenet_filters();
+    max_mobilenet_dff_ = file.format().network_format().max_mobilenet_dff();
     convnext_blocks_ = file.format().network_format().convnext_blocks();
     max_convnext_filters_ = file.format().network_format().max_convnext_filters();
     encoder_blocks_ = file.format().network_format().encoder_blocks();
     first_block_ = file.format().network_format().first_block();
-
+    prenorm_ = file.format().network_format().prenorm();
     // Warn if the memory required for storing transformed weights is
     // going to exceed 40% of total video memory, force custom_winograd off
     // if it's going to exceed 50% of memory.
@@ -460,8 +462,9 @@ class CudaNetwork : public Network {
     }
 
     if (mobilenet_blocks_ > 0) {
+        size_t peak_channels = std::max(max_mobilenet_filters_, max_mobilenet_dff_);
         const size_t mobilenet_tensor_size =
-            (size_t)(max_batch_size_ * max_mobilenet_filters_ * 64 * sizeof(DataType));
+            (size_t)(max_batch_size_ * peak_channels * 64 * sizeof(DataType));
 
         scratch_size_ = std::max(scratch_size_, 2 * mobilenet_tensor_size);
     }
@@ -472,7 +475,6 @@ class CudaNetwork : public Network {
 
         scratch_size_ = std::max(scratch_size_, 2 * convnext_tensor_size);
     }
-
 
     std::string policy_head =
         options.GetOrDefault<std::string>("policy_head", "vanilla");
@@ -529,6 +531,7 @@ class CudaNetwork : public Network {
         scratch_mem_,
         activations,
         kNumInputPlanes,
+        prenorm_,
         residual_blocks_,
         mobilenet_blocks_,
         convnext_blocks_,       
@@ -538,7 +541,7 @@ class CudaNetwork : public Network {
         max_batch_size_,
         use_gemm_ex,
         use_fused_mha,
-        nhwc_,
+        true,
         use_res_block_winograd_fuse_opt_,
         allow_cache_opt_,
         l2_cache_size_,
@@ -557,7 +560,7 @@ class CudaNetwork : public Network {
       if (attn_policy_) {
         auto AttentionPolicy = std::make_unique<AttentionPolicyHead<DataType>>(
             getLastLayer(), head, scratch_mem_, use_unified_backbone_, act,
-            max_batch_size_, use_gemm_ex);
+            max_batch_size_, prenorm_, use_gemm_ex, weights.epsilon);
         network_.emplace_back(std::move(AttentionPolicy));
 
         auto policymap = std::make_unique<PolicyMapLayer<DataType>>(
@@ -818,6 +821,7 @@ class CudaNetwork : public Network {
 #endif
     }
 
+    
     if (nhwc_ && (first_block_ == "M" || first_block_ == "C")) {
       expandPlanes_NHWC(tensor_mem[0], ipDataMasks, ipDataValues,
                 batchSize * kInputPlanes, compute_stream);
@@ -826,6 +830,8 @@ class CudaNetwork : public Network {
       expandPlanes_NCHW(tensor_mem[0], ipDataMasks, ipDataValues,
                 batchSize * kInputPlanes, compute_stream);
     }
+    
+
 
     auto* opPol = io->op_policy_mem_gpu_;
     auto* opVal = io->op_value_mem_gpu_;
@@ -842,7 +848,7 @@ class CudaNetwork : public Network {
           batchSize, tensor_mem[1],
           tensor_mem[0],
           tensor_mem[2], scratch_mem,
-          scratch_size_, nullptr, cublas, compute_stream,
+          scratch_size_, cudnn_, cublas, compute_stream,
           offset_pointers);  // Entire attention body of the network
 
       flow = tensor_mem[1];
@@ -1096,9 +1102,11 @@ class CudaNetwork : public Network {
   int convnext_blocks_ = 0;
   int max_convnext_filters_ = 0;
   int encoder_blocks_ = 0;
+  int max_mobilenet_dff_ = 0;
   std::string first_block_;
   bool nhwc_ = true;
   bool custom_depthwise_ = true;
+  bool prenorm_ = false;
 
   int numBlocks_;
   int numFilters_;
@@ -1129,9 +1137,7 @@ class CudaNetwork : public Network {
   cudaStream_t download_stream_ = nullptr;
   cudaEvent_t compute_ordering_event_ = nullptr;
   cublasHandle_t cublas_;
-  #ifdef USE_CUDNN
   cudnnHandle_t cudnn_;
-  #endif
   DataType* tensor_mem_[3];
 
   mutable std::mutex inputs_outputs_lock_;

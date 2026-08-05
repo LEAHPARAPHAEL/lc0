@@ -107,14 +107,10 @@ struct BaseWeights {
     Smolgen smolgen;
     bool has_smolgen;
 
-    /*
     Vec rpe_q;
     Vec rpe_k;
-    Vec rpe_v;
     bool has_rpe_q;
     bool has_rpe_k;
-    bool has_rpe_v;
-    */
   };
 
   struct FFN {

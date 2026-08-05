@@ -159,263 +159,19 @@ BaseLayer<DataType>::BaseLayer(int c, int h, int w, BaseLayer* ip)
 
 #ifdef USE_CUDNN
 template <typename DataType>
-void ConvLayer<DataType>::init() {
-  // Allocate memory for weights (filter tensor) and biases.
-  const size_t weight_size =
-      sizeof(DataType) * c_input_ * C * filter_size_ * filter_size_;
-  ReportCUDAErrors(cudaMalloc(&weights, weight_size));
-
-  const size_t bias_size = sizeof(DataType) * C;
-  ReportCUDAErrors(cudaMalloc(&biases, bias_size));
-
-  const bool fp16 = std::is_same<half, DataType>::value;
-  const cudnnDataType_t dataType =
-      std::is_same<half, DataType>::value ? CUDNN_DATA_HALF : CUDNN_DATA_FLOAT;
-
-  const cudnnTensorFormat_t layout =
-      nhwc_ ? CUDNN_TENSOR_NHWC : CUDNN_TENSOR_NCHW;
-
-  // Create cudnn objects for various tensors, algorithms, etc.
-  cudnnCreateFilterDescriptor(&filter_desc_);
-  cudnnCreateConvolutionDescriptor(&conv_desc_);
-  cudnnCreateTensorDescriptor(&out_tensor_desc_);
-  cudnnCreateTensorDescriptor(&in_tensor_desc_);
-  cudnnCreateTensorDescriptor(&bias_desc_);
-  cudnnCreateActivationDescriptor(&activation_);
-
-  cudnnSetFilter4dDescriptor(filter_desc_, dataType, layout, GetC(), c_input_,
-                             filter_size_, filter_size_);
-
-  ReportCUDNNErrors(
-      cudnnSetTensor4dDescriptor(bias_desc_, layout, dataType, 1, C, 1, 1));
-
-  const int padding = filter_size_ / 2;
-  const bool crossCorr = 1;
-
-  ReportCUDNNErrors(cudnnSetConvolution2dDescriptor(
-      conv_desc_, padding, padding, 1, 1, 1, 1,
-      crossCorr ? CUDNN_CROSS_CORRELATION : CUDNN_CONVOLUTION, dataType));
-
-  if (fp16 && nhwc_)
-    ReportCUDNNErrors(
-        cudnnSetConvolutionMathType(conv_desc_, CUDNN_TENSOR_OP_MATH));
-
-  // TODO: dynamic selection of algorithm!
-  if ((C > 32) && (!nhwc_) && (filter_size_ > 1)) {
-    conv_algo_ = CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED;
-  } else {
-    conv_algo_ = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
-  }
-
-  if (act_ == ACTIVATION_RELU) {
-    cudnnSetActivationDescriptor(activation_, CUDNN_ACTIVATION_RELU,
-                                 CUDNN_NOT_PROPAGATE_NAN, 0.0);
-  }
-#if CUDNN_MAJOR != 7 || CUDNN_MINOR != 0
-  else {
-    cudnnSetActivationDescriptor(activation_, CUDNN_ACTIVATION_IDENTITY,
-                                 CUDNN_NOT_PROPAGATE_NAN, 0.0);
-  }
-#endif
-}
-
-template <typename DataType>
-ConvLayer<DataType>::ConvLayer(BaseLayer<DataType>* ip, int C, int H, int W,
-                               int filter, int Cin,
-                               ActivationFunction activation, bool bias)
-    : BaseLayer<DataType>(C, H, W, ip),
+ConvLayer<DataType>::ConvLayer(
+    BaseLayer<DataType>* prev, int C, int height, int width,
+    int filter, int Cin, ActivationFunction act, bool bias, bool use_gemm_ex,
+    int min_batch_size, int max_batch_size, cudnnHandle_t cudnn)
+    : BaseLayer<DataType>(C, height, width, prev, true, use_gemm_ex),
       c_input_(Cin),
       filter_size_(filter),
-      act_(activation),
+      act_(act),
       use_bias_(bias) {
-  init();
-}
 
-template <typename DataType>
-ConvLayer<DataType>::ConvLayer(bool nhwc, int C, int H, int W, int filter,
-                               int Cin, ActivationFunction activation,
-                               bool bias)
-    : BaseLayer<DataType>(C, H, W, nullptr, nhwc),
-      c_input_(Cin),
-      filter_size_(filter),
-      act_(activation),
-      use_bias_(bias) {
-  init();
-}
-
-template <>
-void ConvLayer<half>::LoadWeights(float* pfilter, float* pBias, void* scratch) {
-  const size_t weight_size =
-      sizeof(float) * c_input_ * C * filter_size_ * filter_size_;
-  const size_t bias_size = sizeof(float) * C;
-  // Also need to convert from fp32 NCHW to fp16 NHWC
-  // first copy from CPU memory to scratch space in GPU memory
-  // and then do the type / layout conversion using a kernel.
-  assert(scratch);
-  ReportCUDAErrors(
-      cudaMemcpy(scratch, pfilter, weight_size, cudaMemcpyHostToDevice));
-
-  if (nhwc_) {
-    convertNCHWtoNHWC((half*)weights, (float*)scratch, C, c_input_, C, c_input_,
-                      filter_size_, filter_size_, 0);
-  } else {
-    copyTypeConverted((half*)weights, (float*)scratch,
-                      C * c_input_ * filter_size_ * filter_size_, 0);
-  }
-
-  if (pBias) {
-    ReportCUDAErrors(
-        cudaMemcpy(scratch, pBias, bias_size, cudaMemcpyHostToDevice));
-
-    copyTypeConverted((half*)biases, (float*)scratch, C, 0);
-  }
-}
-
-template <>
-void ConvLayer<float>::LoadWeights(float* pfilter, float* pBias,
-                                   void* /*scratch*/) {
-  const size_t weight_size =
-      sizeof(float) * c_input_ * C * filter_size_ * filter_size_;
-  const size_t bias_size = sizeof(float) * C;
-  ReportCUDAErrors(
-      cudaMemcpy(weights, pfilter, weight_size, cudaMemcpyHostToDevice));
-
-  if (pBias) {
-    ReportCUDAErrors(
-        cudaMemcpy(biases, pBias, bias_size, cudaMemcpyHostToDevice));
-  } else {
-    ReportCUDAErrors(cudaMemset(biases, 0, bias_size));
-  }
-}
-
-template <typename DataType>
-void ConvLayer<DataType>::Eval(int N, DataType* output, const DataType* input,
-                               const DataType* input2, void* scratch,
-                               size_t scratch_size, cudnnHandle_t cudnn,
-                               cublasHandle_t /*cublas*/, cudaStream_t stream,
-                               DataType***) {
-  const cudnnDataType_t dataType =
-      std::is_same<half, DataType>::value ? CUDNN_DATA_HALF : CUDNN_DATA_FLOAT;
-
-  const cudnnTensorFormat_t layout =
-      nhwc_ ? CUDNN_TENSOR_NHWC : CUDNN_TENSOR_NCHW;
-
-  ReportCUDNNErrors(cudnnSetTensor4dDescriptor(out_tensor_desc_, layout,
-                                               dataType, N, C, H, W));
-
-  ReportCUDNNErrors(cudnnSetTensor4dDescriptor(in_tensor_desc_, layout,
-                                               dataType, N, c_input_, H, W));
-
-  float alpha = 1.0f, beta = 0.0f;
-
-  if (!(act_ != ACTIVATION_NONE || use_bias_ || input2)) {
-    ReportCUDNNErrors(cudnnConvolutionForward(
-        cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
-        conv_desc_, conv_algo_, scratch, scratch_size, &beta, out_tensor_desc_,
-        output));
-  }
-#if CUDNN_MAJOR != 7 || CUDNN_MINOR != 0
-  else if (input2 && (act_ == ACTIVATION_RELU || act_ == ACTIVATION_NONE) &&
-           use_bias_) {
-    // fused bias + sum + relu!
-    ReportCUDNNErrors(cudnnConvolutionBiasActivationForward(
-        cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
-        conv_desc_, conv_algo_, scratch, scratch_size, &alpha, out_tensor_desc_,
-        input2, bias_desc_, biases, activation_, out_tensor_desc_, output));
-  } else {
-    // For some reason cudnn doesn't support just Convolution + Bias with nchw
-    // (winograd algorithm) it works fine when RELU is also needed which is
-    // somewhat strange.
-    if ((act_ == ACTIVATION_RELU || (act_ == ACTIVATION_NONE && nhwc_)) &&
-        !input2 && use_bias_) {
-      ReportCUDNNErrors(cudnnConvolutionBiasActivationForward(
-          cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
-          conv_desc_, conv_algo_, scratch, scratch_size, &beta,
-          out_tensor_desc_, output, bias_desc_, biases, activation_,
-          out_tensor_desc_, output));
-    } else {
-      // The no special case path...
-      ReportCUDNNErrors(cudnnConvolutionForward(
-          cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
-          conv_desc_, conv_algo_, scratch, scratch_size, &beta,
-          out_tensor_desc_, output));
-      bool act_done = false;
-      if (input2 && input2 != output) {
-        // Merge act with residual add unless there is bias.
-        addVectors(output, output, (DataType*)input2, N * C * H * W,
-                   N * C * H * W, N * C * H * W,
-                   use_bias_ ? ACTIVATION_NONE : act_, stream);
-        act_done = !use_bias_;
-      }
-      // Merge act with bias.
-      if (use_bias_) {
-        if (!nhwc_) {
-          // add bias
-          addBias_NCHW(output, output, biases, N, C, H, W, act_, stream);
-        } else {
-          addVectors(output, output, biases, N * C * H * W, N * C * H * W, C,
-                     act_, stream);
-        }
-      } else if (!act_done && act_ != ACTIVATION_NONE) {
-        addVectors(output, output, (DataType*)nullptr, N * C * H * W,
-                   N * C * H * W, 0, act_, stream);
-      }
-    }
-  }
-#else
-  else {
-    ReportCUDNNErrors(cudnnConvolutionForward(
-        cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
-        conv_desc_, conv_algo_, scratch, scratch_size,
-        (input2 == output) ? &alpha : &beta, out_tensor_desc_, output));
-    if (input2 && input2 != output) {
-      ReportCUDNNErrors(cudnnAddTensor(cudnn, &alpha, out_tensor_desc_, input2,
-                                       &alpha, out_tensor_desc_, output));
-    }
-    if (use_bias_) {
-      ReportCUDNNErrors(cudnnAddTensor(cudnn, &alpha, bias_desc_, biases,
-                                       &alpha, out_tensor_desc_, output));
-    }
-    if (act_ == ACTIVATION_RELU) {
-      ReportCUDNNErrors(cudnnActivationForward(cudnn, activation_, &alpha,
-                                               out_tensor_desc_, output, &beta,
-                                               out_tensor_desc_, output));
-    }
-    if (act_ != ACTIVATION_RELU && act_ != ACTIVATION_NONE) {
-      addVectors(output, output, nullptr, N * C * H * W, N * C * H * W, 0, act_,
-                 stream);
-      // TODO: check this actually compiles?
-    }
-  }
-#endif
-}
-
-template <typename DataType>
-ConvLayer<DataType>::~ConvLayer() {
-  ReportCUDAErrors(cudaFree(weights));
-  ReportCUDAErrors(cudaFree(biases));
-
-  cudnnDestroyFilterDescriptor(filter_desc_);
-  cudnnDestroyConvolutionDescriptor(conv_desc_);
-  cudnnDestroyTensorDescriptor(bias_desc_);
-  cudnnDestroyTensorDescriptor(in_tensor_desc_);
-  cudnnDestroyTensorDescriptor(out_tensor_desc_);
-  cudnnDestroyActivationDescriptor(activation_);
-}
-
-/*
-template <typename DataType>
-DepthwiseConvLayer<DataType>::DepthwiseConvLayer(
-    BaseLayer<DataType>* prev, int channels, int height, int width,
-    ActivationFunction act, bool use_gemm_ex,  int min_batch_size, int max_batch_size, 
-    cudnnHandle_t cudnn)
-    : BaseLayer<DataType>(channels, height, width, prev, true, use_gemm_ex),
-      channels_(channels),
-      act_(act) {
-  
   for (int b = 1; b <= 32; b *= 2) {
         if (b >= min_batch_size) EnsureGraph(b, cudnn);
-    }
+  }
 
   int start_batch = std::max(32, GetPaddedBatchSize(min_batch_size));
   int max_padded_batch = GetPaddedBatchSize(max_batch_size);
@@ -426,388 +182,147 @@ DepthwiseConvLayer<DataType>::DepthwiseConvLayer(
 }
 
 template <typename DataType>
-DepthwiseConvLayer<DataType>::~DepthwiseConvLayer() {
+ConvLayer<DataType>::~ConvLayer() {
   if (weights_) ReportCUDAErrors(cudaFree(weights_));
   if (biases_) ReportCUDAErrors(cudaFree(biases_));
 }
 
-template <typename DataType>
-void DepthwiseConvLayer<DataType>::LoadWeights(float* weights,
-                                               float* biases,
-                                               void* scratch) {
-  size_t num_weights = channels_ * 1 * 5 * 5;
-  size_t num_biases = channels_;
+template <>
+void ConvLayer<half>::LoadWeights(const std::vector<float>& weights,
+                                 float* biases,
+                                 void* scratch) {
+  size_t num_weights = C * c_input_ * filter_size_ * filter_size_;
+  size_t num_biases = C;
 
-  ReportCUDAErrors(cudaMalloc(&weights_, num_weights * sizeof(DataType)));
-  ReportCUDAErrors(cudaMalloc(&biases_, num_biases * sizeof(DataType)));
+  ReportCUDAErrors(cudaMalloc(&weights_, num_weights * sizeof(half)));
+  ReportCUDAErrors(cudaMalloc(&biases_, num_biases * sizeof(half)));
 
-  ReportCUDAErrors(cudaMemcpy(scratch, weights, num_weights * sizeof(float), cudaMemcpyHostToDevice));
-  copyTypeConverted(weights_, (float*)scratch, num_weights, 0);
+  // Copy raw host OIHW float weights to GPU staging scratchpad
+  ReportCUDAErrors(cudaMemcpy(scratch, weights.data(), num_weights * sizeof(float), cudaMemcpyHostToDevice));
+  
+  // Slipped parameters map N=C (Output), C=c_input_ (Input). 
+  // Performs layout transposition (OIHW -> OHWI) and Type Conversion (float -> half) simultaneously on GPU.
+  convertNCHWtoNHWC((half*)weights_, (float*)scratch, C, c_input_, C, c_input_, filter_size_, filter_size_, 0);
 
-  ReportCUDAErrors(cudaMemcpy(scratch, biases, num_biases * sizeof(float), cudaMemcpyHostToDevice));
-  copyTypeConverted(biases_, (float*)scratch, num_biases, 0);
+  if (biases != nullptr) {
+      ReportCUDAErrors(cudaMemcpy(scratch, biases, num_biases * sizeof(float), cudaMemcpyHostToDevice));
+      copyTypeConverted((half*)biases_, (float*)scratch, num_biases, 0);
+  } else {
+      std::vector<float> zero_biases(num_biases, 0.0f);
+      ReportCUDAErrors(cudaMemcpy(scratch, zero_biases.data(), num_biases * sizeof(float), cudaMemcpyHostToDevice));
+      copyTypeConverted((half*)biases_, (float*)scratch, num_biases, 0);
+  }
+}
+
+template <>
+void ConvLayer<float>::LoadWeights(const std::vector<float>& weights,
+                                  float* biases,
+                                  void* scratch) {
+  size_t num_weights = C * c_input_ * filter_size_ * filter_size_;
+  size_t num_biases = C;
+
+  ReportCUDAErrors(cudaMalloc(&weights_, num_weights * sizeof(float)));
+  ReportCUDAErrors(cudaMalloc(&biases_, num_biases * sizeof(float)));
+
+  // Copy raw host OIHW float weights to GPU staging scratchpad
+  ReportCUDAErrors(cudaMemcpy(scratch, weights.data(), num_weights * sizeof(float), cudaMemcpyHostToDevice));
+
+  // Performs pure layout transposition (OIHW -> OHWI) entirely on the GPU
+  convertNCHWtoNHWC((float*)weights_, (float*)scratch, C, c_input_, C, c_input_, filter_size_, filter_size_, 0);
+
+  if (biases != nullptr) {
+      ReportCUDAErrors(cudaMemcpy(biases_, biases, num_biases * sizeof(float), cudaMemcpyHostToDevice));
+  } else {
+      ReportCUDAErrors(cudaMemset(biases_, 0, num_biases * sizeof(float)));
+  }
 }
 
 template <typename DataType>
-void DepthwiseConvLayer<DataType>::EnsureGraph(int padded_batch, cudnnHandle_t cudnn) {
+void ConvLayer<DataType>::EnsureGraph(int padded_batch, cudnnHandle_t cudnn) {
   if (plans_.count(padded_batch) > 0) return;
 
+  namespace fe = cudnn_frontend;
+
   cudnn_frontend::DataType_t fe_dtype = std::is_same<DataType, half>::value ? 
-      cudnn_frontend::DataType_t::HALF : cudnn_frontend::DataType_t::FLOAT;
+      fe::DataType_t::HALF : fe::DataType_t::FLOAT;
 
-  auto graph = std::make_shared<cudnn_frontend::graph::Graph>();
+  auto graph = std::make_shared<fe::graph::Graph>();
   graph->set_io_data_type(fe_dtype)
-       .set_intermediate_data_type(cudnn_frontend::DataType_t::FLOAT)
-       .set_compute_data_type(cudnn_frontend::DataType_t::FLOAT);
+       .set_intermediate_data_type(fe::DataType_t::FLOAT)
+       .set_compute_data_type(fe::DataType_t::FLOAT);
 
-
-  auto X = graph->tensor(cudnn_frontend::graph::Tensor_attributes()
+  // Input Activations (NHWC)
+  auto X = graph->tensor(fe::graph::Tensor_attributes()
       .set_name("X")
-      .set_dim({padded_batch, channels_, 8, 8})
-      .set_stride({channels_ * 64, 1, channels_ * 8, channels_}));
+      .set_dim({padded_batch, c_input_, this->H, this->W})
+      .set_stride({this->H * this->W * c_input_, 1, this->W * c_input_, c_input_}));
 
-  auto W = graph->tensor(cudnn_frontend::graph::Tensor_attributes()
+  auto W = graph->tensor(fe::graph::Tensor_attributes()
       .set_name("W")
-      .set_dim({channels_, 1, 5, 5})
-      .set_stride({25, 1, 5, 1}));
+      .set_dim({this->C, c_input_, filter_size_, filter_size_})
+      .set_stride({filter_size_ * filter_size_ * c_input_, 1, filter_size_ * c_input_, c_input_}));
 
-  auto conv_options = cudnn_frontend::graph::Conv_fprop_attributes()
-      .set_padding({2, 2})
+  int padding = filter_size_ / 2;
+  auto conv_options = fe::graph::Conv_fprop_attributes()
+      .set_padding({padding, padding})
       .set_stride({1, 1})
       .set_dilation({1, 1});
+
   auto Y_conv = graph->conv_fprop(X, W, conv_options);
 
-  auto B = graph->tensor(cudnn_frontend::graph::Tensor_attributes()
-      .set_name("B")
-      .set_dim({1, channels_, 1, 1})
-      .set_stride({channels_, 1, channels_, channels_}));
+  // Output Activations (NHWC)
+  Y_conv->set_output(true)
+        .set_dim({padded_batch, this->C, this->H, this->W})
+        .set_stride({this->H * this->W * this->C, 1, this->W * this->C, this->C});
 
-  auto Y_bias = graph->pointwise(Y_conv, B, cudnn_frontend::graph::Pointwise_attributes()
-      .set_mode(cudnn_frontend::PointwiseMode_t::ADD));
-
-  auto Y_act = graph->pointwise(Y_bias, cudnn_frontend::graph::Pointwise_attributes()
-      .set_mode(cudnn_frontend::PointwiseMode_t::RELU_FWD));
-
-  Y_act->set_output(true)
-       .set_dim({padded_batch, channels_, 8, 8})
-       .set_stride({channels_ * 64, 1, channels_ * 8, channels_});
-
-  auto status = graph->build(cudnn, {cudnn_frontend::HeurMode_t::A});
+  auto status = graph->build(cudnn, {fe::HeurMode_t::A});
   if (!status.is_good()) {
-      throw Exception("cuDNN graph build failed: " + status.get_message());
+      throw Exception("cuDNN graph build failed for ConvLayer: " + status.get_message());
   }
 
   GraphPlan plan;
   plan.graph = graph;
   plan.X = X;
   plan.W = W;
-  plan.B = B;     
-  plan.Y = Y_act; 
+  plan.Y = Y_conv; 
   plan.workspace_size = graph->get_workspace_size();
 
   plans_[padded_batch] = plan;
 }
 
 template <typename DataType>
-void DepthwiseConvLayer<DataType>::Eval(
+void ConvLayer<DataType>::Eval(
     int batch_size, DataType* output, const DataType* input,
     const DataType* skip, void* scratch, size_t scratch_size,
     cudnnHandle_t cudnn, cublasHandle_t cublas, cudaStream_t stream,
     DataType***) {
 
   int padded_batch = GetPaddedBatchSize(batch_size);
-  
   EnsureGraph(padded_batch, cudnn); 
 
   auto& plan = plans_[padded_batch];
 
   if (scratch_size < plan.workspace_size) {
-      throw Exception("Scratch size is too small for cuDNN graph workspace");
+      throw Exception("Scratch size is too small for cuDNN graph workspace in ConvLayer");
   }
 
   std::unordered_map<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, void*> variant_pack = {
       {plan.X, (void*)input},
       {plan.W, (void*)weights_},
-      {plan.B, (void*)biases_},   
       {plan.Y, (void*)output}
   };
 
-  ReportCUDNNErrors(cudnnSetStream(cudnn, stream));
   auto status = plan.graph->execute(cudnn, variant_pack, scratch);
   if (!status.is_good()) {
-      throw Exception("cuDNN graph execution failed: " + status.get_message());
-  }
-}
-*/
-template <typename DataType>
-void DepthwiseLegacy<DataType>::init() {
-  // Allocate memory for weights (filter tensor) and biases.
-  const size_t weight_size =
-      sizeof(DataType) * c_input_ * filter_size_ * filter_size_;
-  ReportCUDAErrors(cudaMalloc(&weights, weight_size));
-
-  const size_t bias_size = sizeof(DataType) * c_input_;
-  ReportCUDAErrors(cudaMalloc(&biases, bias_size));
-
-  const bool fp16 = std::is_same<half, DataType>::value;
-  const cudnnDataType_t dataType =
-      std::is_same<half, DataType>::value ? CUDNN_DATA_HALF : CUDNN_DATA_FLOAT;
-
-  const cudnnTensorFormat_t layout =
-      nhwc_ ? CUDNN_TENSOR_NHWC : CUDNN_TENSOR_NCHW;
-
-  // Create cudnn objects for various tensors, algorithms, etc.
-  cudnnCreateFilterDescriptor(&filter_desc_);
-  cudnnCreateConvolutionDescriptor(&conv_desc_);
-  cudnnCreateTensorDescriptor(&out_tensor_desc_);
-  cudnnCreateTensorDescriptor(&in_tensor_desc_);
-  cudnnCreateTensorDescriptor(&bias_desc_);
-  cudnnCreateActivationDescriptor(&activation_);
-
-  cudnnSetFilter4dDescriptor(filter_desc_, dataType, layout, GetC(), 1,
-                             filter_size_, filter_size_);
-
-  ReportCUDNNErrors(
-      cudnnSetTensor4dDescriptor(bias_desc_, layout, dataType, 1, C, 1, 1));
-
-  const int padding = filter_size_ / 2;
-  const bool crossCorr = 1;
-
-  ReportCUDNNErrors(cudnnSetConvolution2dDescriptor(
-      conv_desc_, padding, padding, 1, 1, 1, 1,
-      crossCorr ? CUDNN_CROSS_CORRELATION : CUDNN_CONVOLUTION, dataType));
-
-  /////////////////////////////////////////////////////////////////////
-  assert(c_input_ == C); 
-  ReportCUDNNErrors(cudnnSetConvolutionGroupCount(conv_desc_, c_input_));
-  /////////////////////////////////////////////////////////////////////
-
-  if (fp16 && nhwc_)
-    ReportCUDNNErrors(
-        cudnnSetConvolutionMathType(conv_desc_, CUDNN_TENSOR_OP_MATH));
-
-  conv_algo_ = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
-
-  if (act_ == ACTIVATION_RELU) {
-    cudnnSetActivationDescriptor(activation_, CUDNN_ACTIVATION_RELU,
-                                 CUDNN_NOT_PROPAGATE_NAN, 0.0);
-  }
-#if CUDNN_MAJOR != 7 || CUDNN_MINOR != 0
-  else {
-    cudnnSetActivationDescriptor(activation_, CUDNN_ACTIVATION_IDENTITY,
-                                 CUDNN_NOT_PROPAGATE_NAN, 0.0);
-  }
-#endif
-}
-
-template <typename DataType>
-DepthwiseLegacy<DataType>::DepthwiseLegacy(BaseLayer<DataType>* ip, int C, int H, int W,
-                               int filter, 
-                               ActivationFunction activation, bool bias)
-    : BaseLayer<DataType>(C, H, W, ip),
-      c_input_(C),
-      filter_size_(filter),
-      act_(activation),
-      use_bias_(bias) {
-  init();
-}
-
-template <typename DataType>
-DepthwiseLegacy<DataType>::DepthwiseLegacy(bool nhwc, int C, int H, int W, int filter,
-                               ActivationFunction activation,
-                               bool bias)
-    : BaseLayer<DataType>(C, H, W, nullptr, nhwc),
-      c_input_(C),
-      filter_size_(filter),
-      act_(activation),
-      use_bias_(bias) {
-  init();
-}
-
-template <>
-void DepthwiseLegacy<half>::LoadWeights(float* pfilter, float* pBias, void* scratch) {
-  assert(pfilter != nullptr);
-  
-  const size_t weight_size =
-      sizeof(float) * c_input_ * filter_size_ * filter_size_;
-
-  //std::cout << "Weight size : " << weight_size << std::endl;
-
-  const size_t bias_size = sizeof(float) * c_input_;
-
-  if (c_input_ > 0 && pfilter != nullptr) {
-    std::cout << "\n=== DEBUG: DepthwiseConvLayer (cuDNN) | Channel 0 ===" << std::endl;
-    std::cout << "Weights (5x5 = 25 elements):\n";
-    for (int i = 0; i < 25; ++i) {
-        std::cout << pfilter[i] << (i == 24 ? "" : ", ");
-    }
-    std::cout << "\nBias: ";
-    if (pBias) {
-        std::cout << pBias[0];
-    } else {
-        std::cout << "nullptr (no bias)";
-    }
-    std::cout << "\n=====================================================\n" << std::endl;
+      throw Exception("cuDNN graph execution failed in ConvLayer: " + status.get_message());
   }
 
-  //std::cout << "Bias size : " << weight_size << std::endl;
-  // Also need to convert from fp32 NCHW to fp16 NHWC
-  // first copy from CPU memory to scratch space in GPU memory
-  // and then do the type / layout conversion using a kernel.
-  assert(scratch);
-  ReportCUDAErrors(
-      cudaMemcpy(scratch, pfilter, weight_size, cudaMemcpyHostToDevice));
-
-  if (nhwc_) {
-    //std::cout << "NHWC" << std::endl;
-    convertNCHWtoNHWC((half*)weights, (float*)scratch, c_input_, 1, c_input_, 1,
-                      filter_size_, filter_size_, 0);
-  } else {
-    //std::cout << "Not NHWC" <<std::endl;
-    copyTypeConverted((half*)weights, (float*)scratch,
-                    C * filter_size_ * filter_size_, 0);
-    //copyTypeConvertedMask((half*)weights, (float*)scratch,
-    //                 C * filter_size_ * filter_size_, C, 0);
+  // Applies elements bias injection and activation loops on the contiguous channel data sequence outside the graph
+  if (use_bias_) {
+      addBiasBatched<DataType>(output, output, biases_, 1, batch_size * this->H * this->W, this->C, act_, stream);
+  } else if (act_ != ACTIVATION_NONE) {
+      addVectors(output, output, (DataType*)nullptr, batch_size * this->C * this->H * this->W, batch_size * this->C * this->H * this->W, 0, act_, stream);
   }
-
-  if (pBias) {
-    ReportCUDAErrors(
-        cudaMemcpy(scratch, pBias, bias_size, cudaMemcpyHostToDevice));
-
-    copyTypeConverted((half*)biases, (float*)scratch, C, 0);
-  }
-}
-
-template <>
-void DepthwiseLegacy<float>::LoadWeights(float* pfilter, float* pBias,
-                                   void* /*scratch*/) {
-  const size_t weight_size =
-      sizeof(float) *  C * filter_size_ * filter_size_;
-  const size_t bias_size = sizeof(float) * C;
-  ReportCUDAErrors(
-      cudaMemcpy(weights, pfilter, weight_size, cudaMemcpyHostToDevice));
-
-  if (pBias) {
-    ReportCUDAErrors(
-        cudaMemcpy(biases, pBias, bias_size, cudaMemcpyHostToDevice));
-  } else {
-    ReportCUDAErrors(cudaMemset(biases, 0, bias_size));
-  }
-}
-
-template <typename DataType>
-void DepthwiseLegacy<DataType>::Eval(int N, DataType* output, const DataType* input,
-                               const DataType* input2, void* scratch,
-                               size_t scratch_size, cudnnHandle_t cudnn,
-                               cublasHandle_t /*cublas*/, cudaStream_t stream,
-                               DataType***) {
-  const cudnnDataType_t dataType =
-      std::is_same<half, DataType>::value ? CUDNN_DATA_HALF : CUDNN_DATA_FLOAT;
-
-  const cudnnTensorFormat_t layout =
-      nhwc_ ? CUDNN_TENSOR_NHWC : CUDNN_TENSOR_NCHW;
-
-  ReportCUDNNErrors(cudnnSetTensor4dDescriptor(out_tensor_desc_, layout,
-                                               dataType, N, C, H, W));
-
-  ReportCUDNNErrors(cudnnSetTensor4dDescriptor(in_tensor_desc_, layout,
-                                               dataType, N, c_input_, H, W));
-
-  float alpha = 1.0f, beta = 0.0f;
-
-  if (!(act_ != ACTIVATION_NONE || use_bias_ || input2)) {
-    ReportCUDNNErrors(cudnnConvolutionForward(
-        cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
-        conv_desc_, conv_algo_, scratch, scratch_size, &beta, out_tensor_desc_,
-        output));
-  }
-#if CUDNN_MAJOR != 7 || CUDNN_MINOR != 0
-  else if (input2 && (act_ == ACTIVATION_RELU || act_ == ACTIVATION_NONE) &&
-           use_bias_) {
-    // fused bias + sum + relu!
-    ReportCUDNNErrors(cudnnConvolutionBiasActivationForward(
-        cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
-        conv_desc_, conv_algo_, scratch, scratch_size, &alpha, out_tensor_desc_,
-        input2, bias_desc_, biases, activation_, out_tensor_desc_, output));
-  } else {
-    // For some reason cudnn doesn't support just Convolution + Bias with nchw
-    // (winograd algorithm) it works fine when RELU is also needed which is
-    // somewhat strange.
-    if ((act_ == ACTIVATION_RELU || (act_ == ACTIVATION_NONE && nhwc_)) &&
-        !input2 && use_bias_) {
-      ReportCUDNNErrors(cudnnConvolutionBiasActivationForward(
-          cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
-          conv_desc_, conv_algo_, scratch, scratch_size, &beta,
-          out_tensor_desc_, output, bias_desc_, biases, activation_,
-          out_tensor_desc_, output));
-    } else {
-      // The no special case path...
-      ReportCUDNNErrors(cudnnConvolutionForward(
-          cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
-          conv_desc_, conv_algo_, scratch, scratch_size, &beta,
-          out_tensor_desc_, output));
-      bool act_done = false;
-      if (input2 && input2 != output) {
-        // Merge act with residual add unless there is bias.
-        addVectors(output, output, (DataType*)input2, N * C * H * W,
-                   N * C * H * W, N * C * H * W,
-                   use_bias_ ? ACTIVATION_NONE : act_, stream);
-        act_done = !use_bias_;
-      }
-      // Merge act with bias.
-      if (use_bias_) {
-        if (!nhwc_) {
-          // add bias
-          addBias_NCHW(output, output, biases, N, C, H, W, act_, stream);
-        } else {
-          addVectors(output, output, biases, N * C * H * W, N * C * H * W, C,
-                     act_, stream);
-        }
-      } else if (!act_done && act_ != ACTIVATION_NONE) {
-        addVectors(output, output, (DataType*)nullptr, N * C * H * W,
-                   N * C * H * W, 0, act_, stream);
-      }
-    }
-  }
-#else
-  else {
-    ReportCUDNNErrors(cudnnConvolutionForward(
-        cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
-        conv_desc_, conv_algo_, scratch, scratch_size,
-        (input2 == output) ? &alpha : &beta, out_tensor_desc_, output));
-    if (input2 && input2 != output) {
-      ReportCUDNNErrors(cudnnAddTensor(cudnn, &alpha, out_tensor_desc_, input2,
-                                       &alpha, out_tensor_desc_, output));
-    }
-    if (use_bias_) {
-      ReportCUDNNErrors(cudnnAddTensor(cudnn, &alpha, bias_desc_, biases,
-                                       &alpha, out_tensor_desc_, output));
-    }
-    if (act_ == ACTIVATION_RELU) {
-      ReportCUDNNErrors(cudnnActivationForward(cudnn, activation_, &alpha,
-                                               out_tensor_desc_, output, &beta,
-                                               out_tensor_desc_, output));
-    }
-    if (act_ != ACTIVATION_RELU && act_ != ACTIVATION_NONE) {
-      addVectors(output, output, nullptr, N * C * H * W, N * C * H * W, 0, act_,
-                 stream);
-      // TODO: check this actually compiles?
-    }
-  }
-#endif
-}
-
-template <typename DataType>
-DepthwiseLegacy<DataType>::~DepthwiseLegacy() {
-  ReportCUDAErrors(cudaFree(weights));
-  ReportCUDAErrors(cudaFree(biases));
-
-  cudnnDestroyFilterDescriptor(filter_desc_);
-  cudnnDestroyConvolutionDescriptor(conv_desc_);
-  cudnnDestroyTensorDescriptor(bias_desc_);
-  cudnnDestroyTensorDescriptor(in_tensor_desc_);
-  cudnnDestroyTensorDescriptor(out_tensor_desc_);
-  cudnnDestroyActivationDescriptor(activation_);
 }
 
 
@@ -815,15 +330,19 @@ template <typename DataType>
 DepthwiseConvLayer<DataType>::DepthwiseConvLayer(
     BaseLayer<DataType>* prev, int channels, int height, int width,
     ActivationFunction act, bool use_gemm_ex,  int min_batch_size, int max_batch_size, 
+    int rook_channels, int bishop_channels, int knight_channels,
     cudnnHandle_t cudnn)
-    : BaseLayer<DataType>(channels, height, width, prev, false, use_gemm_ex),
+    // FIX 1: Toggle the 5th parameter from 'false' to 'true' to signal NHWC format
+    : BaseLayer<DataType>(channels, height, width, prev, true, use_gemm_ex),
       channels_(channels),
-      act_(act) {
+      act_(act),
+      rook_channels_(rook_channels),
+      bishop_channels_(bishop_channels),
+      knight_channels_(knight_channels) {
 
-  
   for (int b = 1; b <= 32; b *= 2) {
         if (b >= min_batch_size) EnsureGraph(b, cudnn);
-    }
+  }
 
   int start_batch = std::max(32, GetPaddedBatchSize(min_batch_size));
   int max_padded_batch = GetPaddedBatchSize(max_batch_size);
@@ -831,13 +350,6 @@ DepthwiseConvLayer<DataType>::DepthwiseConvLayer(
   for (int b = start_batch; b <= max_padded_batch; b += 32) {
       EnsureGraph(b, cudnn);
   }
-  
-  //int min_padded_batch = GetPaddedBatchSize(min_batch_size);
-  //int max_padded_batch = GetPaddedBatchSize(max_batch_size);
-
-  //for (int b = min_padded_batch; b <= max_padded_batch; b *= 2) {
-  //    EnsureGraph(b, cudnn);
-  //}
 }
 
 template <typename DataType>
@@ -847,37 +359,58 @@ DepthwiseConvLayer<DataType>::~DepthwiseConvLayer() {
 }
 
 template <typename DataType>
-void DepthwiseConvLayer<DataType>::LoadWeights(float* weights,
+void DepthwiseConvLayer<DataType>::LoadWeights(const std::vector<float>& weights,
                                                float* biases,
                                                void* scratch) {
-  size_t num_weights = channels_ * 1 * 5 * 5;
+  size_t num_weights_cudnn = channels_ * 1 * 5 * 5; 
   size_t num_biases = channels_;
   
-  if (channels_ > 0 && weights != nullptr) {
-      std::cout << "\n=== DEBUG: DepthwiseConvLayer (cuDNN) | Channel 0 ===" << std::endl;
-      std::cout << "Weights (5x5 = 25 elements):\n";
-      for (int i = 0; i < 25; ++i) {
-          std::cout << weights[i] << (i == 24 ? "" : ", ");
-      }
-      std::cout << "\nBias: ";
-      if (biases) {
-          std::cout << biases[0];
-      } else {
-          std::cout << "nullptr (no bias)";
-      }
-      std::cout << "\n=====================================================\n" << std::endl;
-  }
+  int weights_per_channel = weights.size() / channels_;
+  assert(weights_per_channel == 25 || weights_per_channel == 9);
 
-  ReportCUDAErrors(cudaMalloc(&weights_, num_weights * sizeof(DataType)));
+  ReportCUDAErrors(cudaMalloc(&weights_, num_weights_cudnn * sizeof(DataType)));
   ReportCUDAErrors(cudaMalloc(&biases_, num_biases * sizeof(DataType)));
 
-  ReportCUDAErrors(cudaMemcpy(scratch, weights, num_weights * sizeof(float), cudaMemcpyHostToDevice));
-  copyTypeConverted(weights_, (float*)scratch, num_weights, 0);
+  if (weights_per_channel == 25) {
+      ReportCUDAErrors(cudaMemcpy(scratch, weights.data(), num_weights_cudnn * sizeof(float), cudaMemcpyHostToDevice));
+      copyTypeConverted(weights_, (float*)scratch, num_weights_cudnn, 0);
+  } 
+  else {
+      std::vector<float> dense_weights_host(num_weights_cudnn, 0.0f);
+      const int rook_idx[9]   = {2, 7, 10, 11, 12, 13, 14, 17, 22};
+      const int bishop_idx[9] = {0, 4,  6,  8, 12, 16, 18, 20, 24};
+      const int knight_idx[9] = {1, 3,  5,  9, 12, 15, 19, 21, 23};
 
-  ReportCUDAErrors(cudaMemcpy(scratch, biases, num_biases * sizeof(float), cudaMemcpyHostToDevice));
-  copyTypeConverted(biases_, (float*)scratch, num_biases, 0);
+      for (int o = 0; o < channels_; o++) {
+          const int* active_mask = nullptr;
+          if (o < rook_channels_) {
+              active_mask = rook_idx;
+          } else if (o < (rook_channels_ + bishop_channels_)) {
+              active_mask = bishop_idx;
+          } else {
+              active_mask = knight_idx;
+          }
+
+          for (int i = 0; i < 9; i++) {
+              int src_compressed_idx = (o * 9) + i;
+              int dst_dense_idx = (o * 25) + active_mask[i];
+              dense_weights_host[dst_dense_idx] = weights[src_compressed_idx];
+          }
+      }
+
+      ReportCUDAErrors(cudaMemcpy(scratch, dense_weights_host.data(), num_weights_cudnn * sizeof(float), cudaMemcpyHostToDevice));
+      copyTypeConverted(weights_, (float*)scratch, num_weights_cudnn, 0);
+  }
+
+  if (biases != nullptr) {
+      ReportCUDAErrors(cudaMemcpy(scratch, biases, num_biases * sizeof(float), cudaMemcpyHostToDevice));
+      copyTypeConverted(biases_, (float*)scratch, num_biases, 0);
+  } else {
+      std::vector<float> zero_biases(num_biases, 0.0f);
+      ReportCUDAErrors(cudaMemcpy(scratch, zero_biases.data(), num_biases * sizeof(float), cudaMemcpyHostToDevice));
+      copyTypeConverted(biases_, (float*)scratch, num_biases, 0);
+  }
 }
-
 template <typename DataType>
 void DepthwiseConvLayer<DataType>::EnsureGraph(int padded_batch, cudnnHandle_t cudnn) {
   if (plans_.count(padded_batch) > 0) return;
@@ -890,16 +423,20 @@ void DepthwiseConvLayer<DataType>::EnsureGraph(int padded_batch, cudnnHandle_t c
        .set_intermediate_data_type(cudnn_frontend::DataType_t::FLOAT)
        .set_compute_data_type(cudnn_frontend::DataType_t::FLOAT);
 
+  // Tensor dimensions are strictly expected in logical NCHW format: {Batch, Channels, Height, Width}
   auto X = graph->tensor(cudnn_frontend::graph::Tensor_attributes()
       .set_name("X")
       .set_dim({padded_batch, channels_, 8, 8})
-      .set_stride({channels_ * 64, 64, 8, 1}));
+      .set_stride({64 * channels_, 1, 8 * channels_, channels_})); // NHWC Physical Strides
 
+  // Filter dimensions: {Output_channels, Input_channels_per_group, Height, Width}
+  // Setting Input_channels_per_group to 1 implicitly triggers the depthwise configuration!
   auto W = graph->tensor(cudnn_frontend::graph::Tensor_attributes()
       .set_name("W")
       .set_dim({channels_, 1, 5, 5})
       .set_stride({25, 25, 5, 1}));
 
+  // FIX: Clear the non-existent .set_group_count call entirely
   auto conv_options = cudnn_frontend::graph::Conv_fprop_attributes()
       .set_padding({2, 2})
       .set_stride({1, 1})
@@ -909,7 +446,7 @@ void DepthwiseConvLayer<DataType>::EnsureGraph(int padded_batch, cudnnHandle_t c
 
   Y_conv->set_output(true)
         .set_dim({padded_batch, channels_, 8, 8})
-        .set_stride({channels_ * 64, 64, 8, 1});
+        .set_stride({64 * channels_, 1, 8 * channels_, channels_});
 
   auto status = graph->build(cudnn, {cudnn_frontend::HeurMode_t::A});
   if (!status.is_good()) {
@@ -954,7 +491,7 @@ void DepthwiseConvLayer<DataType>::Eval(
       throw Exception("cuDNN graph execution failed: " + status.get_message());
   }
 
-  addBias_NCHW<DataType>(output, output, biases_, batch_size, channels_, 8, 8, act_, stream);
+  addBiasBatched<DataType>(output, output, biases_, 1, batch_size * 64, channels_, act_, stream);
 }
 #endif
 
@@ -976,58 +513,56 @@ DepthwiseCustom<DataType>::DepthwiseCustom(int C_in, int H, int W, ActivationFun
   }
 
   
-  template <typename DataType>
-  void DepthwiseCustom<DataType>::LoadWeights(float* pfilter, float* pBias, void* scratch) {
-    assert(pfilter != nullptr);
-    assert(scratch != nullptr);
+template <typename DataType>
+void DepthwiseCustom<DataType>::LoadWeights(const std::vector<float>& pfilter, float* pBias, void* scratch) {
+  assert(scratch != nullptr);
 
-    std::vector<float> packed_weights;
-    packed_weights.reserve(c_input_ * 10); 
+  std::vector<float> packed_weights;
+  packed_weights.reserve(c_input_ * 10); 
 
-    const int rook_idx[9]   = {2, 7, 10, 11, 12, 13, 14, 17, 22};
-    const int bishop_idx[9] = {0, 4,  6,  8, 12, 16, 18, 20, 24};
-    const int knight_idx[9] = {1, 3,  5,  9, 12, 15, 19, 21, 23};
+  int weights_per_channel = pfilter.size() / c_input_;
+  assert(weights_per_channel == 25 || weights_per_channel == 9);
 
-    for (int o = 0; o < c_input_; o++) {
-        const int* active_mask = nullptr;
+  if (weights_per_channel == 25) {
+      const int rook_idx[9]   = {2, 7, 10, 11, 12, 13, 14, 17, 22};
+      const int bishop_idx[9] = {0, 4,  6,  8, 12, 16, 18, 20, 24};
+      const int knight_idx[9] = {1, 3,  5,  9, 12, 15, 19, 21, 23};
 
-        if (o < rook_channels_) active_mask = rook_idx;
-        else if (o < (rook_channels_ + bishop_channels_)) active_mask = bishop_idx;
-        else active_mask = knight_idx;
+      for (int o = 0; o < c_input_; o++) {
+          const int* active_mask = nullptr;
 
-        for (int i = 0; i < 9; i++) {
-            packed_weights.push_back(pfilter[o * 25 + active_mask[i]]);
-        }
-        
-        packed_weights.push_back(pBias ? pBias[o] : 0.0f);
-    }
+          if (o < rook_channels_) active_mask = rook_idx;
+          else if (o < (rook_channels_ + bishop_channels_)) active_mask = bishop_idx;
+          else active_mask = knight_idx;
 
-    const size_t packed_size = sizeof(float) * c_input_ * 10;
-
-    // --- OPTIONAL DEBUG BLOCK ---
-    /*
-    if (c_input_ > 0) {
-        std::cout << "\n=== DEBUG: DepthwiseCustom Packing | Channel 0 ===" << std::endl;
-        std::cout << "Packed Array (9 Weights + 1 Bias):\n";
-        for (int i = 0; i < 10; ++i) {
-            std::cout << packed_weights[i] << (i == 9 ? "" : ", ");
-        }
-        std::cout << "\n==================================================\n" << std::endl;
-    }
-    */
-    // ----------------------------
-
-    ReportCUDAErrors(
-        cudaMemcpy(scratch, packed_weights.data(), packed_size, cudaMemcpyHostToDevice));
-        
-    if (nhwc_) {
-      convert_float_to_half2_nhwc((float*)scratch, (half2*)weights, c_input_, 10, 1);
-    }
-    else {
-      convert_float_to_half2_nchw((float*)scratch, (half2*)weights, c_input_, 10, 1);
-    }
-    
+          for (int i = 0; i < 9; i++) {
+              packed_weights.push_back(pfilter[o * 25 + active_mask[i]]);
+          }
+          packed_weights.push_back(pBias ? pBias[o] : 0.0f);
+      }
+  } 
+  else {
+      // COMPRESSED LAYOUT FORMAT (New style: load natively packed weights contiguously)
+      for (int o = 0; o < c_input_; o++) {
+          for (int i = 0; i < 9; i++) {
+              packed_weights.push_back(pfilter[o * 9 + i]);
+          }
+          packed_weights.push_back(pBias ? pBias[o] : 0.0f);
+      }
   }
+
+  // 3. Convert and stage data into standard high-speed register layouts
+  const size_t packed_size = sizeof(float) * c_input_ * 10;
+  ReportCUDAErrors(
+      cudaMemcpy(scratch, packed_weights.data(), packed_size, cudaMemcpyHostToDevice));
+      
+  if (nhwc_) {
+    convert_float_to_half2_nhwc((float*)scratch, (half2*)weights, c_input_, 10, 1);
+  }
+  else {
+    convert_float_to_half2_nchw((float*)scratch, (half2*)weights, c_input_, 10, 1);
+  }
+}
   
   
 
@@ -1196,11 +731,12 @@ void FusedDWPWLayer<float>::Eval(int N, float* output, const float* input,
 
 template <typename DataType>
 SELayer<DataType>::SELayer(BaseLayer<DataType>* ip, int fc1Outputs,
-                           bool addPrevLayerBias, ActivationFunction activation)
+                           bool addPrevLayerBias, ActivationFunction activation, bool activateOutput)
     : BaseLayer<DataType>(ip->GetC(), ip->GetH(), ip->GetW(), ip),
       numFc1Out_(fc1Outputs),
       addPrevLayerBias_(addPrevLayerBias),
-      act_(activation) {
+      act_(activation),
+      activateOutput_(activateOutput) {
   ReportCUDAErrors(cudaMalloc(&w1_, C * numFc1Out_ * sizeof(DataType)));
   ReportCUDAErrors(cudaMalloc(&w2_, 2 * C * numFc1Out_ * sizeof(DataType)));
 
@@ -1342,7 +878,13 @@ void SELayer<float>::Eval(int N, float* output, const float* input,
 
   // 4. (Optional prev layer bias add), Global scale, residual add, relu and
   // bias.
-  globalScale(N, C, output, input, op2, bPrev_, false, act_, stream);
+  if (activateOutput_) {
+    globalScale(N, C, output, input, op2, bPrev_, false, act_, stream);
+  }
+  else {
+    globalScale(N, C, output, input, op2, bPrev_, false, ACTIVATION_NONE, stream);
+  }
+
 }
 
 template <>
@@ -1385,7 +927,13 @@ void SELayer<half>::Eval(int N, half* output, const half* input,
 
     // 4. (Optional prev layer bias add), Global scale, residual add, relu and
     // bias.
-    globalScale(N, C, output, input, op2, bPrev_, nhwc_, act_, stream);
+    if (activateOutput_) {
+      globalScale(N, C, output, input, op2, bPrev_, nhwc_, act_, stream);
+    }
+    else {
+      globalScale(N, C, output, input, op2, bPrev_, nhwc_, ACTIVATION_NONE, stream);
+    }
+
   }
 }
 
@@ -1613,7 +1161,7 @@ FusedWinogradConvSELayer<DataType>::FusedWinogradConvSELayer(
     BaseLayer<DataType>* ip, int C, int H, int W, int Cin,
     ActivationFunction activation, bool bias, bool skip_add, bool se, int se_k,
     bool use_gemm_ex, bool op_nhcw)
-    : BaseLayer<DataType>(C, H, W, ip, false, use_gemm_ex),
+    : BaseLayer<DataType>(C, H, W, ip, true, use_gemm_ex),
       c_input_(Cin),
       act_(activation),
       use_bias_(bias),
@@ -1857,8 +1405,7 @@ ResidualBlock<DataType>::ResidualBlock(BaseLayer<DataType>* ip, int C, bool se,
                                        int se_k, bool use_gemm_ex, bool first,
 
                                        bool last, ActivationFunction activation,
-                                       int shared_mem_size,
-                                       bool output_nhwc)
+                                       int shared_mem_size)
     : BaseLayer<DataType>(C, 8, 8, ip, ip->isNHWC(), use_gemm_ex),
       has_se_(se),
       se_k_(se_k),
@@ -1866,8 +1413,7 @@ ResidualBlock<DataType>::ResidualBlock(BaseLayer<DataType>* ip, int C, bool se,
       first_block_(first),
       last_block_(last),
       shared_mem_size_(shared_mem_size),
-      act_(activation),
-      output_nhwc_(output_nhwc) {
+      act_(activation) {
   if (act_ != ACTIVATION_RELU && act_ != ACTIVATION_MISH) {
     throw Exception("Unsupported activation for residual block.");
   }
@@ -2051,29 +1597,14 @@ void ResidualBlock<DataType>::Eval(int N, DataType* output,
 
   if (act_ == ACTIVATION_RELU) {
     if (last_block_) {
-      if (has_se_) {
-        if (output_nhwc_)
-          OutputTransform<DataType, true, ACTIVATION_RELU, true, true, true,
-                  true>(N, C, se_k_, output, transformed_output, input,
-                          biases1_, w1_, b1_, w2_, b2_, stream);
-        else
-          OutputTransform<DataType, true, ACTIVATION_RELU, true, true, true,
-                  false>(N, C, se_k_, output, transformed_output, input,
-                          biases1_, w1_, b1_, w2_, b2_, stream);
-      }
-
-      else {
-        if (output_nhwc_)
-          OutputTransform<DataType, false, ACTIVATION_RELU, true, true, true,
-                true>(N, C, se_k_, output, transformed_output, input,
-                        biases1_, w1_, b1_, w2_, b2_, stream);
-        else
-          OutputTransform<DataType, false, ACTIVATION_RELU, true, true, true,
-                false>(N, C, se_k_, output, transformed_output, input,
-                        biases1_, w1_, b1_, w2_, b2_, stream);
-
-      }
-
+      if (has_se_)
+        OutputTransform<DataType, true, ACTIVATION_RELU, true, true, true,
+                        false>(N, C, se_k_, output, transformed_output, input,
+                               biases1_, w1_, b1_, w2_, b2_, stream);
+      else
+        OutputTransform<DataType, false, ACTIVATION_RELU, true, true, true,
+                        false>(N, C, se_k_, output, transformed_output, input,
+                               biases1_, w1_, b1_, w2_, b2_, stream);
     } else {
       if (has_se_) {
         if (allowFusing) {
@@ -2095,29 +1626,14 @@ void ResidualBlock<DataType>::Eval(int N, DataType* output,
     }
   } else if (act_ == ACTIVATION_MISH) {
     if (last_block_) {
-      if (has_se_) {
-        if (output_nhwc_)
-          OutputTransform<DataType, true, ACTIVATION_MISH, true, true, true,
-                  true>(N, C, se_k_, output, transformed_output, input,
-                          biases1_, w1_, b1_, w2_, b2_, stream);
-        else
-          OutputTransform<DataType, true, ACTIVATION_MISH, true, true, true,
-                  false>(N, C, se_k_, output, transformed_output, input,
-                          biases1_, w1_, b1_, w2_, b2_, stream);
-      }
-
-      else {
-        if (output_nhwc_)
-          OutputTransform<DataType, false, ACTIVATION_MISH, true, true, true,
-                true>(N, C, se_k_, output, transformed_output, input,
-                        biases1_, w1_, b1_, w2_, b2_, stream);
-        else
-          OutputTransform<DataType, false, ACTIVATION_MISH, true, true, true,
-                false>(N, C, se_k_, output, transformed_output, input,
-                        biases1_, w1_, b1_, w2_, b2_, stream);
-
-      }
-
+      if (has_se_)
+        OutputTransform<DataType, true, ACTIVATION_MISH, true, true, true,
+                        false>(N, C, se_k_, output, transformed_output, input,
+                               biases1_, w1_, b1_, w2_, b2_, stream);
+      else
+        OutputTransform<DataType, false, ACTIVATION_MISH, true, true, true,
+                        false>(N, C, se_k_, output, transformed_output, input,
+                               biases1_, w1_, b1_, w2_, b2_, stream);
     } else {
       if (has_se_) {
         if (allowFusing) {
@@ -2155,6 +1671,7 @@ ResidualBlock<DataType>::~ResidualBlock() {
     ReportCUDAErrors(cudaFree(b2_));
   }
 }
+
 
 template <typename DataType>
 void allocAndUpload(DataType** gpu_dest, std::vector<float> cpu_src,
@@ -2246,7 +1763,7 @@ EncoderBlock<DataType>::EncoderBlock(
     int size, float alpha, DataType* smolgen_global_scratch,
     int smolgen_global_size, int max_batch_size, ActivationFunction smolgen_act,
     ActivationFunction ffn_act, float default_eps, bool prenorm, bool use_gemm_ex,
-    bool fused_mha)
+    bool fused_mha, const std::vector<float>& attention_mask)
     : embedding_op_size_(size),
       encoder_heads_(heads),
       alpha_(alpha),
@@ -2258,11 +1775,7 @@ EncoderBlock<DataType>::EncoderBlock(
       use_fused_mha_(fused_mha),
       prenorm_(prenorm),
       use_gemm_ex_(use_gemm_ex) {
-  /*
-  mha_q_size_ = cpu_weights.mha.q_b.size();
-  mha_k_size_ = cpu_weights.mha.k_b.size();
-  mha_v_size_ = cpu_weights.mha.v_b.size();
-  */
+
   mha_q_size_ = cpu_weights.mha.q_w.size() / size;
   mha_k_size_ = cpu_weights.mha.k_w.size() / size;
   mha_v_size_ = cpu_weights.mha.v_w.size() / size;
@@ -2324,7 +1837,7 @@ EncoderBlock<DataType>::EncoderBlock(
           cpu_weights.ffn.d_conv.rook_channels,
           cpu_weights.ffn.d_conv.bishop_channels,
           cpu_weights.ffn.d_conv.knight_channels);
-    d_conv->LoadWeights(const_cast<float*>(cpu_weights.ffn.d_conv.weights.data()),
+    d_conv->LoadWeights(cpu_weights.ffn.d_conv.weights,
                         const_cast<float*>(cpu_weights.ffn.d_conv.biases.data()),
                       scratch); 
   }
@@ -2336,12 +1849,7 @@ EncoderBlock<DataType>::EncoderBlock(
     smol_dense_1_size_ = cpu_weights.mha.smolgen.dense1_b.size();
     smol_dense_2_size_ = cpu_weights.mha.smolgen.dense2_b.size();
     smol_global_size_ = smolgen_global_size;
-    /*
-    std::cout<<"smol_compress_size_"<<smol_compress_size_<<std::endl;
-    std::cout<<"smol_dense_1_size_"<<smol_dense_1_size_<<std::endl;
-    std::cout<<"smol_dense_2_size_"<<smol_dense_2_size_<<std::endl;
-    std::cout<<"smol_global_size_"<<smol_global_size_<<std::endl;
-    */
+
     allocAndUpload<DataType>(&smol_compress, cpu_weights.mha.smolgen.compress,
                              scratch);
     allocAndUpload<DataType>(&smol_dense1_w, cpu_weights.mha.smolgen.dense1_w,
@@ -2366,7 +1874,10 @@ EncoderBlock<DataType>::EncoderBlock(
     smol_global = smolgen_global_scratch;
   }
 
-
+  if (!attention_mask.empty()) {
+    has_attention_mask_ = true;
+    allocAndUpload<DataType>(&attention_mask_, attention_mask, scratch);
+  }
 
 }
 
@@ -2376,14 +1887,6 @@ static void cublasXgemm(cublasHandle_t handle, cublasOperation_t transa,
                         float alpha, const DataType* A, int lda,
                         const DataType* B, int ldb, float beta, DataType* C,
                         int ldc) {
-  /*
-  std::cout<<"m "<<m<<std::endl;
-  std::cout<<"n "<<n<<std::endl;
-  std::cout<<"k "<<k<<std::endl;
-  std::cout<<"lda "<<lda<<std::endl;
-  std::cout<<"ldb "<<ldb<<std::endl;
-  std::cout<<"ldc "<<ldc<<std::endl;
-  */
   const bool fp16 = std::is_same<half, DataType>::value;
   if (fp16) {
     unsigned short alpha_h = FP32toFP16(alpha);
@@ -2563,7 +2066,7 @@ static void cublasXGemmBatched(cublasHandle_t handle, cublasOperation_t transa,
   }
 }
 
-// input/output tensor is in_out_tensor, others are used as scratch.
+
 template <typename DataType>
 void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
                                   DataType* scratch, DataType* buffer1,
@@ -2572,65 +2075,58 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
                                   DataType*** offset_pointers) const {
   const int d_model = mha_q_size_;
   const int depth = d_model / encoder_heads_;
-  // Calculate smolgen weights. Do this first so we can make use of
-  // scratch, buffer1 and buffer2.
+
+  if (prenorm_) {
+    LayerNorm<DataType>(N * 64, embedding_op_size_, buffer1, in_out_tensor,
+                        (const DataType*)nullptr, (const DataType*)nullptr,
+                        ln1_gammas, ln1_betas, default_eps_, 1.0f, ACTIVATION_NONE, stream);
+  }
+
+  DataType* mha_src_ptr = prenorm_ ? buffer1 : in_out_tensor;
+  DataType* smol_tmp_buf = prenorm_ ? buffer2 : buffer1;
+
   if (has_smolgen_) {
     {
-      // Compress.
-      // input shape: N, 64, d_model
-      // output shape: N, 64, hidden_channels
       const int num_inputs = d_model;
       const int num_outputs = smol_compress_size_;
       const int batch = N * 64;
       cublasXgemm<DataType>(
           cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch, num_inputs,
-          1.0f, (const DataType*)smol_compress, num_inputs, in_out_tensor,
+          1.0f, (const DataType*)smol_compress, num_inputs, mha_src_ptr,
           num_inputs, 0.0f, scratch, num_outputs);
     }
 
     {
-      // Hidden 1 dense.
-      // input shape: N, 64 * hidden_channels
-      // output shape: N, hidden_sz
       const int num_inputs = 64 * smol_compress_size_;
       const int num_outputs = smol_dense_1_size_;
       const int batch = N;
       cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs,
                             batch, num_inputs, 1.0f,
                             (const DataType*)smol_dense1_w, num_inputs, scratch,
-                            num_inputs, 0.0f, buffer1, num_outputs);
+                            num_inputs, 0.0f, smol_tmp_buf, num_outputs);
 
-      LayerNorm<DataType>(batch, num_outputs, scratch, buffer1, smol_dense1_b,
+      LayerNorm<DataType>(batch, num_outputs, scratch, smol_tmp_buf, smol_dense1_b,
                           (DataType*)nullptr, smol_ln1_gammas, smol_ln1_betas,
                           default_eps_, 1.0, smolgen_activation_, stream);
     }
 
     {
-      // Hidden 2 dense (gen_from)
-      // input shape: N, hidden_sz
-      // output shape: N, heads * gen_sz
       const int num_inputs = smol_dense_1_size_;
       const int num_outputs = smol_dense_2_size_;
       const int batch = N;
       cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs,
                             batch, num_inputs, 1.0f,
                             (const DataType*)smol_dense2_w, num_inputs, scratch,
-                            num_inputs, 0.0f, buffer1, num_outputs);
+                            num_inputs, 0.0f, smol_tmp_buf, num_outputs);
 
-      LayerNorm<DataType>(batch, num_outputs, scratch, buffer1, smol_dense2_b,
+      LayerNorm<DataType>(batch, num_outputs, scratch, smol_tmp_buf, smol_dense2_b,
                           (DataType*)nullptr, smol_ln2_gammas, smol_ln2_betas,
                           default_eps_, 1.0, smolgen_activation_, stream);
     }
 
     {
-      // Final smolgen weights generation.
-      /*
-        gen_from = tf.reshape(gen_from, [-1, heads, gen_sz])
-        out = self.smol_weight_gen_dense(gen_from)
-      */
-      const int num_inputs =
-          smol_dense_2_size_ / encoder_heads_; /* num_inputs == gen_sz == 256 */
-      const int num_outputs = smol_global_size_; /* hwhw: 64 * 64 */
+      const int num_inputs = smol_dense_2_size_ / encoder_heads_;
+      const int num_outputs = smol_global_size_;
       const int batch = N * encoder_heads_;
       cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs,
                             batch, num_inputs, 1.0f,
@@ -2655,43 +2151,31 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
 
     cublasXGemmStridedBatched<DataType>(
         cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch, num_inputs, 1.0f,
-        mha_qkv_w, num_inputs, num_inputs * num_outputs, in_out_tensor,
+        mha_qkv_w, num_inputs, num_inputs * num_outputs, mha_src_ptr,
         num_inputs, 0, 0.0f, mha_q, num_outputs, num_outputs * max_batch, 3,
         use_gemm_ex_);
     if (mha_qkv_b != nullptr) {
       addBiasBatched<DataType>(mha_q, mha_q, mha_qkv_b, 3, batch, num_outputs,
-                              max_batch, ACTIVATION_NONE, stream);
+                               max_batch, ACTIVATION_NONE, stream);
     }
   }
 
-  // Apply split_heads() to q, k and v
-  // which basically transposes (batch_size, 64, num_heads, depth)
-  // to (batch_size, num_heads, 64, depth)
-  // Do we really need to transpose here?
-  // (Maybe not, we can play with strides of the gemm and do independent gemms
-  // for each encoder head)
-
-  // Apply scaled dot product attention:
-  /*
-      matmul_qk = tf.matmul(q, k, transpose_b=True)
-      dk = tf.cast(tf.shape(k)[-1], self.model_dtype)
-      scaled_attention_logits = matmul_qk / tf.math.sqrt(dk)
-      attention_weights = tf.nn.softmax(scaled_attention_logits, axis=-1)
-      output = tf.matmul(attention_weights, v)
-  */
-
-  // shape(k)[-1] = depth
   float factor = 1.0f / sqrt((float)depth);
+
+  bool has_bias = has_smolgen_ || has_attention_mask_;
+  bool is_buffer_initialized = has_smolgen_;
+
+  if (has_attention_mask_) {
+      AddAttentionMask<DataType>(N, encoder_heads_, buffer2, attention_mask_, is_buffer_initialized, stream);
+      is_buffer_initialized = true;
+  }
 
 #ifdef USE_CUTLASS
   if (use_fused_mha_) {
-    // TODO: check if we need skip in a different tensor than same tensor as
-    // output!
-    fusedMHA(buffer2, mha_q, mha_k, mha_v, has_smolgen_ ? buffer2 : nullptr, N,
+    fusedMHA(buffer2, mha_q, mha_k, mha_v, has_bias ? buffer2 : nullptr, N,
              encoder_heads_, depth, stream);
   } else
 #endif
-  // matmul_qk = tf.matmul(q, k, transpose_b=True)
   {
     if (*offset_pointers == nullptr) {
 #ifndef NDEBUG
@@ -2699,8 +2183,7 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
       ReportCUDAErrors(cudaStreamIsCapturing(stream, &capture));
       assert(capture !=
                  cudaStreamCaptureStatus::cudaStreamCaptureStatusActive &&
-             "Stream capture is active, cannot allocate memory for offset "
-             "pointers");
+             "Stream capture is active, cannot allocate memory for offset pointers");
 #endif
       ReportCUDAErrors(
           cudaMalloc((void**)offset_pointers,
@@ -2711,31 +2194,13 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
     }
 
     cublasXGemmBatched<DataType>(
-        cublas, CUBLAS_OP_T, CUBLAS_OP_N, 64 /*M*/, 64 /*N*/,
-        depth /*K*/,  // A/B, and M/N are swapped for row-major to col-major
-                      // transform
-        factor,       // to handle "/ tf.math.sqrt(dk)"
-        *offset_pointers,  // mha_k + offset /*A*/,
-        d_model /*LDA*/,   // (d_model = depth * encoder_heads_) to skip over
-                           // other "depth" slices / heads
-        // 64 * d_model,     /*strideA*/
-        *offset_pointers +
-            encoder_heads_ * max_batch_size_,  // mha_q + offset /*B*/,
-        d_model /*LDB*/,  // to skip over other other "depth" slices / heads
-        // 64 * d_model,     /*strideB*/
-        0.0f,
-        *offset_pointers + encoder_heads_ * max_batch_size_ *
-                               2,  // buffer1 + outOffset /*C*/,  // output
-                                   // (matmul_qk) goes to buffer1
-        64 /*LDC*/,
-        // 64 * 64 /*strideC*/,
+        cublas, CUBLAS_OP_T, CUBLAS_OP_N, 64, 64, depth, factor, 
+        *offset_pointers, d_model,
+        *offset_pointers + encoder_heads_ * max_batch_size_, d_model, 0.0f,
+        *offset_pointers + encoder_heads_ * max_batch_size_ * 2, 64,
         N * encoder_heads_);
 
-    // attention_weights = tf.nn.softmax(scaled_attention_logits, axis = -1)
-    // attention_weights -> buffer1
-    if (has_smolgen_) {
-      // Add smolgen weights to the scaled matmul_qk attention logits before
-      // softmax.
+    if (has_bias) {
       Softmax(encoder_heads_ * N * 64, 64, buffer1, buffer1, buffer2, stream);
     } else {
       Softmax(encoder_heads_ * N * 64, 64, buffer1, buffer1,
@@ -2743,82 +2208,94 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
     }
 
     cublasXGemmBatched<DataType>(
-        cublas, CUBLAS_OP_N, CUBLAS_OP_N, depth /*M*/, 64 /*N*/, 64 /*K*/, 1.0f,
-        *offset_pointers + encoder_heads_ * max_batch_size_ *
-                               3,  // mha_v + offset /*A*/,  // "v" matrix
-        d_model /*LDA*/,           // to skip over other "depth" slices / heads
-        // 64 * d_model,          /*strideA*/
-        *offset_pointers + encoder_heads_ * max_batch_size_ *
-                               2,  // buffer1 + weightsOffset /*B*/,
-        64 /*LDB*/,                // 64 * 64, /*strideB*/
-        0.0f,
-        *offset_pointers +
-            encoder_heads_ * max_batch_size_ *
-                4,  // buffer2 + offset /*C*/,  // output goes to buffer2
-        d_model /*LDC*/,
-        // 64 * d_model /*strideC*/,
+        cublas, CUBLAS_OP_N, CUBLAS_OP_N, depth, 64, 64, 1.0f,
+        *offset_pointers + encoder_heads_ * max_batch_size_ * 3, d_model,
+        *offset_pointers + encoder_heads_ * max_batch_size_ * 2, 64, 0.0f,
+        *offset_pointers + encoder_heads_ * max_batch_size_ * 4, d_model,
         N * encoder_heads_);
   }
 
-  // #final dense layer (mha_dense), buffer2 -> buffer1
   {
     const int num_inputs = d_model;
     const int num_outputs = embedding_op_size_;
     const int batch = N * 64;
-    cublasXgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch,
-                num_inputs, 1.0f, (const DataType*)mha_dense_w, num_inputs,
-                buffer2, num_inputs, 0.0f, buffer1, num_outputs);
+
+    if (prenorm_) {
+      cublasXgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch,
+                  num_inputs, 1.0f, (const DataType*)mha_dense_w, num_inputs,
+                  buffer2, num_inputs, 1.0f, in_out_tensor, num_outputs);
+      if (mha_dense_b != nullptr) {
+        addBiasBatched<DataType>(in_out_tensor, in_out_tensor, mha_dense_b, 1, batch,
+                                 num_outputs, ACTIVATION_NONE, stream);
+      }
+    } else {
+      cublasXgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch,
+                  num_inputs, 1.0f, (const DataType*)mha_dense_w, num_inputs,
+                  buffer2, num_inputs, 0.0f, buffer1, num_outputs);
+
+      LayerNorm<DataType>(N * 64, embedding_op_size_, scratch, buffer1, mha_dense_b,
+                          in_out_tensor, ln1_gammas, ln1_betas, default_eps_,
+                          alpha_, ACTIVATION_NONE, stream);
+    }
   }
 
-  // LN1: skip connection and layer normalization (also bias add of prev gemm)
-  // buffer1/in_out_tensor -> scratch
-  LayerNorm<DataType>(N * 64, embedding_op_size_, scratch, buffer1, mha_dense_b,
-                      in_out_tensor, ln1_gammas, ln1_betas, default_eps_,
-                      alpha_, ACTIVATION_NONE, stream);
+  DataType* ffn_src_ptr = scratch; 
+  DataType* ffn_inter_ptr = prenorm_ ? buffer2 : in_out_tensor;
 
-  // #FFN dense 1, scratch -> in_out_tensor
+  if (prenorm_) {
+    LayerNorm<DataType>(N * 64, embedding_op_size_, ffn_src_ptr, in_out_tensor,
+                        (const DataType*)nullptr, (const DataType*)nullptr,
+                        ln2_gammas, ln2_betas, default_eps_, 1.0f, ACTIVATION_NONE, stream);
+  }
+
+  // #FFN dense 1
   if (d_conv == nullptr) {
-    {
-      const int num_inputs = embedding_op_size_;
-      const int num_outputs = ffn_dense1_size_;  // encoder_dff
-      const int batch = N * 64;
-      cublasXgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch,
-                  num_inputs, 1.0f, (const DataType*)ffn_dense1_w, num_inputs,
-                  scratch, num_inputs, 0.0f, in_out_tensor, num_outputs);
-      addBiasBatched(in_out_tensor, in_out_tensor, ffn_dense1_b, 1, batch,
-                    num_outputs, ffn_activation_, stream);
-    }
-  }
+    const int num_inputs = embedding_op_size_;
+    const int num_outputs = ffn_dense1_size_;
+    const int batch = N * 64;
+    cublasXgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch,
+                num_inputs, 1.0f, (const DataType*)ffn_dense1_w, num_inputs,
+                ffn_src_ptr, num_inputs, 0.0f, ffn_inter_ptr, num_outputs);
+    addBiasBatched(ffn_inter_ptr, ffn_inter_ptr, ffn_dense1_b, 1, batch,
+                   num_outputs, ffn_activation_, stream);
+  } else {
+    const int num_inputs = embedding_op_size_;
+    const int num_outputs = ffn_dense1_size_;
+    const int batch = N * 64;
+    cublasXgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch,
+                num_inputs, 1.0f, (const DataType*)ffn_dense1_w, num_inputs,
+                ffn_src_ptr, num_inputs, 0.0f, buffer1, num_outputs);
+    addBiasBatched(buffer1, buffer1, ffn_dense1_b, 1, batch,
+                   num_outputs, ffn_activation_, stream);
 
-  else {
-    {
-      const int num_inputs = embedding_op_size_;
-      const int num_outputs = ffn_dense1_size_;  // encoder_dff
-      const int batch = N * 64;
-      cublasXgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch,
-                  num_inputs, 1.0f, (const DataType*)ffn_dense1_w, num_inputs,
-                  scratch, num_inputs, 0.0f, buffer1, num_outputs);
-      addBiasBatched(buffer1, buffer1, ffn_dense1_b, 1, batch,
-                    num_outputs, ffn_activation_, stream);
-    }
-
-    d_conv->Eval(N, in_out_tensor, buffer1, nullptr, scratch, 0, nullptr, cublas, stream, offset_pointers);
+    d_conv->Eval(N, ffn_inter_ptr, buffer1, nullptr, scratch, 0, nullptr, cublas, stream, offset_pointers);
   }
 
   {
-    const int num_inputs = ffn_dense1_size_;  // encoder_dff
+    const int num_inputs = ffn_dense1_size_;
     const int num_outputs = embedding_op_size_;
     const int batch = N * 64;
-    cublasXgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch,
-                num_inputs, 1.0f, (const DataType*)ffn_dense2_w, num_inputs,
-                in_out_tensor, num_inputs, 0.0f, buffer1, num_outputs);
+
+    if (prenorm_) {
+      cublasXgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch,
+                  num_inputs, 1.0f, (const DataType*)ffn_dense2_w, num_inputs,
+                  ffn_inter_ptr, num_inputs, 1.0f, in_out_tensor, num_outputs);
+      if (ffn_dense2_b != nullptr) {
+        addBiasBatched<DataType>(in_out_tensor, in_out_tensor, ffn_dense2_b, 1, batch,
+                                 num_outputs, ACTIVATION_NONE, stream);
+      }
+    } else {
+      cublasXgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch,
+                  num_inputs, 1.0f, (const DataType*)ffn_dense2_w, num_inputs,
+                  ffn_inter_ptr, num_inputs, 0.0f, buffer1, num_outputs);
+
+      LayerNorm<DataType>(N * 64, embedding_op_size_, in_out_tensor, buffer1,
+                          ffn_dense2_b, scratch, ln2_gammas, ln2_betas,
+                          default_eps_, alpha_, ACTIVATION_NONE, stream);
+    }
   }
-  // LN2: skip connection and layer normilization (also bias add of prev gemm)
-  // buffer1/scratch -> in_out_tensor
-  LayerNorm<DataType>(N * 64, embedding_op_size_, in_out_tensor, buffer1,
-                      ffn_dense2_b, scratch, ln2_gammas, ln2_betas,
-                      default_eps_, alpha_, ACTIVATION_NONE, stream);
 }
+
 
 template <typename DataType>
 void AttentionPolicyHead<DataType>::Eval(
@@ -2948,6 +2425,7 @@ EncoderBlock<DataType>::~EncoderBlock() {
     ReportCUDAErrors(cudaFree(smol_ln2_gammas));
     ReportCUDAErrors(cudaFree(smol_ln2_betas));
   }
+  if (has_attention_mask_) ReportCUDAErrors(cudaFree(attention_mask_));
 }
 
 template <typename DataType>
@@ -3001,6 +2479,7 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
                             int l2_cache_size,
                             int shared_mem_per_block_optin,
                             bool use_custom_depthwise,
+                            const std::vector<std::vector<float>>& layer_masks,
                             cudnnHandle_t cudnn)     
   : BaseLayer<DataType>(weights.ip_emb_b.size(), 8, 8, nullptr, nhwc, use_gemm_ex),
     embedding_op_size_(weights.ip_emb_b.size()),
@@ -3027,20 +2506,17 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
     smolgen_global_(nullptr),
     ip_mult_gate_(nullptr),
     ip_add_gate_(nullptr),
-    cnn_enc_w_(nullptr),
-    cnn_enc_b_(nullptr),
-    cnn_enc_ln_gammas_(nullptr),
-    cnn_enc_ln_betas_(nullptr),
-    cnn_enc_mult_gate_(nullptr),
-    cnn_enc_add_gate_(nullptr) {
+    final_ln_gammas_(nullptr),
+    final_ln_betas_(nullptr) {
     
-  starts_with_encoder_ = (first_block == "T" || first_block == "B" || first_block == "L");
+  starts_with_encoder_ = (first_block == "T" || first_block == "B" || first_block == "D");
   starts_with_residual_ = first_block == "R";
   starts_with_mobilenet_ = first_block == "M";
   starts_with_convnext_ = first_block == "C";
   BaseLayer<DataType>* prev_layer = nullptr;
   
   int current_channels = input_c_;
+  int encoder_count = 0;
 
   // Deep norm scaling for residual stream
   if (prenorm) {
@@ -3095,7 +2571,7 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
             weights.ip_emb_ffn.d_conv.rook_channels,
             weights.ip_emb_ffn.d_conv.bishop_channels,
             weights.ip_emb_ffn.d_conv.knight_channels);
-        ip_emb_ffn_d_conv_->LoadWeights(const_cast<float*>(weights.ip_emb_ffn.d_conv.weights.data()),
+        ip_emb_ffn_d_conv_->LoadWeights(weights.ip_emb_ffn.d_conv.weights,
                             const_cast<float*>(weights.ip_emb_ffn.d_conv.biases.data()),
                         scratch); 
     }
@@ -3122,6 +2598,24 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
     input_conv_output_channels_ = current_channels;    
   }
 
+  else if (starts_with_residual_){
+    current_channels = weights.input.biases.size();
+    auto input_conv = std::make_unique<ConvLayer<DataType>>(
+            prev_layer, current_channels, 8, 8, 3, input_c_, act_, true, use_gemm_ex,
+            min_batch_size, max_batch_size, cudnn
+    );
+
+    input_conv->LoadWeights(weights.input.weights,
+                              const_cast<float*>(weights.input.biases.data()),
+                          scratch);
+
+    prev_layer = input_conv.get();
+
+    input_conv_ = std::move(input_conv);
+
+    input_conv_output_channels_ = current_channels;   
+  }
+
   // Iterates over each block of the main backbone tower
   for (size_t i = 0; i < weights.tower.size(); ++i) {
       const auto& pb_block = weights.tower[i];
@@ -3146,7 +2640,7 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
       embedding_op_size_ = current_channels;
 
       // ENC -> CNN
-      else if (!pb_block.enc_cnn.biases.empty()) {
+      if (!pb_block.enc_cnn.biases.empty()) {
           node.transition_cnn = std::make_unique<Conv1Layer<DataType>>(
               prev_layer, pb_block.enc_cnn.biases.size(), 8, 8, current_channels,
               act_, true, use_gemm_ex, nhwc_
@@ -3178,14 +2672,15 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
       if (std::holds_alternative<BaseWeights::EncoderLayer>(pb_block.block)) {
           node.type = TowerNode::TRANSFORMER;
           const auto& enc_weights = std::get<BaseWeights::EncoderLayer>(pb_block.block);
+          std::vector<float> mask = (encoder_count < layer_masks.size()) ? layer_masks[encoder_count] : std::vector<float>();
           node.encoder = std::make_unique<EncoderBlock<DataType>>(
               enc_weights, scratch, encoder_head_count_, embedding_op_size_, 
-              prenorm_,
               alpha_,
               smolgen_global_, smolgen_global_size_, max_batch_size,
               activations_.smolgen_activation, activations_.ffn_activation,
-              default_epsilon_, use_gemm_ex, use_fused_mha_
+              default_epsilon_, prenorm_, use_gemm_ex, use_fused_mha_, mask
           );
+          encoder_count++;
       } 
 
       // Mobile Net block
@@ -3205,15 +2700,33 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
         node.cnn_layers.push_back(std::move(conv1));
         current_channels = c_expand;
 
-        auto d_conv = std::make_unique<DepthwiseCustom<DataType>>(c_expand, 8, 8, act_, nhwc_,
-            m_weights.d_conv.rook_channels,
-            m_weights.d_conv.bishop_channels,
-            m_weights.d_conv.knight_channels);
-        d_conv->LoadWeights(const_cast<float*>(m_weights.d_conv.weights.data()),
-                            const_cast<float*>(m_weights.d_conv.biases.data()),
-                        scratch);
-        prev_layer = d_conv.get();
-        node.cnn_layers.push_back(std::move(d_conv));
+        if (use_custom_depthwise_) {
+          auto d_conv = std::make_unique<DepthwiseCustom<DataType>>(c_expand, 8, 8, act_, nhwc_,
+              m_weights.d_conv.rook_channels,
+              m_weights.d_conv.bishop_channels,
+              m_weights.d_conv.knight_channels);
+          d_conv->LoadWeights(m_weights.d_conv.weights,
+                              const_cast<float*>(m_weights.d_conv.biases.data()),
+                          scratch);
+          prev_layer = d_conv.get();
+          node.cnn_layers.push_back(std::move(d_conv));
+        }
+        else {
+          auto d_conv = std::make_unique<DepthwiseConvLayer<DataType>>(prev_layer, c_expand, 8, 8, act_, use_gemm_ex,
+              min_batch_size, max_batch_size,
+              m_weights.d_conv.rook_channels,
+              m_weights.d_conv.bishop_channels,
+              m_weights.d_conv.knight_channels,
+              cudnn
+            );
+          d_conv->LoadWeights(m_weights.d_conv.weights,
+                              const_cast<float*>(m_weights.d_conv.biases.data()),
+                          scratch);
+          prev_layer = d_conv.get();
+          node.cnn_layers.push_back(std::move(d_conv));
+        }
+
+
 
         auto conv2 = std::make_unique<Conv1Layer<DataType>>(prev_layer, 
           m_weights.conv2.biases.size(), 8, 8, current_channels, ACTIVATION_NONE, false, use_gemm_ex, nhwc_);
@@ -3225,12 +2738,55 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
         current_channels = m_weights.conv2.biases.size();
 
         auto se = std::make_unique<SELayer<DataType>>(prev_layer,
-        se_k, false, act_);
+        se_k, false, act_, false);
         se->LoadWeights(const_cast<float*>(m_weights.se.w1.data()),
                         const_cast<float*>(m_weights.se.b1.data()),
                         const_cast<float*>(m_weights.se.w2.data()),
                         const_cast<float*>(m_weights.se.b2.data()),
                         const_cast<float*>(m_weights.conv2.biases.data()),
+                        scratch);
+
+        prev_layer = se.get();
+        node.cnn_layers.push_back(std::move(se));
+      }
+
+      else if (std::holds_alternative<BaseWeights::Residual>(pb_block.block)) {
+        node.type = TowerNode::RESIDUAL;
+        const auto& r_weights = std::get<BaseWeights::Residual>(pb_block.block);
+        int se_k = r_weights.se.b1.size();
+
+        // 1. First Convolution Layer: Reads from prev_layer, writes to intermediate buf
+        auto conv1 = std::make_unique<ConvLayer<DataType>>(
+                prev_layer, current_channels, 8, 8, 3, current_channels, act_, true, use_gemm_ex,
+                min_batch_size, max_batch_size, cudnn
+        );
+
+        conv1->LoadWeights(r_weights.conv1.weights,
+                          const_cast<float*>(r_weights.conv1.biases.data()),
+                          scratch);        
+        
+        prev_layer = conv1.get();
+        node.cnn_layers.push_back(std::move(conv1));
+
+        // 2. Second Convolution Layer: Performs the fused residual skip connection & optional SE
+        auto conv2 = std::make_unique<ConvLayer<DataType>>(
+                prev_layer, current_channels, 8, 8, 3, current_channels, ACTIVATION_NONE, false, use_gemm_ex,
+                min_batch_size, max_batch_size, cudnn
+        );
+
+        conv2->LoadWeights(r_weights.conv2.weights,
+                            nullptr,
+                            scratch);           
+        
+        node.cnn_layers.push_back(std::move(conv2));
+
+        auto se = std::make_unique<SELayer<DataType>>(prev_layer,
+        se_k, true, act_, true);
+        se->LoadWeights(const_cast<float*>(r_weights.se.w1.data()),
+                        const_cast<float*>(r_weights.se.b1.data()),
+                        const_cast<float*>(r_weights.se.w2.data()),
+                        const_cast<float*>(r_weights.se.b2.data()),
+                        const_cast<float*>(r_weights.conv2.biases.data()),
                         scratch);
 
         prev_layer = se.get();
@@ -3255,7 +2811,7 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
             c_weights.d_conv.rook_channels,
             c_weights.d_conv.bishop_channels,
             c_weights.d_conv.knight_channels);
-        d_conv->LoadWeights(const_cast<float*>(c_weights.d_conv.weights.data()),
+        d_conv->LoadWeights(c_weights.d_conv.weights,
                             const_cast<float*>(c_weights.d_conv.biases.data()),
                         scratch);
         prev_layer = d_conv.get();
@@ -3265,23 +2821,14 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
       }      
       node.out_channels = current_channels;
       tower_nodes_.push_back(std::move(node));
+
   }
 
-  // Final encoding for the different heads if the last layer is convolutional
-  if (!weights.cnn_enc_b.empty()) {
-    allocAndUpload<DataType>(&cnn_enc_w_, weights.cnn_enc_w, scratch);
-    allocAndUpload<DataType>(&cnn_enc_b_, weights.cnn_enc_b, scratch);
-    embedding_op_size_ = weights.cnn_enc_b.size();
+  if (!weights.final_ln_gammas.empty()) {
+    allocAndUpload<DataType>(&final_ln_gammas_, weights.final_ln_gammas, scratch);
+    allocAndUpload<DataType>(&final_ln_betas_, weights.final_ln_betas, scratch);
   }
-  if (!weights.cnn_enc_ln_gammas.empty()) {
-    allocAndUpload<DataType>(&cnn_enc_ln_gammas_, weights.cnn_enc_ln_gammas, scratch);
-    allocAndUpload<DataType>(&cnn_enc_ln_betas_, weights.cnn_enc_ln_betas, scratch);
-    embedding_op_size_ = weights.cnn_enc_ln_gammas.size();
-  }
-  if (!weights.cnn_enc_mult_gate.empty()) {
-    allocAndUpload<DataType>(&cnn_enc_mult_gate_, weights.cnn_enc_mult_gate, scratch);
-    allocAndUpload<DataType>(&cnn_enc_add_gate_, weights.cnn_enc_add_gate, scratch);
-  }
+
   prev_layer = this;
   this->C = current_channels;
 }
@@ -3293,24 +2840,11 @@ void Backbone<DataType>::Eval(int N, DataType* output,
                               size_t scratch_size, cudnnHandle_t cudnn,
                               cublasHandle_t cublas, cudaStream_t stream,
                               DataType*** offset_pointers) {
-  DataType* flow;
-  DataType* buf0;    
-  
-  if (cnn_enc_w_ == nullptr && cnn_enc_ln_betas_ != nullptr) {
-    /*
-      Final layer norm with no dense layer : maintain the residual flow in the input pointer, 
-      and the final layernorm returns it gracefully to the output tensor without having to copy anything from 
-      global memory. 
-    */
-    flow = (DataType*)input; 
-    buf0 = (DataType*)output; 
-  }
-  else {
-    flow = (DataType*)output; 
-    buf0 = (DataType*)input; 
-  }
- 
+
+  DataType* flow = (DataType*)output; 
+  DataType* buf0 = (DataType*)input; 
   DataType* buf1 = (DataType*)input2;  
+ 
   DataType* buf2 = buf1 + scratch_size / (2 * sizeof(DataType));
 
   DataType* temp = (DataType*)scratch;
@@ -3323,7 +2857,7 @@ void Backbone<DataType>::Eval(int N, DataType* output,
       const int num_inputs = 64 * 12;
       const int batch = N;
 
-      convertNCHWtoNHWC(temp, (DataType*)input, N, inputC, N, 12, 8, 8, stream);
+      convertNCHWtoNHWC(temp, buf0, N, inputC, N, 12, 8, 8, stream);
       cublasXgemm<DataType>(
           cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch, num_inputs,
           1.0f, (const DataType*)ip_emb_pre_w_, num_inputs,
@@ -3387,11 +2921,10 @@ void Backbone<DataType>::Eval(int N, DataType* output,
       current_channels = embedding_op_size_;
   }
 
-  else if (starts_with_mobilenet_ || starts_with_convnext_) {
+  else if (starts_with_mobilenet_ || starts_with_convnext_ || starts_with_residual_) {
       input_conv_->Eval(N, flow, buf0, nullptr, (DataType*)scratch, scratch_size, cudnn, cublas, stream, offset_pointers);
       current_channels = input_conv_output_channels_;
   }
-
 
   //int b_idx = -1;
   for (auto& node : tower_nodes_) {
@@ -3454,6 +2987,12 @@ void Backbone<DataType>::Eval(int N, DataType* output,
         node.cnn_layers[3]->Eval(N, flow, buf0, flow, temp, scratch_size, cudnn, cublas, stream, offset_pointers);
       }
 
+      else if (node.type == TowerNode::RESIDUAL) {
+        node.cnn_layers[0]->Eval(N, buf0, flow, nullptr, temp, scratch_size, cudnn, cublas, stream, offset_pointers);
+        node.cnn_layers[1]->Eval(N, buf1, buf0, nullptr, temp, scratch_size, cudnn, cublas, stream, offset_pointers);
+        node.cnn_layers[2]->Eval(N, flow, buf1, flow, temp, scratch_size, cudnn, cublas, stream, offset_pointers);
+      }
+
       else if (node.type == TowerNode::CONVNEXT) {
 
         node.cnn_layers[0]->Eval(N, buf0, flow, nullptr, temp, scratch_size, cudnn, cublas, stream, offset_pointers);
@@ -3487,37 +3026,27 @@ void Backbone<DataType>::Eval(int N, DataType* output,
       current_channels = node.out_channels;
   }
 
-  flow = (DataType*)output;
-  DataType* buf0 = (DataType*)input;  
-
-  if (cnn_enc_w_ != nullptr) {
+  
+  if (final_ln_gammas_ != nullptr) {
       const int batch = N * 64; 
-      const int num_inputs = current_channels;     
-      const int num_outputs = embedding_op_size_;  
-      cublasXgemm<DataType>(
-          cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch, num_inputs, 1.0f, 
-          (const DataType*)cnn_enc_w_, num_inputs, flow, num_inputs, 0.0f, buf0, num_outputs
-      );
-
-      if (cnn_enc_ln_gammas_ == nullptr) {
-          addBiasBatched(flow, buf0, node.dense_b, 1, batch, num_outputs, ACTIVATION_NONE, stream);
-      }
+      // Read from flow (output), write out-of-place to buf1 (input2)
+      LayerNormInPlace<DataType>(batch, current_channels, flow, final_ln_gammas_, final_ln_betas_, 
+        default_epsilon_, stream);
   }
+  
 
-  if (cnn_enc_ln_gammas_ != nullptr) {
+  /*
+  if (final_ln_gammas_ != nullptr) {
       const int batch = N * 64; 
-      const int num_inputs = current_channels;     
-      const int num_outputs = embedding_op_size_;  
-      LayerNorm<DataType>(batch, num_outputs, flow, buf0, cnn_enc_b_, (DataType*)nullptr, 
-                  cnn_enc_ln_gammas_, cnn_enc_ln_betas_, default_epsilon_, 1.0, ACTIVATION_NONE, stream);
-  }
+      // Read from flow (output), write out-of-place to buf1 (input2)
+      LayerNorm<DataType>(batch, current_channels, buf1, flow, nullptr, (DataType*)nullptr, 
+                          final_ln_gammas_, final_ln_betas_, default_epsilon_, 1.0, ACTIVATION_NONE, stream);
+      
+      // Copy the final safely-normalized result back into the expected output tensor
+      cudaMemcpyAsync(output, buf1, N * current_channels * 64 * sizeof(DataType), cudaMemcpyDeviceToDevice, stream);
+  }*/
+  
 
-  if (cnn_enc_mult_gate_ != nullptr) {
-    const int num_outputs = embedding_op_size_;  
-    applyInputGating<DataType>(flow, flow, cnn_enc_mult_gate_, cnn_enc_add_gate_, N, 64, num_outputs, stream);
-  }
-
-  current_channels = embedding_op_size;
 }
 
 template <typename DataType>
@@ -3578,20 +3107,11 @@ Backbone<DataType>::~Backbone() {
       }
   }
 
-  if (cnn_enc_w_ != nullptr ) {
-      ReportCUDAErrors(cudaFree(cnn_enc_w_));
-      ReportCUDAErrors(cudaFree(cnn_enc_b_));
+  if (final_ln_gammas_ != nullptr) {
+      ReportCUDAErrors(cudaFree(final_ln_gammas_));
+      ReportCUDAErrors(cudaFree(final_ln_betas_));
   }
 
-  if (cnn_enc_ln_gammas_ != nullptr) {
-      ReportCUDAErrors(cudaFree(cnn_enc_ln_gammas_));
-      ReportCUDAErrors(cudaFree(cnn_enc_ln_betas_));
-  }
-
-  if (cnn_enc_mult_gate_ != nullptr) {
-      ReportCUDAErrors(cudaFree(cnn_enc_mult_gate_));
-      ReportCUDAErrors(cudaFree(cnn_enc_add_gate_));
-  }
 }
 
 
@@ -3670,7 +3190,7 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
         enc, scratch, encoder_head_count_, embedding_op_size_, alpha,
         smolgen_global_, smolgen_global_size_, max_batch_size,
         activations_.smolgen_activation, activations_.ffn_activation,
-        is_pe_dense_embedding_ ? 1e-3 : 1e-6, use_gemm_ex, use_fused_mha_);
+        is_pe_dense_embedding_ ? 1e-3 : 1e-6, false, use_gemm_ex, use_fused_mha_);
     encoder_weights_.emplace_back(pW);
   }
 }

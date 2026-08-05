@@ -52,14 +52,14 @@
 #undef cudaEventRecordExternal
 #endif
 
-/*
+
 namespace {
 std::vector<std::vector<float>> BuildChessFormerMasks(const lczero::WeightsFile& file, int num_heads, int num_layers) {
     std::vector<std::vector<float>> layer_masks(num_layers);
     
     auto network_format = file.format().network_format();
     for (const auto& am : network_format.attention_masks()) {
-        std::string piece(am.piece_type());
+        std::string pattern(am.pattern());
 
         std::vector<uint32_t> target_layers;
         if (am.layer_indices_size() == 0) {
@@ -82,13 +82,14 @@ std::vector<std::vector<float>> BuildChessFormerMasks(const lczero::WeightsFile&
 
                         bool valid = false;
                         if (i == j) valid = true;
-                        else if (piece == "rook" && (dr == 0 || dc == 0)) valid = true;
-                        else if (piece == "bishop" && (dr == dc)) valid = true;
-                        else if (piece == "knight" && ((dr == 2 && dc == 1) || (dr == 1 && dc == 2))) valid = true;
-                        else if (piece == "queen" && (dr == 0 || dc == 0 || dr == dc)) valid = true;
-                        else if (piece == "king" && (dr <= 1 && dc <= 1)) valid = true;
-                        else if (piece == "pawn" && ((dr == 1 && dc <= 1) || (dr == 2 && dc == 0))) valid = true;
-                        else if (piece == "color" && ((r1 + c1) % 2 == (r2 + c2) % 2)) valid = true;
+                        else if (pattern == "rook" && (dr == 0 || dc == 0)) valid = true;
+                        else if (pattern == "bishop" && (dr == dc)) valid = true;
+                        else if (pattern == "knight" && ((dr == 2 && dc == 1) || (dr == 1 && dc == 2))) valid = true;
+                        else if (pattern == "queen" && (dr == 0 || dc == 0 || dr == dc)) valid = true;
+                        else if (pattern == "king" && (dr <= 1 && dc <= 1)) valid = true;
+                        else if (pattern == "pawn" && ((dr == 1 && dc <= 1) || (dr == 2 && dc == 0))) valid = true;
+                        else if (pattern == "color" && ((r1 + c1) % 2 == (r2 + c2) % 2)) valid = true;
+                        else if (pattern == "all" && (dr == 0 || dc == 0 || dr == dc || (dr == 2 && dc == 1) || (dr == 1 && dc == 2))) valid = true;
                 
                         if (!valid) {
                             if (layer_masks[l].empty()) {
@@ -105,7 +106,7 @@ std::vector<std::vector<float>> BuildChessFormerMasks(const lczero::WeightsFile&
     return layer_masks;
 }
 }
-*/
+
 
 namespace lczero {
 using namespace cudnn_backend;
@@ -300,6 +301,9 @@ class CudaNetwork : public Network {
     if (max_batch_size_ < min_batch_size_)
       throw Exception("Max batch must not be less than min_batch setting.");
 
+    nhwc_ = options.GetOrDefault<bool>("nhwc", true);
+    custom_depthwise_ = options.GetOrDefault<bool>("custom_depthwise", true);
+
     showInfo();
 
 #ifdef USE_CUTLASS
@@ -326,8 +330,6 @@ class CudaNetwork : public Network {
 
     multi_stream_ = options.GetOrDefault<bool>("multi_stream", false);
 
-    nhwc_ = options.GetOrDefault<bool>("nhwc", true);
-    custom_depthwise_ = options.GetOrDefault<bool>("custom_depthwise", true);
 
     std::cout<<"NHWC layout : "<<nhwc_<<std::endl;
     std::cout<<"Custom depthwise : "<<custom_depthwise_<<std::endl;
@@ -526,6 +528,9 @@ class CudaNetwork : public Network {
               : static_cast<ActivationFunction>(ffn_activation);
       activations.default_activation = act;
 
+      std::vector<std::vector<float>> attention_masks = 
+        BuildChessFormerMasks(file, weights.encoder_head_count, encoder_blocks_);
+
       auto backbone = std::make_unique<Backbone<DataType>>(
         weights,
         scratch_mem_,
@@ -546,7 +551,8 @@ class CudaNetwork : public Network {
         allow_cache_opt_,
         l2_cache_size_,
         deviceProp.sharedMemPerBlockOptin,
-        true,
+        custom_depthwise_,
+        attention_masks,
         cudnn_
       );
      
@@ -822,7 +828,7 @@ class CudaNetwork : public Network {
     }
 
     
-    if (nhwc_ && (first_block_ == "M" || first_block_ == "C")) {
+    if (nhwc_ && (first_block_ == "M" || first_block_ == "C" || first_block_ == "R")) {
       expandPlanes_NHWC(tensor_mem[0], ipDataMasks, ipDataValues,
                 batchSize * kInputPlanes, compute_stream);
     }
@@ -848,7 +854,7 @@ class CudaNetwork : public Network {
           batchSize, tensor_mem[1],
           tensor_mem[0],
           tensor_mem[2], scratch_mem,
-          scratch_size_, nullptr, cublas, compute_stream,
+          scratch_size_, cudnn_, cublas, compute_stream,
           offset_pointers);  // Entire attention body of the network
 
       flow = tensor_mem[1];
@@ -1208,6 +1214,7 @@ class CudaNetwork : public Network {
       CERR << "WARNING: you will probably get better performance from the "
               "cuda-fp16 backend.";
     }
+    CERR << "Custom depthwise: " << custom_depthwise_;
   }
 };
 

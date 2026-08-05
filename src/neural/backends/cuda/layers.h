@@ -86,49 +86,45 @@ class BaseLayer {
 };
 
 #ifdef USE_CUDNN
+namespace fe = cudnn_frontend;
+
 template <typename DataType>
 class ConvLayer : public BaseLayer<DataType> {
-  using BaseLayer<DataType>::C;
-  using BaseLayer<DataType>::H;
-  using BaseLayer<DataType>::W;
-  using BaseLayer<DataType>::GetC;
-  using BaseLayer<DataType>::GetH;
-  using BaseLayer<DataType>::GetW;
-  using BaseLayer<DataType>::nhwc_;
-
  public:
-  ConvLayer(BaseLayer<DataType>* ip, int C, int H, int W, int size, int Cin,
-            ActivationFunction activation = ACTIVATION_NONE, bool bias = false);
-
-  ConvLayer(bool nhwc, int C, int H, int W, int size, int Cin,
-            ActivationFunction activation = ACTIVATION_NONE, bool bias = false);
-
+  ConvLayer(BaseLayer<DataType>* prev, int C, int height, int width,
+            int filter, int Cin, ActivationFunction act, bool bias, bool use_gemm_ex,
+            int min_batch_size, int max_batch_size, cudnnHandle_t cudnn);
   ~ConvLayer();
-  void LoadWeights(float* pfilter, float* pBias, void* scratch);
-  void Eval(int N, DataType* output, const DataType* input,
-            const DataType* input2, void* scratch, size_t scratch_size,
-            cudnnHandle_t cudnn, cublasHandle_t cublas, cudaStream_t stream,
-            DataType*** = nullptr) override;
+
+  void LoadWeights(const std::vector<float>& weights, float* biases, void* scratch);
+
+  void Eval(int batch_size, DataType* output, const DataType* input,
+            const DataType* skip, void* scratch, size_t scratch_size,
+            cudnnHandle_t cudnn, cublasHandle_t cublas,
+            cudaStream_t stream, DataType*** offset_pointers = nullptr) override;
 
  private:
-  const int c_input_;
-  const int filter_size_;
-  const ActivationFunction act_;
-  const bool use_bias_;
+  void EnsureGraph(int batch_size, cudnnHandle_t cudnn);
 
-  DataType* biases = nullptr;
-  DataType* weights = nullptr;
+  int c_input_;
+  int filter_size_;
+  ActivationFunction act_;
+  bool use_bias_;
 
-  cudnnFilterDescriptor_t filter_desc_;
-  cudnnConvolutionDescriptor_t conv_desc_;
-  cudnnConvolutionFwdAlgo_t conv_algo_;
+  DataType* weights_ = nullptr;
+  DataType* biases_ = nullptr;
 
-  cudnnTensorDescriptor_t bias_desc_;
-  cudnnTensorDescriptor_t in_tensor_desc_;
-  cudnnTensorDescriptor_t out_tensor_desc_;
-  cudnnActivationDescriptor_t activation_;
-
-  void init();
+  // Modern cuDNN Graph API requires caching the graph per dynamic batch_size
+  struct GraphPlan {
+      std::shared_ptr<fe::graph::Graph> graph;
+      std::shared_ptr<fe::graph::Tensor_attributes> X;
+      std::shared_ptr<fe::graph::Tensor_attributes> W;
+      std::shared_ptr<fe::graph::Tensor_attributes> B;
+      std::shared_ptr<fe::graph::Tensor_attributes> Y;
+      int64_t workspace_size;
+  };
+  
+  std::unordered_map<int, GraphPlan> plans_;
 };
 #endif
 
@@ -210,6 +206,30 @@ class SELayer : public BaseLayer<DataType> {
   bool addPrevLayerBias_;
   const ActivationFunction act_;
   bool activateOutput_;
+};
+
+
+template <typename DataType>
+class SELayerNoSkip : public BaseLayer<DataType> {
+ public:
+  SELayerNoSkip(BaseLayer<DataType>* ip, int fc1Outputs, 
+                ActivationFunction activation);
+  ~SELayerNoSkip();
+
+  void LoadWeights(float* w1, float* b1, float* w2, float* b2, void* scratch);
+  
+  void Eval(int N, DataType* output, const DataType* input, const DataType* input2,
+            void* scratch, size_t scratch_size, cudnnHandle_t cudnn,
+            cublasHandle_t cublas, cudaStream_t stream, DataType*** offset_pointers = nullptr) override;
+
+ private:
+  int numFc1Out_;
+  ActivationFunction act_;
+
+  DataType* w1_;
+  DataType* w2_;
+  DataType* b1_;
+  DataType* b2_;
 };
 
 // Multi-pass Winograd Conv fused with (optional) SE
@@ -390,10 +410,12 @@ class DepthwiseConvLayer : public BaseLayer<DataType> {
   // padding = 2 for a 5x5 kernel to maintain the 8x8 spatial dimensions
   DepthwiseConvLayer(BaseLayer<DataType>* prev, int channels, int height,
                      int width, ActivationFunction act, bool use_gemm_ex,
-                     int min_batch_size, int max_batch_size, cudnnHandle_t cudnn);
+                     int min_batch_size, int max_batch_size, 
+                     int rook_channels, int bishop_channels, int knight_channels,
+                     cudnnHandle_t cudnn);
   ~DepthwiseConvLayer();
 
-  void LoadWeights(float* weights, float* biases, void* scratch);
+  void LoadWeights(const std::vector<float>& weights, float* biases, void* scratch);
 
   void Eval(int batch_size, DataType* output, const DataType* input,
             const DataType* skip, void* scratch, size_t scratch_size,
@@ -405,6 +427,9 @@ class DepthwiseConvLayer : public BaseLayer<DataType> {
 
   int channels_;
   ActivationFunction act_;
+  int rook_channels_;
+  int bishop_channels_;
+  int knight_channels_;
 
   DataType* weights_ = nullptr;
   DataType* biases_ = nullptr;
@@ -507,7 +532,8 @@ class EncoderBlock {
                ActivationFunction ffn_act, float default_eps, 
                bool prenorm,
                bool use_gemm_ex,
-               bool fused_mha);
+               bool fused_mha,
+              const std::vector<float>& attention_mask = {});
   ~EncoderBlock();
 
   void Eval(int N, DataType* inpop, DataType* scratch0, DataType* scratch1,
@@ -567,14 +593,9 @@ class EncoderBlock {
   const int max_batch_size_;
   const bool use_fused_mha_;
   const bool use_gemm_ex_;
-  /*
-  DataType* rpe_q_expanded_ = nullptr;
-  DataType* rpe_k_expanded_ = nullptr;
-  DataType* rpe_v_expanded_ = nullptr;
-  bool has_rpe_q_ = false;
-  bool has_rpe_k_ = false;
-  bool has_rpe_v_ = false;
-  */
+
+  bool has_attention_mask_ = false;
+  DataType* attention_mask_ = nullptr;
 };
 
 // The Attention policy head implementation
@@ -755,7 +776,8 @@ class Backbone : public BaseLayer<DataType> {
                 int l2_cache_size,
                 int shared_mem_per_block_optin,
                 bool use_custom_depthwise, 
-                cudnnHandle_t cudnn);
+                const std::vector<std::vector<float>>& layer_masks = {},
+                cudnnHandle_t cudnn = nullptr);
   ~Backbone();
   void Eval(int N, DataType* output, const DataType* input,
             const DataType* input2, void* scratch, size_t scratch_size,

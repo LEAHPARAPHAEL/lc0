@@ -159,19 +159,263 @@ BaseLayer<DataType>::BaseLayer(int c, int h, int w, BaseLayer* ip)
 
 #ifdef USE_CUDNN
 template <typename DataType>
-ConvLayer<DataType>::ConvLayer(
-    BaseLayer<DataType>* prev, int C, int height, int width,
-    int filter, int Cin, ActivationFunction act, bool bias, bool use_gemm_ex,
-    int min_batch_size, int max_batch_size, cudnnHandle_t cudnn)
-    : BaseLayer<DataType>(C, height, width, prev, true, use_gemm_ex),
+void ConvLayer<DataType>::init() {
+  // Allocate memory for weights (filter tensor) and biases.
+  const size_t weight_size =
+      sizeof(DataType) * c_input_ * C * filter_size_ * filter_size_;
+  ReportCUDAErrors(cudaMalloc(&weights, weight_size));
+
+  const size_t bias_size = sizeof(DataType) * C;
+  ReportCUDAErrors(cudaMalloc(&biases, bias_size));
+
+  const bool fp16 = std::is_same<half, DataType>::value;
+  const cudnnDataType_t dataType =
+      std::is_same<half, DataType>::value ? CUDNN_DATA_HALF : CUDNN_DATA_FLOAT;
+
+  const cudnnTensorFormat_t layout =
+      nhwc_ ? CUDNN_TENSOR_NHWC : CUDNN_TENSOR_NCHW;
+
+  // Create cudnn objects for various tensors, algorithms, etc.
+  cudnnCreateFilterDescriptor(&filter_desc_);
+  cudnnCreateConvolutionDescriptor(&conv_desc_);
+  cudnnCreateTensorDescriptor(&out_tensor_desc_);
+  cudnnCreateTensorDescriptor(&in_tensor_desc_);
+  cudnnCreateTensorDescriptor(&bias_desc_);
+  cudnnCreateActivationDescriptor(&activation_);
+
+  cudnnSetFilter4dDescriptor(filter_desc_, dataType, layout, GetC(), c_input_,
+                             filter_size_, filter_size_);
+
+  ReportCUDNNErrors(
+      cudnnSetTensor4dDescriptor(bias_desc_, layout, dataType, 1, C, 1, 1));
+
+  const int padding = filter_size_ / 2;
+  const bool crossCorr = 1;
+
+  ReportCUDNNErrors(cudnnSetConvolution2dDescriptor(
+      conv_desc_, padding, padding, 1, 1, 1, 1,
+      crossCorr ? CUDNN_CROSS_CORRELATION : CUDNN_CONVOLUTION, dataType));
+
+  if (fp16 && nhwc_)
+    ReportCUDNNErrors(
+        cudnnSetConvolutionMathType(conv_desc_, CUDNN_TENSOR_OP_MATH));
+
+  // TODO: dynamic selection of algorithm!
+  if ((C > 32) && (!nhwc_) && (filter_size_ > 1)) {
+    conv_algo_ = CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED;
+  } else {
+    conv_algo_ = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
+  }
+
+  if (act_ == ACTIVATION_RELU) {
+    cudnnSetActivationDescriptor(activation_, CUDNN_ACTIVATION_RELU,
+                                 CUDNN_NOT_PROPAGATE_NAN, 0.0);
+  }
+#if CUDNN_MAJOR != 7 || CUDNN_MINOR != 0
+  else {
+    cudnnSetActivationDescriptor(activation_, CUDNN_ACTIVATION_IDENTITY,
+                                 CUDNN_NOT_PROPAGATE_NAN, 0.0);
+  }
+#endif
+}
+
+template <typename DataType>
+ConvLayer<DataType>::ConvLayer(BaseLayer<DataType>* ip, int C, int H, int W,
+                               int filter, int Cin,
+                               ActivationFunction activation, bool bias)
+    : BaseLayer<DataType>(C, H, W, ip),
       c_input_(Cin),
       filter_size_(filter),
-      act_(act),
+      act_(activation),
       use_bias_(bias) {
+  init();
+}
 
+template <typename DataType>
+ConvLayer<DataType>::ConvLayer(bool nhwc, int C, int H, int W, int filter,
+                               int Cin, ActivationFunction activation,
+                               bool bias)
+    : BaseLayer<DataType>(C, H, W, nullptr, nhwc),
+      c_input_(Cin),
+      filter_size_(filter),
+      act_(activation),
+      use_bias_(bias) {
+  init();
+}
+
+template <>
+void ConvLayer<half>::LoadWeights(float* pfilter, float* pBias, void* scratch) {
+  const size_t weight_size =
+      sizeof(float) * c_input_ * C * filter_size_ * filter_size_;
+  const size_t bias_size = sizeof(float) * C;
+  // Also need to convert from fp32 NCHW to fp16 NHWC
+  // first copy from CPU memory to scratch space in GPU memory
+  // and then do the type / layout conversion using a kernel.
+  assert(scratch);
+  ReportCUDAErrors(
+      cudaMemcpy(scratch, pfilter, weight_size, cudaMemcpyHostToDevice));
+
+  if (nhwc_) {
+    convertNCHWtoNHWC((half*)weights, (float*)scratch, C, c_input_, C, c_input_,
+                      filter_size_, filter_size_, 0);
+  } else {
+    copyTypeConverted((half*)weights, (float*)scratch,
+                      C * c_input_ * filter_size_ * filter_size_, 0);
+  }
+
+  if (pBias) {
+    ReportCUDAErrors(
+        cudaMemcpy(scratch, pBias, bias_size, cudaMemcpyHostToDevice));
+
+    copyTypeConverted((half*)biases, (float*)scratch, C, 0);
+  }
+}
+
+template <>
+void ConvLayer<float>::LoadWeights(float* pfilter, float* pBias,
+                                   void* /*scratch*/) {
+  const size_t weight_size =
+      sizeof(float) * c_input_ * C * filter_size_ * filter_size_;
+  const size_t bias_size = sizeof(float) * C;
+  ReportCUDAErrors(
+      cudaMemcpy(weights, pfilter, weight_size, cudaMemcpyHostToDevice));
+
+  if (pBias) {
+    ReportCUDAErrors(
+        cudaMemcpy(biases, pBias, bias_size, cudaMemcpyHostToDevice));
+  } else {
+    ReportCUDAErrors(cudaMemset(biases, 0, bias_size));
+  }
+}
+
+template <typename DataType>
+void ConvLayer<DataType>::Eval(int N, DataType* output, const DataType* input,
+                               const DataType* input2, void* scratch,
+                               size_t scratch_size, cudnnHandle_t cudnn,
+                               cublasHandle_t /*cublas*/, cudaStream_t stream,
+                               DataType***) {
+  const cudnnDataType_t dataType =
+      std::is_same<half, DataType>::value ? CUDNN_DATA_HALF : CUDNN_DATA_FLOAT;
+
+  const cudnnTensorFormat_t layout =
+      nhwc_ ? CUDNN_TENSOR_NHWC : CUDNN_TENSOR_NCHW;
+
+  ReportCUDNNErrors(cudnnSetTensor4dDescriptor(out_tensor_desc_, layout,
+                                               dataType, N, C, H, W));
+
+  ReportCUDNNErrors(cudnnSetTensor4dDescriptor(in_tensor_desc_, layout,
+                                               dataType, N, c_input_, H, W));
+
+  float alpha = 1.0f, beta = 0.0f;
+
+  if (!(act_ != ACTIVATION_NONE || use_bias_ || input2)) {
+    ReportCUDNNErrors(cudnnConvolutionForward(
+        cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
+        conv_desc_, conv_algo_, scratch, scratch_size, &beta, out_tensor_desc_,
+        output));
+  }
+#if CUDNN_MAJOR != 7 || CUDNN_MINOR != 0
+  else if (input2 && (act_ == ACTIVATION_RELU || act_ == ACTIVATION_NONE) &&
+           use_bias_) {
+    // fused bias + sum + relu!
+    ReportCUDNNErrors(cudnnConvolutionBiasActivationForward(
+        cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
+        conv_desc_, conv_algo_, scratch, scratch_size, &alpha, out_tensor_desc_,
+        input2, bias_desc_, biases, activation_, out_tensor_desc_, output));
+  } else {
+    // For some reason cudnn doesn't support just Convolution + Bias with nchw
+    // (winograd algorithm) it works fine when RELU is also needed which is
+    // somewhat strange.
+    if ((act_ == ACTIVATION_RELU || (act_ == ACTIVATION_NONE && nhwc_)) &&
+        !input2 && use_bias_) {
+      ReportCUDNNErrors(cudnnConvolutionBiasActivationForward(
+          cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
+          conv_desc_, conv_algo_, scratch, scratch_size, &beta,
+          out_tensor_desc_, output, bias_desc_, biases, activation_,
+          out_tensor_desc_, output));
+    } else {
+      // The no special case path...
+      ReportCUDNNErrors(cudnnConvolutionForward(
+          cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
+          conv_desc_, conv_algo_, scratch, scratch_size, &beta,
+          out_tensor_desc_, output));
+      bool act_done = false;
+      if (input2 && input2 != output) {
+        // Merge act with residual add unless there is bias.
+        addVectors(output, output, (DataType*)input2, N * C * H * W,
+                   N * C * H * W, N * C * H * W,
+                   use_bias_ ? ACTIVATION_NONE : act_, stream);
+        act_done = !use_bias_;
+      }
+      // Merge act with bias.
+      if (use_bias_) {
+        if (!nhwc_) {
+          // add bias
+          addBias_NCHW(output, output, biases, N, C, H, W, act_, stream);
+        } else {
+          addVectors(output, output, biases, N * C * H * W, N * C * H * W, C,
+                     act_, stream);
+        }
+      } else if (!act_done && act_ != ACTIVATION_NONE) {
+        addVectors(output, output, (DataType*)nullptr, N * C * H * W,
+                   N * C * H * W, 0, act_, stream);
+      }
+    }
+  }
+#else
+  else {
+    ReportCUDNNErrors(cudnnConvolutionForward(
+        cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
+        conv_desc_, conv_algo_, scratch, scratch_size,
+        (input2 == output) ? &alpha : &beta, out_tensor_desc_, output));
+    if (input2 && input2 != output) {
+      ReportCUDNNErrors(cudnnAddTensor(cudnn, &alpha, out_tensor_desc_, input2,
+                                       &alpha, out_tensor_desc_, output));
+    }
+    if (use_bias_) {
+      ReportCUDNNErrors(cudnnAddTensor(cudnn, &alpha, bias_desc_, biases,
+                                       &alpha, out_tensor_desc_, output));
+    }
+    if (act_ == ACTIVATION_RELU) {
+      ReportCUDNNErrors(cudnnActivationForward(cudnn, activation_, &alpha,
+                                               out_tensor_desc_, output, &beta,
+                                               out_tensor_desc_, output));
+    }
+    if (act_ != ACTIVATION_RELU && act_ != ACTIVATION_NONE) {
+      addVectors(output, output, nullptr, N * C * H * W, N * C * H * W, 0, act_,
+                 stream);
+      // TODO: check this actually compiles?
+    }
+  }
+#endif
+}
+
+template <typename DataType>
+ConvLayer<DataType>::~ConvLayer() {
+  ReportCUDAErrors(cudaFree(weights));
+  ReportCUDAErrors(cudaFree(biases));
+
+  cudnnDestroyFilterDescriptor(filter_desc_);
+  cudnnDestroyConvolutionDescriptor(conv_desc_);
+  cudnnDestroyTensorDescriptor(bias_desc_);
+  cudnnDestroyTensorDescriptor(in_tensor_desc_);
+  cudnnDestroyTensorDescriptor(out_tensor_desc_);
+  cudnnDestroyActivationDescriptor(activation_);
+}
+
+/*
+template <typename DataType>
+DepthwiseConvLayer<DataType>::DepthwiseConvLayer(
+    BaseLayer<DataType>* prev, int channels, int height, int width,
+    ActivationFunction act, bool use_gemm_ex,  int min_batch_size, int max_batch_size, 
+    cudnnHandle_t cudnn)
+    : BaseLayer<DataType>(channels, height, width, prev, true, use_gemm_ex),
+      channels_(channels),
+      act_(act) {
+  
   for (int b = 1; b <= 32; b *= 2) {
         if (b >= min_batch_size) EnsureGraph(b, cudnn);
-  }
+    }
 
   int start_batch = std::max(32, GetPaddedBatchSize(min_batch_size));
   int max_padded_batch = GetPaddedBatchSize(max_batch_size);
@@ -182,147 +426,388 @@ ConvLayer<DataType>::ConvLayer(
 }
 
 template <typename DataType>
-ConvLayer<DataType>::~ConvLayer() {
+DepthwiseConvLayer<DataType>::~DepthwiseConvLayer() {
   if (weights_) ReportCUDAErrors(cudaFree(weights_));
   if (biases_) ReportCUDAErrors(cudaFree(biases_));
 }
 
-template <>
-void ConvLayer<half>::LoadWeights(const std::vector<float>& weights,
-                                 float* biases,
-                                 void* scratch) {
-  size_t num_weights = C * c_input_ * filter_size_ * filter_size_;
-  size_t num_biases = C;
+template <typename DataType>
+void DepthwiseConvLayer<DataType>::LoadWeights(float* weights,
+                                               float* biases,
+                                               void* scratch) {
+  size_t num_weights = channels_ * 1 * 5 * 5;
+  size_t num_biases = channels_;
 
-  ReportCUDAErrors(cudaMalloc(&weights_, num_weights * sizeof(half)));
-  ReportCUDAErrors(cudaMalloc(&biases_, num_biases * sizeof(half)));
+  ReportCUDAErrors(cudaMalloc(&weights_, num_weights * sizeof(DataType)));
+  ReportCUDAErrors(cudaMalloc(&biases_, num_biases * sizeof(DataType)));
 
-  // Copy raw host OIHW float weights to GPU staging scratchpad
-  ReportCUDAErrors(cudaMemcpy(scratch, weights.data(), num_weights * sizeof(float), cudaMemcpyHostToDevice));
-  
-  // Slipped parameters map N=C (Output), C=c_input_ (Input). 
-  // Performs layout transposition (OIHW -> OHWI) and Type Conversion (float -> half) simultaneously on GPU.
-  convertNCHWtoNHWC((half*)weights_, (float*)scratch, C, c_input_, C, c_input_, filter_size_, filter_size_, 0);
+  ReportCUDAErrors(cudaMemcpy(scratch, weights, num_weights * sizeof(float), cudaMemcpyHostToDevice));
+  copyTypeConverted(weights_, (float*)scratch, num_weights, 0);
 
-  if (biases != nullptr) {
-      ReportCUDAErrors(cudaMemcpy(scratch, biases, num_biases * sizeof(float), cudaMemcpyHostToDevice));
-      copyTypeConverted((half*)biases_, (float*)scratch, num_biases, 0);
-  } else {
-      std::vector<float> zero_biases(num_biases, 0.0f);
-      ReportCUDAErrors(cudaMemcpy(scratch, zero_biases.data(), num_biases * sizeof(float), cudaMemcpyHostToDevice));
-      copyTypeConverted((half*)biases_, (float*)scratch, num_biases, 0);
-  }
-}
-
-template <>
-void ConvLayer<float>::LoadWeights(const std::vector<float>& weights,
-                                  float* biases,
-                                  void* scratch) {
-  size_t num_weights = C * c_input_ * filter_size_ * filter_size_;
-  size_t num_biases = C;
-
-  ReportCUDAErrors(cudaMalloc(&weights_, num_weights * sizeof(float)));
-  ReportCUDAErrors(cudaMalloc(&biases_, num_biases * sizeof(float)));
-
-  // Copy raw host OIHW float weights to GPU staging scratchpad
-  ReportCUDAErrors(cudaMemcpy(scratch, weights.data(), num_weights * sizeof(float), cudaMemcpyHostToDevice));
-
-  // Performs pure layout transposition (OIHW -> OHWI) entirely on the GPU
-  convertNCHWtoNHWC((float*)weights_, (float*)scratch, C, c_input_, C, c_input_, filter_size_, filter_size_, 0);
-
-  if (biases != nullptr) {
-      ReportCUDAErrors(cudaMemcpy(biases_, biases, num_biases * sizeof(float), cudaMemcpyHostToDevice));
-  } else {
-      ReportCUDAErrors(cudaMemset(biases_, 0, num_biases * sizeof(float)));
-  }
+  ReportCUDAErrors(cudaMemcpy(scratch, biases, num_biases * sizeof(float), cudaMemcpyHostToDevice));
+  copyTypeConverted(biases_, (float*)scratch, num_biases, 0);
 }
 
 template <typename DataType>
-void ConvLayer<DataType>::EnsureGraph(int padded_batch, cudnnHandle_t cudnn) {
+void DepthwiseConvLayer<DataType>::EnsureGraph(int padded_batch, cudnnHandle_t cudnn) {
   if (plans_.count(padded_batch) > 0) return;
 
-  namespace fe = cudnn_frontend;
-
   cudnn_frontend::DataType_t fe_dtype = std::is_same<DataType, half>::value ? 
-      fe::DataType_t::HALF : fe::DataType_t::FLOAT;
+      cudnn_frontend::DataType_t::HALF : cudnn_frontend::DataType_t::FLOAT;
 
-  auto graph = std::make_shared<fe::graph::Graph>();
+  auto graph = std::make_shared<cudnn_frontend::graph::Graph>();
   graph->set_io_data_type(fe_dtype)
-       .set_intermediate_data_type(fe::DataType_t::FLOAT)
-       .set_compute_data_type(fe::DataType_t::FLOAT);
+       .set_intermediate_data_type(cudnn_frontend::DataType_t::FLOAT)
+       .set_compute_data_type(cudnn_frontend::DataType_t::FLOAT);
 
-  // Input Activations (NHWC)
-  auto X = graph->tensor(fe::graph::Tensor_attributes()
+
+  auto X = graph->tensor(cudnn_frontend::graph::Tensor_attributes()
       .set_name("X")
-      .set_dim({padded_batch, c_input_, this->H, this->W})
-      .set_stride({this->H * this->W * c_input_, 1, this->W * c_input_, c_input_}));
+      .set_dim({padded_batch, channels_, 8, 8})
+      .set_stride({channels_ * 64, 1, channels_ * 8, channels_}));
 
-  auto W = graph->tensor(fe::graph::Tensor_attributes()
+  auto W = graph->tensor(cudnn_frontend::graph::Tensor_attributes()
       .set_name("W")
-      .set_dim({this->C, c_input_, filter_size_, filter_size_})
-      .set_stride({filter_size_ * filter_size_ * c_input_, 1, filter_size_ * c_input_, c_input_}));
+      .set_dim({channels_, 1, 5, 5})
+      .set_stride({25, 1, 5, 1}));
 
-  int padding = filter_size_ / 2;
-  auto conv_options = fe::graph::Conv_fprop_attributes()
-      .set_padding({padding, padding})
+  auto conv_options = cudnn_frontend::graph::Conv_fprop_attributes()
+      .set_padding({2, 2})
       .set_stride({1, 1})
       .set_dilation({1, 1});
-
   auto Y_conv = graph->conv_fprop(X, W, conv_options);
 
-  // Output Activations (NHWC)
-  Y_conv->set_output(true)
-        .set_dim({padded_batch, this->C, this->H, this->W})
-        .set_stride({this->H * this->W * this->C, 1, this->W * this->C, this->C});
+  auto B = graph->tensor(cudnn_frontend::graph::Tensor_attributes()
+      .set_name("B")
+      .set_dim({1, channels_, 1, 1})
+      .set_stride({channels_, 1, channels_, channels_}));
 
-  auto status = graph->build(cudnn, {fe::HeurMode_t::A});
+  auto Y_bias = graph->pointwise(Y_conv, B, cudnn_frontend::graph::Pointwise_attributes()
+      .set_mode(cudnn_frontend::PointwiseMode_t::ADD));
+
+  auto Y_act = graph->pointwise(Y_bias, cudnn_frontend::graph::Pointwise_attributes()
+      .set_mode(cudnn_frontend::PointwiseMode_t::RELU_FWD));
+
+  Y_act->set_output(true)
+       .set_dim({padded_batch, channels_, 8, 8})
+       .set_stride({channels_ * 64, 1, channels_ * 8, channels_});
+
+  auto status = graph->build(cudnn, {cudnn_frontend::HeurMode_t::A});
   if (!status.is_good()) {
-      throw Exception("cuDNN graph build failed for ConvLayer: " + status.get_message());
+      throw Exception("cuDNN graph build failed: " + status.get_message());
   }
 
   GraphPlan plan;
   plan.graph = graph;
   plan.X = X;
   plan.W = W;
-  plan.Y = Y_conv; 
+  plan.B = B;     
+  plan.Y = Y_act; 
   plan.workspace_size = graph->get_workspace_size();
 
   plans_[padded_batch] = plan;
 }
 
 template <typename DataType>
-void ConvLayer<DataType>::Eval(
+void DepthwiseConvLayer<DataType>::Eval(
     int batch_size, DataType* output, const DataType* input,
     const DataType* skip, void* scratch, size_t scratch_size,
     cudnnHandle_t cudnn, cublasHandle_t cublas, cudaStream_t stream,
     DataType***) {
 
   int padded_batch = GetPaddedBatchSize(batch_size);
+  
   EnsureGraph(padded_batch, cudnn); 
 
   auto& plan = plans_[padded_batch];
 
   if (scratch_size < plan.workspace_size) {
-      throw Exception("Scratch size is too small for cuDNN graph workspace in ConvLayer");
+      throw Exception("Scratch size is too small for cuDNN graph workspace");
   }
 
   std::unordered_map<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, void*> variant_pack = {
       {plan.X, (void*)input},
       {plan.W, (void*)weights_},
+      {plan.B, (void*)biases_},   
       {plan.Y, (void*)output}
   };
 
+  ReportCUDNNErrors(cudnnSetStream(cudnn, stream));
   auto status = plan.graph->execute(cudnn, variant_pack, scratch);
   if (!status.is_good()) {
-      throw Exception("cuDNN graph execution failed in ConvLayer: " + status.get_message());
+      throw Exception("cuDNN graph execution failed: " + status.get_message());
+  }
+}
+*/
+template <typename DataType>
+void DepthwiseLegacy<DataType>::init() {
+  // Allocate memory for weights (filter tensor) and biases.
+  const size_t weight_size =
+      sizeof(DataType) * c_input_ * filter_size_ * filter_size_;
+  ReportCUDAErrors(cudaMalloc(&weights, weight_size));
+
+  const size_t bias_size = sizeof(DataType) * c_input_;
+  ReportCUDAErrors(cudaMalloc(&biases, bias_size));
+
+  const bool fp16 = std::is_same<half, DataType>::value;
+  const cudnnDataType_t dataType =
+      std::is_same<half, DataType>::value ? CUDNN_DATA_HALF : CUDNN_DATA_FLOAT;
+
+  const cudnnTensorFormat_t layout =
+      nhwc_ ? CUDNN_TENSOR_NHWC : CUDNN_TENSOR_NCHW;
+
+  // Create cudnn objects for various tensors, algorithms, etc.
+  cudnnCreateFilterDescriptor(&filter_desc_);
+  cudnnCreateConvolutionDescriptor(&conv_desc_);
+  cudnnCreateTensorDescriptor(&out_tensor_desc_);
+  cudnnCreateTensorDescriptor(&in_tensor_desc_);
+  cudnnCreateTensorDescriptor(&bias_desc_);
+  cudnnCreateActivationDescriptor(&activation_);
+
+  cudnnSetFilter4dDescriptor(filter_desc_, dataType, layout, GetC(), 1,
+                             filter_size_, filter_size_);
+
+  ReportCUDNNErrors(
+      cudnnSetTensor4dDescriptor(bias_desc_, layout, dataType, 1, C, 1, 1));
+
+  const int padding = filter_size_ / 2;
+  const bool crossCorr = 1;
+
+  ReportCUDNNErrors(cudnnSetConvolution2dDescriptor(
+      conv_desc_, padding, padding, 1, 1, 1, 1,
+      crossCorr ? CUDNN_CROSS_CORRELATION : CUDNN_CONVOLUTION, dataType));
+
+  /////////////////////////////////////////////////////////////////////
+  assert(c_input_ == C); 
+  ReportCUDNNErrors(cudnnSetConvolutionGroupCount(conv_desc_, c_input_));
+  /////////////////////////////////////////////////////////////////////
+
+  if (fp16 && nhwc_)
+    ReportCUDNNErrors(
+        cudnnSetConvolutionMathType(conv_desc_, CUDNN_TENSOR_OP_MATH));
+
+  conv_algo_ = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
+
+  if (act_ == ACTIVATION_RELU) {
+    cudnnSetActivationDescriptor(activation_, CUDNN_ACTIVATION_RELU,
+                                 CUDNN_NOT_PROPAGATE_NAN, 0.0);
+  }
+#if CUDNN_MAJOR != 7 || CUDNN_MINOR != 0
+  else {
+    cudnnSetActivationDescriptor(activation_, CUDNN_ACTIVATION_IDENTITY,
+                                 CUDNN_NOT_PROPAGATE_NAN, 0.0);
+  }
+#endif
+}
+
+template <typename DataType>
+DepthwiseLegacy<DataType>::DepthwiseLegacy(BaseLayer<DataType>* ip, int C, int H, int W,
+                               int filter, 
+                               ActivationFunction activation, bool bias)
+    : BaseLayer<DataType>(C, H, W, ip),
+      c_input_(C),
+      filter_size_(filter),
+      act_(activation),
+      use_bias_(bias) {
+  init();
+}
+
+template <typename DataType>
+DepthwiseLegacy<DataType>::DepthwiseLegacy(bool nhwc, int C, int H, int W, int filter,
+                               ActivationFunction activation,
+                               bool bias)
+    : BaseLayer<DataType>(C, H, W, nullptr, nhwc),
+      c_input_(C),
+      filter_size_(filter),
+      act_(activation),
+      use_bias_(bias) {
+  init();
+}
+
+template <>
+void DepthwiseLegacy<half>::LoadWeights(float* pfilter, float* pBias, void* scratch) {
+  assert(pfilter != nullptr);
+  
+  const size_t weight_size =
+      sizeof(float) * c_input_ * filter_size_ * filter_size_;
+
+  //std::cout << "Weight size : " << weight_size << std::endl;
+
+  const size_t bias_size = sizeof(float) * c_input_;
+
+  if (c_input_ > 0 && pfilter != nullptr) {
+    std::cout << "\n=== DEBUG: DepthwiseConvLayer (cuDNN) | Channel 0 ===" << std::endl;
+    std::cout << "Weights (5x5 = 25 elements):\n";
+    for (int i = 0; i < 25; ++i) {
+        std::cout << pfilter[i] << (i == 24 ? "" : ", ");
+    }
+    std::cout << "\nBias: ";
+    if (pBias) {
+        std::cout << pBias[0];
+    } else {
+        std::cout << "nullptr (no bias)";
+    }
+    std::cout << "\n=====================================================\n" << std::endl;
   }
 
-  // Applies elements bias injection and activation loops on the contiguous channel data sequence outside the graph
-  if (use_bias_) {
-      addBiasBatched<DataType>(output, output, biases_, 1, batch_size * this->H * this->W, this->C, act_, stream);
-  } else if (act_ != ACTIVATION_NONE) {
-      addVectors(output, output, (DataType*)nullptr, batch_size * this->C * this->H * this->W, batch_size * this->C * this->H * this->W, 0, act_, stream);
+  //std::cout << "Bias size : " << weight_size << std::endl;
+  // Also need to convert from fp32 NCHW to fp16 NHWC
+  // first copy from CPU memory to scratch space in GPU memory
+  // and then do the type / layout conversion using a kernel.
+  assert(scratch);
+  ReportCUDAErrors(
+      cudaMemcpy(scratch, pfilter, weight_size, cudaMemcpyHostToDevice));
+
+  if (nhwc_) {
+    //std::cout << "NHWC" << std::endl;
+    convertNCHWtoNHWC((half*)weights, (float*)scratch, c_input_, 1, c_input_, 1,
+                      filter_size_, filter_size_, 0);
+  } else {
+    //std::cout << "Not NHWC" <<std::endl;
+    copyTypeConverted((half*)weights, (float*)scratch,
+                    C * filter_size_ * filter_size_, 0);
+    //copyTypeConvertedMask((half*)weights, (float*)scratch,
+    //                 C * filter_size_ * filter_size_, C, 0);
   }
+
+  if (pBias) {
+    ReportCUDAErrors(
+        cudaMemcpy(scratch, pBias, bias_size, cudaMemcpyHostToDevice));
+
+    copyTypeConverted((half*)biases, (float*)scratch, C, 0);
+  }
+}
+
+template <>
+void DepthwiseLegacy<float>::LoadWeights(float* pfilter, float* pBias,
+                                   void* /*scratch*/) {
+  const size_t weight_size =
+      sizeof(float) *  C * filter_size_ * filter_size_;
+  const size_t bias_size = sizeof(float) * C;
+  ReportCUDAErrors(
+      cudaMemcpy(weights, pfilter, weight_size, cudaMemcpyHostToDevice));
+
+  if (pBias) {
+    ReportCUDAErrors(
+        cudaMemcpy(biases, pBias, bias_size, cudaMemcpyHostToDevice));
+  } else {
+    ReportCUDAErrors(cudaMemset(biases, 0, bias_size));
+  }
+}
+
+template <typename DataType>
+void DepthwiseLegacy<DataType>::Eval(int N, DataType* output, const DataType* input,
+                               const DataType* input2, void* scratch,
+                               size_t scratch_size, cudnnHandle_t cudnn,
+                               cublasHandle_t /*cublas*/, cudaStream_t stream,
+                               DataType***) {
+  const cudnnDataType_t dataType =
+      std::is_same<half, DataType>::value ? CUDNN_DATA_HALF : CUDNN_DATA_FLOAT;
+
+  const cudnnTensorFormat_t layout =
+      nhwc_ ? CUDNN_TENSOR_NHWC : CUDNN_TENSOR_NCHW;
+
+  ReportCUDNNErrors(cudnnSetTensor4dDescriptor(out_tensor_desc_, layout,
+                                               dataType, N, C, H, W));
+
+  ReportCUDNNErrors(cudnnSetTensor4dDescriptor(in_tensor_desc_, layout,
+                                               dataType, N, c_input_, H, W));
+
+  float alpha = 1.0f, beta = 0.0f;
+
+  if (!(act_ != ACTIVATION_NONE || use_bias_ || input2)) {
+    ReportCUDNNErrors(cudnnConvolutionForward(
+        cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
+        conv_desc_, conv_algo_, scratch, scratch_size, &beta, out_tensor_desc_,
+        output));
+  }
+#if CUDNN_MAJOR != 7 || CUDNN_MINOR != 0
+  else if (input2 && (act_ == ACTIVATION_RELU || act_ == ACTIVATION_NONE) &&
+           use_bias_) {
+    // fused bias + sum + relu!
+    ReportCUDNNErrors(cudnnConvolutionBiasActivationForward(
+        cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
+        conv_desc_, conv_algo_, scratch, scratch_size, &alpha, out_tensor_desc_,
+        input2, bias_desc_, biases, activation_, out_tensor_desc_, output));
+  } else {
+    // For some reason cudnn doesn't support just Convolution + Bias with nchw
+    // (winograd algorithm) it works fine when RELU is also needed which is
+    // somewhat strange.
+    if ((act_ == ACTIVATION_RELU || (act_ == ACTIVATION_NONE && nhwc_)) &&
+        !input2 && use_bias_) {
+      ReportCUDNNErrors(cudnnConvolutionBiasActivationForward(
+          cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
+          conv_desc_, conv_algo_, scratch, scratch_size, &beta,
+          out_tensor_desc_, output, bias_desc_, biases, activation_,
+          out_tensor_desc_, output));
+    } else {
+      // The no special case path...
+      ReportCUDNNErrors(cudnnConvolutionForward(
+          cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
+          conv_desc_, conv_algo_, scratch, scratch_size, &beta,
+          out_tensor_desc_, output));
+      bool act_done = false;
+      if (input2 && input2 != output) {
+        // Merge act with residual add unless there is bias.
+        addVectors(output, output, (DataType*)input2, N * C * H * W,
+                   N * C * H * W, N * C * H * W,
+                   use_bias_ ? ACTIVATION_NONE : act_, stream);
+        act_done = !use_bias_;
+      }
+      // Merge act with bias.
+      if (use_bias_) {
+        if (!nhwc_) {
+          // add bias
+          addBias_NCHW(output, output, biases, N, C, H, W, act_, stream);
+        } else {
+          addVectors(output, output, biases, N * C * H * W, N * C * H * W, C,
+                     act_, stream);
+        }
+      } else if (!act_done && act_ != ACTIVATION_NONE) {
+        addVectors(output, output, (DataType*)nullptr, N * C * H * W,
+                   N * C * H * W, 0, act_, stream);
+      }
+    }
+  }
+#else
+  else {
+    ReportCUDNNErrors(cudnnConvolutionForward(
+        cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
+        conv_desc_, conv_algo_, scratch, scratch_size,
+        (input2 == output) ? &alpha : &beta, out_tensor_desc_, output));
+    if (input2 && input2 != output) {
+      ReportCUDNNErrors(cudnnAddTensor(cudnn, &alpha, out_tensor_desc_, input2,
+                                       &alpha, out_tensor_desc_, output));
+    }
+    if (use_bias_) {
+      ReportCUDNNErrors(cudnnAddTensor(cudnn, &alpha, bias_desc_, biases,
+                                       &alpha, out_tensor_desc_, output));
+    }
+    if (act_ == ACTIVATION_RELU) {
+      ReportCUDNNErrors(cudnnActivationForward(cudnn, activation_, &alpha,
+                                               out_tensor_desc_, output, &beta,
+                                               out_tensor_desc_, output));
+    }
+    if (act_ != ACTIVATION_RELU && act_ != ACTIVATION_NONE) {
+      addVectors(output, output, nullptr, N * C * H * W, N * C * H * W, 0, act_,
+                 stream);
+      // TODO: check this actually compiles?
+    }
+  }
+#endif
+}
+
+template <typename DataType>
+DepthwiseLegacy<DataType>::~DepthwiseLegacy() {
+  ReportCUDAErrors(cudaFree(weights));
+  ReportCUDAErrors(cudaFree(biases));
+
+  cudnnDestroyFilterDescriptor(filter_desc_);
+  cudnnDestroyConvolutionDescriptor(conv_desc_);
+  cudnnDestroyTensorDescriptor(bias_desc_);
+  cudnnDestroyTensorDescriptor(in_tensor_desc_);
+  cudnnDestroyTensorDescriptor(out_tensor_desc_);
+  cudnnDestroyActivationDescriptor(activation_);
 }
 
 
@@ -936,6 +1421,116 @@ void SELayer<half>::Eval(int N, half* output, const half* input,
 
   }
 }
+template <typename DataType>
+SELayerNoSkip<DataType>::SELayerNoSkip(BaseLayer<DataType>* ip, int fc1Outputs,
+                                       ActivationFunction activation)
+    : BaseLayer<DataType>(ip->GetC(), ip->GetH(), ip->GetW(), ip),
+      numFc1Out_(fc1Outputs),
+      act_(activation){
+  ReportCUDAErrors(cudaMalloc(&w1_, this->C * numFc1Out_ * sizeof(DataType)));
+  ReportCUDAErrors(cudaMalloc(&w2_, 2 * this->C * numFc1Out_ * sizeof(DataType)));
+  ReportCUDAErrors(cudaMalloc(&b1_, numFc1Out_ * sizeof(DataType)));
+  ReportCUDAErrors(cudaMalloc(&b2_, 2 * this->C * sizeof(DataType)));
+}
+
+template <typename DataType>
+SELayerNoSkip<DataType>::~SELayerNoSkip() {
+  ReportCUDAErrors(cudaFree(w1_));
+  ReportCUDAErrors(cudaFree(w2_));
+  ReportCUDAErrors(cudaFree(b1_));
+  ReportCUDAErrors(cudaFree(b2_));
+}
+
+template <>
+void SELayerNoSkip<float>::LoadWeights(float* w1, float* b1, float* w2, float* b2,
+                                       void* /*scratch*/) {
+  const size_t num_weights1 = this->C * numFc1Out_;
+  ReportCUDAErrors(cudaMemcpy(w1_, w1, sizeof(float) * num_weights1, cudaMemcpyHostToDevice));
+  ReportCUDAErrors(cudaMemcpy(w2_, w2, sizeof(float) * num_weights1 * 2, cudaMemcpyHostToDevice));
+  ReportCUDAErrors(cudaMemcpy(b1_, b1, numFc1Out_ * sizeof(float), cudaMemcpyHostToDevice));
+  ReportCUDAErrors(cudaMemcpy(b2_, b2, 2 * this->C * sizeof(float), cudaMemcpyHostToDevice));
+}
+
+template <>
+void SELayerNoSkip<half>::LoadWeights(float* w1, float* b1, float* w2, float* b2,
+                                      void* scratch) {
+  const size_t num_weights1 = this->C * numFc1Out_;
+  assert(scratch);
+  
+  ReportCUDAErrors(cudaMemcpy(scratch, w1, sizeof(float) * num_weights1, cudaMemcpyHostToDevice));
+  copyTypeConverted((half*)w1_, (float*)scratch, (int)num_weights1, 0);
+
+  ReportCUDAErrors(cudaMemcpy(scratch, w2, sizeof(float) * num_weights1 * 2, cudaMemcpyHostToDevice));
+  copyTypeConverted((half*)w2_, (float*)scratch, (int)num_weights1 * 2, 0);
+
+  ReportCUDAErrors(cudaMemcpy(scratch, b1, numFc1Out_ * sizeof(float), cudaMemcpyHostToDevice));
+  copyTypeConverted((half*)b1_, (float*)scratch, numFc1Out_, 0);
+
+  ReportCUDAErrors(cudaMemcpy(scratch, b2, 2 * this->C * sizeof(float), cudaMemcpyHostToDevice));
+  copyTypeConverted((half*)b2_, (float*)scratch, 2 * this->C, 0);
+}
+
+template <>
+void SELayerNoSkip<half>::Eval(int N, half* output, const half* input,
+                               const half* /*input2*/, void* scratch, size_t scratch_size,
+                               cudnnHandle_t /*cudnn*/, cublasHandle_t cublas,
+                               cudaStream_t stream, half***) {
+  
+  // Ping-pong between 'op1' and 'op2' (sub-allocations of scratch memory)
+  half* op1 = (half*)scratch;
+  half* op2 = (half*)scratch + scratch_size / sizeof(half) / 2;
+
+  // 1. Global average pooling (No skip layer variant has no previous bias addition)
+  globalAvgPool(N, this->C, op2, input, (const half*)nullptr, nhwc_, stream);
+
+  // 2. First fully connected layer (Squeeze GEMM)
+  __half_raw one_h{0x3C00};
+  __half_raw zero_h{0};
+  half alpha = one_h;
+  half beta = zero_h;
+  
+  ReportCUBLASErrors(cublasHgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, numFc1Out_,
+                                 N, this->C, &alpha, w1_, this->C, op2, this->C, &beta, op1,
+                                 numFc1Out_));
+                                 
+  // Apply bias vectors and activate squeezed hidden layers
+  addVectors(op1, b1_, op1, numFc1Out_ * N, numFc1Out_, numFc1Out_ * N, act_, stream);
+
+  // 3. Second fully connected layer (Excitation GEMM)
+  ReportCUBLASErrors(cublasHgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, 2 * this->C, N,
+                                 numFc1Out_, &alpha, w2_, numFc1Out_, op1, numFc1Out_, &beta, op2, 2 * this->C));
+                                 
+  // Apply final bias scaling parameters
+  addVectors(op2, b2_, op2, 2 * this->C * N, 2 * this->C, 2 * this->C * N, ACTIVATION_NONE, stream);
+
+  // 4. Broadcast scaling multipliers and biases over the feature planes without residual jumps
+  globalScale_NoSkip(N, this->C, output, input, op2, (const half*)nullptr, nhwc_, act_, stream);
+}
+
+template <>
+void SELayerNoSkip<float>::Eval(int N, float* output, const float* input,
+                                const float* /*input2*/, void* scratch,
+                                size_t scratch_size, cudnnHandle_t /*cudnn*/,
+                                cublasHandle_t cublas, cudaStream_t stream, float***) {
+  float* op1 = (float*)scratch;
+  float* op2 = (float*)scratch + scratch_size / sizeof(float) / 2;
+
+  // 1. Global average pooling
+  globalAvgPool(N, this->C, op2, input, (const float*)nullptr, false, stream);
+
+  // 2. First dense layer
+  float alpha = 1.0f, beta = 0.0f;
+  ReportCUBLASErrors(cublasSgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, numFc1Out_,
+                                 N, this->C, &alpha, w1_, this->C, op2, this->C, &beta, op1, numFc1Out_));
+  addVectors(op1, b1_, op1, numFc1Out_ * N, numFc1Out_, numFc1Out_ * N, act_, stream);
+
+  // 3. Second dense layer
+  ReportCUBLASErrors(cublasSgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, 2 * this->C, N,
+                                 numFc1Out_, &alpha, w2_, numFc1Out_, op1, numFc1Out_, &beta, op2, 2 * this->C));
+  addVectors(op2, b2_, op2, 2 * this->C * N, 2 * this->C, 2 * this->C * N, ACTIVATION_NONE, stream);
+
+  globalScale_NoSkip(N, this->C, output, input, op2, (const float*)nullptr, false, act_, stream);
+}
 
 template <typename DataType>
 FCLayer<DataType>::FCLayer(BaseLayer<DataType>* ip, int C, int H, int W,
@@ -1161,7 +1756,7 @@ FusedWinogradConvSELayer<DataType>::FusedWinogradConvSELayer(
     BaseLayer<DataType>* ip, int C, int H, int W, int Cin,
     ActivationFunction activation, bool bias, bool skip_add, bool se, int se_k,
     bool use_gemm_ex, bool op_nhcw)
-    : BaseLayer<DataType>(C, H, W, ip, true, use_gemm_ex),
+    : BaseLayer<DataType>(C, H, W, ip, false, use_gemm_ex),
       c_input_(Cin),
       act_(activation),
       use_bias_(bias),
@@ -1763,7 +2358,7 @@ EncoderBlock<DataType>::EncoderBlock(
     int size, float alpha, DataType* smolgen_global_scratch,
     int smolgen_global_size, int max_batch_size, ActivationFunction smolgen_act,
     ActivationFunction ffn_act, float default_eps, bool prenorm, bool use_gemm_ex,
-    bool fused_mha, const std::vector<float>& attention_mask)
+    bool fused_mha)
     : embedding_op_size_(size),
       encoder_heads_(heads),
       alpha_(alpha),
@@ -1775,7 +2370,11 @@ EncoderBlock<DataType>::EncoderBlock(
       use_fused_mha_(fused_mha),
       prenorm_(prenorm),
       use_gemm_ex_(use_gemm_ex) {
-
+  /*
+  mha_q_size_ = cpu_weights.mha.q_b.size();
+  mha_k_size_ = cpu_weights.mha.k_b.size();
+  mha_v_size_ = cpu_weights.mha.v_b.size();
+  */
   mha_q_size_ = cpu_weights.mha.q_w.size() / size;
   mha_k_size_ = cpu_weights.mha.k_w.size() / size;
   mha_v_size_ = cpu_weights.mha.v_w.size() / size;
@@ -1849,7 +2448,12 @@ EncoderBlock<DataType>::EncoderBlock(
     smol_dense_1_size_ = cpu_weights.mha.smolgen.dense1_b.size();
     smol_dense_2_size_ = cpu_weights.mha.smolgen.dense2_b.size();
     smol_global_size_ = smolgen_global_size;
-
+    /*
+    std::cout<<"smol_compress_size_"<<smol_compress_size_<<std::endl;
+    std::cout<<"smol_dense_1_size_"<<smol_dense_1_size_<<std::endl;
+    std::cout<<"smol_dense_2_size_"<<smol_dense_2_size_<<std::endl;
+    std::cout<<"smol_global_size_"<<smol_global_size_<<std::endl;
+    */
     allocAndUpload<DataType>(&smol_compress, cpu_weights.mha.smolgen.compress,
                              scratch);
     allocAndUpload<DataType>(&smol_dense1_w, cpu_weights.mha.smolgen.dense1_w,
@@ -1874,10 +2478,7 @@ EncoderBlock<DataType>::EncoderBlock(
     smol_global = smolgen_global_scratch;
   }
 
-  if (!attention_mask.empty()) {
-    has_attention_mask_ = true;
-    allocAndUpload<DataType>(&attention_mask_, attention_mask, scratch);
-  }
+
 
 }
 
@@ -1887,6 +2488,14 @@ static void cublasXgemm(cublasHandle_t handle, cublasOperation_t transa,
                         float alpha, const DataType* A, int lda,
                         const DataType* B, int ldb, float beta, DataType* C,
                         int ldc) {
+  /*
+  std::cout<<"m "<<m<<std::endl;
+  std::cout<<"n "<<n<<std::endl;
+  std::cout<<"k "<<k<<std::endl;
+  std::cout<<"lda "<<lda<<std::endl;
+  std::cout<<"ldb "<<ldb<<std::endl;
+  std::cout<<"ldc "<<ldc<<std::endl;
+  */
   const bool fp16 = std::is_same<half, DataType>::value;
   if (fp16) {
     unsigned short alpha_h = FP32toFP16(alpha);
@@ -1993,18 +2602,25 @@ void Conv1Layer<float>::cublasSpecialMatrixMul(const float* A, const float* B,
 
 template <typename DataType>
 void Conv1Layer<DataType>::Eval(int N, DataType* output, const DataType* input,
-                                const DataType*, void*,
-                                size_t,
-                                cudnnHandle_t , cublasHandle_t cublas,
-                                cudaStream_t stream, DataType***) {
+                                const DataType* input2, void* scratch,
+                                size_t scratch_size,
+                                cudnnHandle_t cudnn, cublasHandle_t cublas,
+                                cudaStream_t stream, DataType*** offset_pointers) {
+  // output = Temporary buffer holding raw cuBLAS outputs (e.g., buf1)
+  // input2 = Persistent residual highway buffer (flow)
   cublasSpecialMatrixMul(weights_, input, output, C, H * W, c_input_, N, cublas);
 
-  if (use_bias_) {
+  if (input2 && use_bias_ && nhwc_) {
+      fusedFlatBiasAddResidualNHWC<DataType>(const_cast<DataType*>(input2), output, biases_, input2, 1, N * H * W, C, act_, stream);
+  } else if (use_bias_) {
       if (nhwc_) {
-        addBiasBatched(output, output, biases_, 1, N * H * W, C, act_, stream);
+          addBiasBatched(output, output, biases_, 1, N * H * W, C, act_, stream);
       } else {
           addBias_NCHW(output, output, biases_, N, C, H, W, act_, stream);
       }
+  } else if (input2) {
+      int total_elements = N * C * H * W;
+      addVectors(const_cast<DataType*>(input2), output, const_cast<DataType*>(input2), total_elements, total_elements, total_elements, act_, stream);
   } else if (act_ != ACTIVATION_NONE) {
       addVectors(output, output, (DataType*)nullptr, N * C * H * W, N * C * H * W, 0, act_, stream);
   }
@@ -2162,17 +2778,9 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
 
   float factor = 1.0f / sqrt((float)depth);
 
-  bool has_bias = has_smolgen_ || has_attention_mask_;
-  bool is_buffer_initialized = has_smolgen_;
-
-  if (has_attention_mask_) {
-      AddAttentionMask<DataType>(N, encoder_heads_, buffer2, attention_mask_, is_buffer_initialized, stream);
-      is_buffer_initialized = true;
-  }
-
 #ifdef USE_CUTLASS
   if (use_fused_mha_) {
-    fusedMHA(buffer2, mha_q, mha_k, mha_v, has_bias ? buffer2 : nullptr, N,
+    fusedMHA(buffer2, mha_q, mha_k, mha_v, has_smolgen_ ? buffer2 : nullptr, N,
              encoder_heads_, depth, stream);
   } else
 #endif
@@ -2200,7 +2808,7 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
         *offset_pointers + encoder_heads_ * max_batch_size_ * 2, 64,
         N * encoder_heads_);
 
-    if (has_bias) {
+    if (has_smolgen_) {
       Softmax(encoder_heads_ * N * 64, 64, buffer1, buffer1, buffer2, stream);
     } else {
       Softmax(encoder_heads_ * N * 64, 64, buffer1, buffer1,
@@ -2425,7 +3033,6 @@ EncoderBlock<DataType>::~EncoderBlock() {
     ReportCUDAErrors(cudaFree(smol_ln2_gammas));
     ReportCUDAErrors(cudaFree(smol_ln2_betas));
   }
-  if (has_attention_mask_) ReportCUDAErrors(cudaFree(attention_mask_));
 }
 
 template <typename DataType>
@@ -2479,7 +3086,6 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
                             int l2_cache_size,
                             int shared_mem_per_block_optin,
                             bool use_custom_depthwise,
-                            const std::vector<std::vector<float>>& layer_masks,
                             cudnnHandle_t cudnn)     
   : BaseLayer<DataType>(weights.ip_emb_b.size(), 8, 8, nullptr, nhwc, use_gemm_ex),
     embedding_op_size_(weights.ip_emb_b.size()),
@@ -2516,7 +3122,6 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
   BaseLayer<DataType>* prev_layer = nullptr;
   
   int current_channels = input_c_;
-  int encoder_count = 0;
 
   // Deep norm scaling for residual stream
   if (prenorm) {
@@ -2598,24 +3203,6 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
     input_conv_output_channels_ = current_channels;    
   }
 
-  else if (starts_with_residual_){
-    current_channels = weights.input.biases.size();
-    auto input_conv = std::make_unique<ConvLayer<DataType>>(
-            prev_layer, current_channels, 8, 8, 3, input_c_, act_, true, use_gemm_ex,
-            min_batch_size, max_batch_size, cudnn
-    );
-
-    input_conv->LoadWeights(weights.input.weights,
-                              const_cast<float*>(weights.input.biases.data()),
-                          scratch);
-
-    prev_layer = input_conv.get();
-
-    input_conv_ = std::move(input_conv);
-
-    input_conv_output_channels_ = current_channels;   
-  }
-
   // Iterates over each block of the main backbone tower
   for (size_t i = 0; i < weights.tower.size(); ++i) {
       const auto& pb_block = weights.tower[i];
@@ -2672,18 +3259,17 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
       if (std::holds_alternative<BaseWeights::EncoderLayer>(pb_block.block)) {
           node.type = TowerNode::TRANSFORMER;
           const auto& enc_weights = std::get<BaseWeights::EncoderLayer>(pb_block.block);
-          std::vector<float> mask = (encoder_count < layer_masks.size()) ? layer_masks[encoder_count] : std::vector<float>();
           node.encoder = std::make_unique<EncoderBlock<DataType>>(
               enc_weights, scratch, encoder_head_count_, embedding_op_size_, 
               alpha_,
               smolgen_global_, smolgen_global_size_, max_batch_size,
               activations_.smolgen_activation, activations_.ffn_activation,
-              default_epsilon_, prenorm_, use_gemm_ex, use_fused_mha_, mask
+              default_epsilon_, prenorm_, use_gemm_ex, use_fused_mha_
           );
-          encoder_count++;
       } 
 
       // Mobile Net block
+      // Mobile Net block (Strict MobileNetV3 Rearrangement)
       else if (std::holds_alternative<BaseWeights::MobileNet>(pb_block.block)) {
         node.type = TowerNode::MOBILENET;
         const auto& m_weights = std::get<BaseWeights::MobileNet>(pb_block.block);
@@ -2691,17 +3277,19 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
         int se_k = m_weights.se.b1.size();
         int c_expand = m_weights.conv1.biases.size();
 
+        // Step A: Expand Convolution (conv1)
         auto conv1 = std::make_unique<Conv1Layer<DataType>>(prev_layer, 
           c_expand, 8, 8, current_channels, act_, true, use_gemm_ex, nhwc_);
         conv1->LoadWeights(const_cast<float*>(m_weights.conv1.weights.data()),
                           const_cast<float*>(m_weights.conv1.biases.data()),
                           scratch);
         prev_layer = conv1.get();
-        node.cnn_layers.push_back(std::move(conv1));
+        node.cnn_layers.push_back(std::move(conv1)); // cnn_layers[0]
         current_channels = c_expand;
 
+        // Step B: Spatial Depthwise Convolution (d_conv)
         if (use_custom_depthwise_) {
-          auto d_conv = std::make_unique<DepthwiseCustom<DataType>>(c_expand, 8, 8, act_, nhwc_,
+          auto d_conv = std::make_unique<DepthwiseCustom<DataType>>(c_expand, 8, 8, ACTIVATION_NONE, nhwc_,
               m_weights.d_conv.rook_channels,
               m_weights.d_conv.bishop_channels,
               m_weights.d_conv.knight_channels);
@@ -2709,10 +3297,10 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
                               const_cast<float*>(m_weights.d_conv.biases.data()),
                           scratch);
           prev_layer = d_conv.get();
-          node.cnn_layers.push_back(std::move(d_conv));
+          node.cnn_layers.push_back(std::move(d_conv)); // cnn_layers[1]
         }
         else {
-          auto d_conv = std::make_unique<DepthwiseConvLayer<DataType>>(prev_layer, c_expand, 8, 8, act_, use_gemm_ex,
+          auto d_conv = std::make_unique<DepthwiseConvLayer<DataType>>(prev_layer, c_expand, 8, 8, ACTIVATION_NONE, use_gemm_ex,
               min_batch_size, max_batch_size,
               m_weights.d_conv.rook_channels,
               m_weights.d_conv.bishop_channels,
@@ -2723,31 +3311,28 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
                               const_cast<float*>(m_weights.d_conv.biases.data()),
                           scratch);
           prev_layer = d_conv.get();
-          node.cnn_layers.push_back(std::move(d_conv));
+          node.cnn_layers.push_back(std::move(d_conv)); // cnn_layers[1]
         }
 
-
-
-        auto conv2 = std::make_unique<Conv1Layer<DataType>>(prev_layer, 
-          m_weights.conv2.biases.size(), 8, 8, current_channels, ACTIVATION_NONE, false, use_gemm_ex, nhwc_);
-        conv2->LoadWeights(const_cast<float*>(m_weights.conv2.weights.data()),
-                          nullptr,
-                          scratch);
-        prev_layer = conv2.get();
-        node.cnn_layers.push_back(std::move(conv2));
-        current_channels = m_weights.conv2.biases.size();
-
-        auto se = std::make_unique<SELayer<DataType>>(prev_layer,
-        se_k, false, act_, false);
+        // Step C: Squeeze-and-Excitation Layer - Switched to custom SELayerNoSkip
+        auto se = std::make_unique<SELayerNoSkip<DataType>>(prev_layer, se_k, act_);
         se->LoadWeights(const_cast<float*>(m_weights.se.w1.data()),
                         const_cast<float*>(m_weights.se.b1.data()),
                         const_cast<float*>(m_weights.se.w2.data()),
                         const_cast<float*>(m_weights.se.b2.data()),
-                        const_cast<float*>(m_weights.conv2.biases.data()),
                         scratch);
-
         prev_layer = se.get();
-        node.cnn_layers.push_back(std::move(se));
+        node.cnn_layers.push_back(std::move(se)); // cnn_layers[2]
+
+        // Step D: Pointwise Projection Convolution (conv2)
+        auto conv2 = std::make_unique<Conv1Layer<DataType>>(prev_layer, 
+          m_weights.conv2.biases.size(), 8, 8, current_channels, ACTIVATION_NONE, true, use_gemm_ex, nhwc_);
+        conv2->LoadWeights(const_cast<float*>(m_weights.conv2.weights.data()),
+                          const_cast<float*>(m_weights.conv2.biases.data()),
+                          scratch);
+        prev_layer = conv2.get();
+        node.cnn_layers.push_back(std::move(conv2)); // cnn_layers[3]
+        current_channels = m_weights.conv2.biases.size();
       }
 
       else if (std::holds_alternative<BaseWeights::Residual>(pb_block.block)) {
@@ -2756,41 +3341,30 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
         int se_k = r_weights.se.b1.size();
 
         // 1. First Convolution Layer: Reads from prev_layer, writes to intermediate buf
-        auto conv1 = std::make_unique<ConvLayer<DataType>>(
-                prev_layer, current_channels, 8, 8, 3, current_channels, act_, true, use_gemm_ex,
-                min_batch_size, max_batch_size, cudnn
+        auto conv1 = std::make_unique<FusedWinogradConvSELayer<DataType>>(
+            prev_layer, current_channels, 8, 8, current_channels, act_, true, false,
+            false, 0, use_gemm_ex
         );
-
-        conv1->LoadWeights(r_weights.conv1.weights,
-                          const_cast<float*>(r_weights.conv1.biases.data()),
-                          scratch);        
-        
+        conv1->LoadWeights(const_cast<float*>(r_weights.conv1.weights.data()),
+                            const_cast<float*>(r_weights.conv1.biases.data()), scratch);
         prev_layer = conv1.get();
         node.cnn_layers.push_back(std::move(conv1));
 
         // 2. Second Convolution Layer: Performs the fused residual skip connection & optional SE
-        auto conv2 = std::make_unique<ConvLayer<DataType>>(
-                prev_layer, current_channels, 8, 8, 3, current_channels, ACTIVATION_NONE, false, use_gemm_ex,
-                min_batch_size, max_batch_size, cudnn
+        auto conv2 = std::make_unique<FusedWinogradConvSELayer<DataType>>(
+            prev_layer, current_channels, 8, 8, current_channels, act_, true, true,
+            r_weights.has_se, se_k, use_gemm_ex
         );
-
-        conv2->LoadWeights(r_weights.conv2.weights,
-                            nullptr,
-                            scratch);           
-        
+        conv2->LoadWeights(const_cast<float*>(r_weights.conv2.weights.data()),
+                            const_cast<float*>(r_weights.conv2.biases.data()), scratch);
+        if (r_weights.has_se) {
+            conv2->LoadSEWeights(const_cast<float*>(r_weights.se.w1.data()),
+                                  const_cast<float*>(r_weights.se.b1.data()),
+                                  const_cast<float*>(r_weights.se.w2.data()),
+                                  const_cast<float*>(r_weights.se.b2.data()), scratch);
+        }
+        prev_layer = conv2.get();
         node.cnn_layers.push_back(std::move(conv2));
-
-        auto se = std::make_unique<SELayer<DataType>>(prev_layer,
-        se_k, true, act_, true);
-        se->LoadWeights(const_cast<float*>(r_weights.se.w1.data()),
-                        const_cast<float*>(r_weights.se.b1.data()),
-                        const_cast<float*>(r_weights.se.w2.data()),
-                        const_cast<float*>(r_weights.se.b2.data()),
-                        const_cast<float*>(r_weights.conv2.biases.data()),
-                        scratch);
-
-        prev_layer = se.get();
-        node.cnn_layers.push_back(std::move(se));
       }
 
       // ConvNext block
@@ -2921,10 +3495,11 @@ void Backbone<DataType>::Eval(int N, DataType* output,
       current_channels = embedding_op_size_;
   }
 
-  else if (starts_with_mobilenet_ || starts_with_convnext_ || starts_with_residual_) {
+  else if (starts_with_mobilenet_ || starts_with_convnext_) {
       input_conv_->Eval(N, flow, buf0, nullptr, (DataType*)scratch, scratch_size, cudnn, cublas, stream, offset_pointers);
       current_channels = input_conv_output_channels_;
   }
+
 
   //int b_idx = -1;
   for (auto& node : tower_nodes_) {
@@ -2981,16 +3556,21 @@ void Backbone<DataType>::Eval(int N, DataType* output,
       } 
       
       else if (node.type == TowerNode::MOBILENET) { 
+        // 1. Expand Layer: Reads from live highway 'flow' (x), writes expanded states to 'buf0'
         node.cnn_layers[0]->Eval(N, buf0, flow, nullptr, temp, scratch_size, cudnn, cublas, stream, offset_pointers);
+
         node.cnn_layers[1]->Eval(N, buf1, buf0, nullptr, temp, scratch_size, cudnn, cublas, stream, offset_pointers);
+        
         node.cnn_layers[2]->Eval(N, buf0, buf1, nullptr, temp, scratch_size, cudnn, cublas, stream, offset_pointers);
-        node.cnn_layers[3]->Eval(N, flow, buf0, flow, temp, scratch_size, cudnn, cublas, stream, offset_pointers);
+
+        node.cnn_layers[3]->Eval(N, buf1, buf0, flow, temp, scratch_size, cudnn, cublas, stream, offset_pointers);
+
       }
 
       else if (node.type == TowerNode::RESIDUAL) {
         node.cnn_layers[0]->Eval(N, buf0, flow, nullptr, temp, scratch_size, cudnn, cublas, stream, offset_pointers);
-        node.cnn_layers[1]->Eval(N, buf1, buf0, nullptr, temp, scratch_size, cudnn, cublas, stream, offset_pointers);
-        node.cnn_layers[2]->Eval(N, flow, buf1, flow, temp, scratch_size, cudnn, cublas, stream, offset_pointers);
+
+        node.cnn_layers[1]->Eval(N, flow, buf0, flow, temp, scratch_size, cudnn, cublas, stream, offset_pointers);
       }
 
       else if (node.type == TowerNode::CONVNEXT) {
@@ -3498,6 +4078,9 @@ template class FCLayer<float>;
 
 template class SELayer<half>;
 template class SELayer<float>;
+
+template class SELayerNoSkip<half>;
+template class SELayerNoSkip<float>;
 
 template class PolicyMapLayer<half>;
 template class PolicyMapLayer<float>;

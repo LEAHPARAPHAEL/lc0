@@ -73,3 +73,19 @@ fastchess -event 'Prenorm VS Postnorm' -engine name='Tx8' args='-w /home/raph/le
 fastchess -config file=/home/raph/leela/configs/Tx8_VS_MMTMMTMMT-60s.json
 
 fastchess -config file=/home/raph/leela/configs/pre_vs_post-60s.json
+
+# CUDNN VS Custom
+
+fastchess -event 'CUDNN Benchmark' -engine name='custom' args='-w /home/raph/leela/networks/MMTMMTMMT-cuda/MMTMMTMMT-cuda-300000.pb.gz' -engine name='cudnn' args='-w /home/raph/leela/networks/MMTMMTMMT-cuda/MMTMMTMMT-cuda-300000.pb.gz -o custom_depthwise=false'  -openings file='/home/raph/leela/books/book-6-ply-unbalanced.pgn' format=pgn order=sequential -each cmd=./build/release/lc0 tc=60+0.1 -rounds 200 -concurrency 1 -pgnout file=/home/raph/leela/pgns/cudnn-60s -config outname=/home/raph/leela/configs/cudnn-60s.json
+
+# Classical VS v3
+
+fastchess -event 'V3 Benchmark' -engine name='custom' args='-w /home/raph/leela/networks/MMTMMTMMT-cuda/MMTMMTMMT-cuda-300000.pb.gz' cmd=./build/release/lc0 -engine name='v3' args='-w /home/raph/leela/networks/MMTMMTMMT-v3/MMTMMTMMT-v3-300000.pb.gz' cmd=./engines/v3 -openings file='/home/raph/leela/books/book-6-ply-unbalanced.pgn' format=pgn order=sequential -each tc=60+0.1 -rounds 200 -concurrency 1 -pgnout file=/home/raph/leela/pgns/v3-60s -config outname=/home/raph/leela/configs/v3-60s.json
+
+# 5x5 VS dense
+
+fastchess -event 'Sparse VS Dense' -engine name='sparse' args='-w /home/raph/leela/networks/MMTx3/MMTx3-100000.pb.gz' cmd=./engines/custom -engine name='dense' args='-w /home/raph/leela/networks/MMTx3-dense/MMTx3-dense-100000.pb.gz -o custom_depthwise=false' cmd=./engines/dense_5x5 -openings file='/home/raph/leela/books/book-6-ply-unbalanced.pgn' format=pgn order=sequential -each tc=60+0.1 -rounds 200 -concurrency 1 -pgnout file=/home/raph/leela/pgns/sparse_VS_dense -config outname=/home/raph/leela/configs/sparse_VS_dense.json
+
+# 3x3 VS dense
+
+fastchess -event 'Sparse VS 3x3' -engine name='sparse' args='-w /home/raph/leela/networks/MMTx3/MMTx3-100000.pb.gz' cmd=./engines/custom -engine name='3x3' args='-w /home/raph/leela/networks/MMTx3-3x3/MMTx3-3x3-100000.pb.gz' cmd=./engines/dense_3x3 -openings file='/home/raph/leela/books/book-6-ply-unbalanced.pgn' format=pgn order=sequential -each tc=60+0.1 -rounds 200 -concurrency 1 -pgnout file=/home/raph/leela/pgns/sparse_VS_3x3 -config outname=/home/raph/leela/configs/sparse_VS_3x3.json

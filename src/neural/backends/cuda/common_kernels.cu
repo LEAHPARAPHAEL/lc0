@@ -45,159 +45,247 @@ constexpr int kInputPlanes = 112;
 /////////////////////////////////////////////////////////////////////////////
 
 template <typename T>
-__global__ void AddAttentionMaskKernel(int N, int heads, int board_sq, T* logits, const T* mask) {
+__global__ void AddAttentionMaskKernel(int N, int heads, int board_sq, T* logits, const T* mask, bool accumulate) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total_elements = N * heads * board_sq;
     
     if (idx < total_elements) {
         // Find which head and which board square we are in, ignoring the batch 'N'
         int head_and_sq = idx % (heads * board_sq);
-        logits[idx] = logits[idx] + mask[head_and_sq];
+        
+        // --- CONDITIONAL INITIALIZATION ---
+        if (accumulate) {
+            logits[idx] = logits[idx] + mask[head_and_sq];
+        } else {
+            logits[idx] = mask[head_and_sq];
+        }
     }
 }
 
 template <typename T>
-void AddAttentionMask(int N, int heads, T* logits, const T* mask, cudaStream_t stream) {
+void AddAttentionMask(int N, int heads, T* logits, const T* mask, bool accumulate, cudaStream_t stream) {
     int board_sq = 64 * 64;
     int total_elements = N * heads * board_sq;
     int threads = 256;
     int blocks = (total_elements + threads - 1) / threads;
     
-    AddAttentionMaskKernel<<<blocks, threads, 0, stream>>>(N, heads, board_sq, logits, mask);
+    AddAttentionMaskKernel<<<blocks, threads, 0, stream>>>(N, heads, board_sq, logits, mask, accumulate);
 }
 
-// Instantiate for both precisions
-template void AddAttentionMask<half>(int N, int heads, half* logits, const half* mask, cudaStream_t stream);
-template void AddAttentionMask<float>(int N, int heads, float* logits, const float* mask, cudaStream_t stream);
+// UPDATE INSTANTIATIONS (Typically located at the bottom of common_kernels.cu)
+template void AddAttentionMask<half>(int N, int heads, half* logits, const half* mask, bool accumulate, cudaStream_t stream);
+template void AddAttentionMask<float>(int N, int heads, float* logits, const float* mask, bool accumulate, cudaStream_t stream);
 
-/*
-template <typename DataType>
-__global__ void ComputeRPE_Q_Kernel(
-    int batch_size, int heads, int head_depth,
-    const DataType* q_in,          // [N, 64(Q), H, D]
-    const DataType* rpe_q_exp,     // [H, Q, D, K]
-    DataType* output_bias)         // [N, H, Q, K]
+
+/////////////////////////////////////////////////////////////////////////////
+//          Squeeze-and-Excitation Gating Kernels (No Skip)                //
+/////////////////////////////////////////////////////////////////////////////
+
+template <typename T>
+__global__ void globalScale_kernel_NoSkip(T* output, const T* input,
+                                          const T* scaleBias, const T* prevLayerBias,
+                                          int inputSize, int C,
+                                          ActivationFunction activation) {
+  const int kPlaneSize = 64;
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (tid >= inputSize) return;
+
+  int nc = tid / kPlaneSize;
+  int n = nc / C;
+  int c = nc % C;
+
+  // Output of depthwise block to be scaled
+  float val1 = input[tid];   
+
+  if (prevLayerBias) {
+    val1 += (float)(prevLayerBias[c]);
+  }
+
+  int startIdx = n * 2 * C;  // Scale and bias interleaved
+
+  float s = scaleBias[startIdx + c];
+  s = 1.0f / (1.0f + exp(-s));  // Sigmoid on scale
+
+  float b = scaleBias[startIdx + c + C];
+
+  // Pure Gating Equation: Multiplication + Bias shift (No val2 skip add)
+  float op = val1 * s + b;
+  op = activate(op, activation);
+  output[tid] = (T)op;
+}
+
+__global__ void globalScale_kernel_fp16_nhwc_NoSkip(half* output, const half* input,
+                                             const half* scaleBias,
+                                             const half* prevLayerBias,
+                                             int inputSize, int C, int HWC,
+                                             ActivationFunction activation) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (tid >= inputSize) return;
+
+  int c = tid % C;
+  int n = tid / (HWC);
+
+  float val1 = (float)input[tid];   
+  if (prevLayerBias) {
+    val1 += (float)prevLayerBias[c];
+  }
+
+  int startIdx = n * 2 * C;  
+
+  float s = scaleBias[startIdx + c];
+  s = 1.0f / (1.0f + exp(-s));  
+
+  float b = scaleBias[startIdx + c + C];
+
+  // Pure Gating Equation (No val2 skip add)
+  float op = val1 * s + b;
+  op = activate(op, activation);
+
+  output[tid] = (half)op;
+}
+
+template <typename T>
+void globalScale_NoSkip(int N, int C, T* output, const T* input, const T* scaleBias,
+                 const T* prevLayerBias, bool nhwc,
+                 ActivationFunction activation, cudaStream_t stream) {
+  const int kBlockSize = 256;
+  const int kBlocks = DivUp(N * 8 * 8 * C, kBlockSize);
+
+  if (nhwc) {
+    assert((std::is_same<half, T>::value));
+    globalScale_kernel_fp16_nhwc_NoSkip<<<kBlocks, kBlockSize, 0, stream>>>(
+        (half*)output, (half*)input, (half*)scaleBias, (half*)prevLayerBias,
+        N * C * 8 * 8, C, 8 * 8 * C, activation);
+  } else {
+    globalScale_kernel_NoSkip<<<kBlocks, kBlockSize, 0, stream>>>(
+        output, input, scaleBias, prevLayerBias, N * C * 8 * 8, C, activation);
+  }
+  ReportCUDAErrors(cudaGetLastError());
+}
+
+// Explicit Template Instantiation
+template void globalScale_NoSkip<float>(int, int, float*, const float*, const float*, 
+                                        const float*, bool, ActivationFunction, cudaStream_t);
+template void globalScale_NoSkip<half>(int, int, half*, const half*, const half*, 
+                                       const half*, bool, ActivationFunction, cudaStream_t);
+
+
+
+template <typename T, ActivationFunction act>
+__global__ void fusedFlatBiasAddResidualNHWC_kernel(
+    T* output, const T* input, const T* bias, const T* residual, 
+    int total_size, int C) 
 {
-    int k = threadIdx.x; 
-    int q = blockIdx.x * blockDim.y + threadIdx.y; 
+    int i = threadIdx.x + blockDim.x * blockIdx.x;
+    if (i < total_size) {
+        // In NHWC layout, the channel index cycles sequentially every C elements
+        int c = i % C; 
+
+        float val = (float)input[i];
+        float b   = (float)bias[c];
+        float res = (float)residual[i];
+
+        // Compute: activation(conv_output + bias) + residual_shortcut
+        float x = val + b;
+        x = activate(x, act);
+        
+        output[i] = (T)(x + res);
+    }
+}
+
+template <typename T>
+void fusedFlatBiasAddResidualNHWC(T* output, const T* input, const T* bias, const T* residual, 
+                                  int Batch, int N, int C, ActivationFunction activation, 
+                                  cudaStream_t stream) 
+{
+    int total_size = Batch * N * C;
+    const int kBlockSize = 256;
+    int blocks = DivUp(total_size, kBlockSize);
+
+    switch (activation) {
+        case ACTIVATION_NONE:
+            fusedFlatBiasAddResidualNHWC_kernel<T, ACTIVATION_NONE><<<blocks, kBlockSize, 0, stream>>>(output, input, bias, residual, total_size, C);
+            break;
+        case ACTIVATION_MISH:
+            fusedFlatBiasAddResidualNHWC_kernel<T, ACTIVATION_MISH><<<blocks, kBlockSize, 0, stream>>>(output, input, bias, residual, total_size, C);
+            break;
+        case ACTIVATION_RELU:
+            fusedFlatBiasAddResidualNHWC_kernel<T, ACTIVATION_RELU><<<blocks, kBlockSize, 0, stream>>>(output, input, bias, residual, total_size, C);
+            break;
+        case ACTIVATION_SWISH:
+            fusedFlatBiasAddResidualNHWC_kernel<T, ACTIVATION_SWISH><<<blocks, kBlockSize, 0, stream>>>(output, input, bias, residual, total_size, C);
+            break;
+        default:
+            fusedFlatBiasAddResidualNHWC_kernel<T, ACTIVATION_RELU><<<blocks, kBlockSize, 0, stream>>>(output, input, bias, residual, total_size, C);
+            break;
+    }
+    ReportCUDAErrors(cudaGetLastError());
+}
+
+// Remember to append these explicit template instantiations at the bottom of the file:
+template void fusedFlatBiasAddResidualNHWC<float>(float*, const float*, const float*, const float*, int, int, int, ActivationFunction, cudaStream_t);
+template void fusedFlatBiasAddResidualNHWC<half>(half*, const half*, const half*, const half*, int, int, int, ActivationFunction, cudaStream_t);
+
+
+template <typename DataType>
+__global__ void ScatterRPEAndMask_Kernel(
+    int batch_size, int heads,
+    const DataType* __restrict__ rpe_scores_q, // [N, 64, H, 225]
+    const DataType* __restrict__ rpe_scores_k, // [N, 64, H, 225]
+    const DataType* __restrict__ mask,         // [H, 64, 64]
+    DataType* __restrict__ output_bias,         // [N, H, 64, 64]
+    bool accumulate)
+{
+    int to = threadIdx.x;                       // 0 to 63
+    int q_local = threadIdx.y;                  // 0 to 3
+    int from = blockIdx.x * 4 + q_local;        // 0 to 63
     int h = blockIdx.y % heads;
     int b = blockIdx.y / heads;
 
-    if (q >= 64 || b >= batch_size) return;
-
-    int q_base = ((b * 64 + q) * heads + h) * head_depth;
-    int rpe_base = ((h * 64 + q) * head_depth) * 64 + k; 
+    if (from >= 64 || b >= batch_size) return;
 
     float sum = 0.0f;
-    for (int d = 0; d < head_depth; ++d) {
-        // Both reads are 100% coalesced or broadcast!
-        sum += static_cast<float>(q_in[q_base + d]) * static_cast<float>(rpe_q_exp[rpe_base + d * 64]);
-    }
 
-    int out_idx = ((b * heads + h) * 64 + q) * 64 + k;
-    output_bias[out_idx] = static_cast<DataType>(static_cast<float>(output_bias[out_idx]) + sum);
+    // Compute relative translation distance lookup index
+    int dist_idx = ((from / 8) - (to / 8) + 7) * 15 + ((from % 8) - (to % 8) + 7);
+
+    // Read from the [N, 64, H, 225] column-major output tensor from cuBLAS
+    int rpe_base_idx = ((b * 64 + from) * heads + h) * 225 + dist_idx;
+
+    if (rpe_scores_q != nullptr) sum += static_cast<float>(rpe_scores_q[rpe_base_idx]);
+    if (rpe_scores_k != nullptr) sum += static_cast<float>(rpe_scores_k[rpe_base_idx]);
+    if (mask != nullptr)         sum += static_cast<float>(mask[(h * 64 + from) * 64 + to]);
+
+    // Perfectly Coalesced Write Out to output_bias [N, H, 64, 64]
+    int out_idx = ((b * heads + h) * 64 + from) * 64 + to;
+
+    if (accumulate) {
+        output_bias[out_idx] = static_cast<DataType>(static_cast<float>(output_bias[out_idx]) + sum);
+    } else {
+        output_bias[out_idx] = static_cast<DataType>(sum);
+    }
 }
 
 template <typename DataType>
-__global__ void ComputeRPE_K_Kernel(
-    int batch_size, int heads, int head_depth,
-    const DataType* k_in,          // [N, 64(K), H, D]
-    const DataType* rpe_k_exp,     // [H, Q, D, K]
-    DataType* output_bias)         // [N, H, Q, K]
+void ScatterRPEAndMask(int batch_size, int heads,
+                       const DataType* rpe_scores_q, const DataType* rpe_scores_k,
+                       const DataType* mask, DataType* out, bool accumulate, cudaStream_t stream) 
 {
-    int k = threadIdx.x;
-    int q = blockIdx.x * blockDim.y + threadIdx.y;
-    int h = blockIdx.y % heads;
-    int b = blockIdx.y / heads;
-
-    // Allocate Shared Memory to transpose K on the fly
-    extern __shared__ float smem_k[]; 
-
-    int tid = threadIdx.y * blockDim.x + threadIdx.x;
-    int num_threads = blockDim.x * blockDim.y;
-    int k_elements = 64 * head_depth;
-
-    // Cooperatively load K into L1 Cache (Perfectly coalesced global read)
-    for (int i = tid; i < k_elements; i += num_threads) {
-        int load_k = i / head_depth;
-        int load_d = i % head_depth;
-        int addr = (b * 64 + load_k) * heads * head_depth + h * head_depth + load_d;
-        smem_k[load_k * head_depth + load_d] = static_cast<float>(k_in[addr]);
-    }
-    __syncthreads();
-
-    if (q >= 64 || b >= batch_size) return;
-
-    int rpe_base = ((h * 64 + q) * head_depth) * 64 + k;
-
-    float sum = 0.0f;
-    for (int d = 0; d < head_depth; ++d) {
-        // Read directly from Shared Memory Cache!
-        sum += smem_k[k * head_depth + d] * static_cast<float>(rpe_k_exp[rpe_base + d * 64]);
-    }
-
-    int out_idx = ((b * heads + h) * 64 + q) * 64 + k;
-    output_bias[out_idx] = static_cast<DataType>(static_cast<float>(output_bias[out_idx]) + sum);
+    dim3 block(64, 4); // 256 threads
+    dim3 grid(16, batch_size * heads); // 16 * 4 = 64 query squares completely mapped
+    ScatterRPEAndMask_Kernel<DataType><<<grid, block, 0, stream>>>(batch_size, heads, rpe_scores_q, rpe_scores_k, mask, out, accumulate);
 }
 
-template <typename DataType>
-__global__ void ComputeRPE_V_Kernel(
-    int batch_size, int heads, int head_depth,
-    const DataType* attn,          // [N, H, Q, K]
-    const DataType* rpe_v_exp,     // [H, Q, K, D]
-    DataType* output)              // [N, 64, H, D]
-{
-    int d = threadIdx.x; // Mapped to D for contiguous writes!
-    int q = blockIdx.x * blockDim.y + threadIdx.y;
-    int h = blockIdx.y % heads;
-    int b = blockIdx.y / heads;
+template void ScatterRPEAndMask<float>(int batch_size, int heads,
+                       const float* rpe_scores_q, const float* rpe_scores_k,
+                       const float* mask, float* out, bool accumulate, cudaStream_t stream);
 
-    if (d >= head_depth || q >= 64 || b >= batch_size) return;
+template void ScatterRPEAndMask<half>(int batch_size, int heads,
+                       const half* rpe_scores_q, const half* rpe_scores_k,
+                       const half* mask, half* out, bool accumulate, cudaStream_t stream);
 
-    int attn_base = ((b * heads + h) * 64 + q) * 64;
-    int rpe_base = ((h * 64 + q) * 64) * head_depth + d; 
-
-    float sum = 0.0f;
-    for (int k = 0; k < 64; ++k) {
-        sum += static_cast<float>(attn[attn_base + k]) * static_cast<float>(rpe_v_exp[rpe_base + k * head_depth]);
-    }
-
-    int out_idx = ((b * 64 + q) * heads + h) * head_depth + d;
-    output[out_idx] = static_cast<DataType>(static_cast<float>(output[out_idx]) + sum);
-}
-
-template <typename DataType>
-void ComputeRPELogits_Q(int batch_size, int heads, int head_depth, const DataType* q_in, const DataType* rpe_exp, DataType* out, cudaStream_t stream) {
-    dim3 block(64, 4);
-    dim3 grid(16, batch_size * heads);
-    ComputeRPE_Q_Kernel<DataType><<<grid, block, 0, stream>>>(batch_size, heads, head_depth, q_in, rpe_exp, out);
-}
-
-template <typename DataType>
-void ComputeRPELogits_K(int batch_size, int heads, int head_depth, const DataType* k_in, const DataType* rpe_exp, DataType* out, cudaStream_t stream) {
-    dim3 block(64, 4);
-    dim3 grid(16, batch_size * heads);
-    int shared_mem_size = 64 * head_depth * sizeof(float);
-    ComputeRPE_K_Kernel<DataType><<<grid, block, shared_mem_size, stream>>>(batch_size, heads, head_depth, k_in, rpe_exp, out);
-}
-
-template <typename DataType>
-void ComputeRPEValue(int batch_size, int heads, int head_depth, const DataType* attn, const DataType* rpe_exp, DataType* out, cudaStream_t stream) {
-    dim3 block(head_depth, 4);
-    dim3 grid(16, batch_size * heads);
-    ComputeRPE_V_Kernel<DataType><<<grid, block, 0, stream>>>(batch_size, heads, head_depth, attn, rpe_exp, out);
-}
-
-// Float32 Instantiations
-template void ComputeRPELogits_Q<float>(int, int, int, const float*, const float*, float*, cudaStream_t);
-template void ComputeRPELogits_K<float>(int, int, int, const float*, const float*, float*, cudaStream_t);
-template void ComputeRPEValue<float>(int, int, int, const float*, const float*, float*, cudaStream_t);
-
-// Float16 (Half) Instantiations
-template void ComputeRPELogits_Q<half>(int, int, int, const half*, const half*, half*, cudaStream_t);
-template void ComputeRPELogits_K<half>(int, int, int, const half*, const half*, half*, cudaStream_t);
-template void ComputeRPEValue<half>(int, int, int, const half*, const half*, half*, cudaStream_t);
-*/
 
 template <typename T>
 __global__ void addVectors_kernel(T* c, T* a, T* b, int size, int asize,
@@ -959,10 +1047,48 @@ __global__ void globalScale_kernel_fp16_nhwc(half* output, const half* input,
   output[tid] = (half)op;
 }
 
+/*
+__global__ void globalAvgPool_kernel_NHWC_fp16(half* output, const half* input,
+                                               const half* prevLayerBias,
+                                               int N, int C) {
+#if __CUDA_ARCH__ >= 530
+  // Linearly map the thread over the entire flat channel space
+  int nc = blockIdx.x * blockDim.x + threadIdx.x;
+  if (nc >= N * C) return;
+
+  // Reconstruct batch index 'n' and channel index 'c'
+  int n = nc / C;
+  int c = nc % C;
+
+  float S = 0.0f;
+  int base_idx = n * 64 * C + c;
+
+  // Coalesced loop over the 8x8 spatial plane
+  #pragma unroll
+  for (int hw = 0; hw < 64; hw++) {
+    // NHWC Layout: Spatial elements are spaced apart by exactly C elements
+    S += (float)input[base_idx + hw * C];
+  }
+
+  float avg = S / 64.0f;
+
+  // Add bias from the previous layer if it exists
+  if (prevLayerBias) {
+    avg += (float)prevLayerBias[c];
+  }
+
+  // Destination write matches the flat index sequence
+  output[nc] = (half)avg;
+#endif
+}
+*/
+
+
 // N blocks.
 // C threads per block.
 // 'HWC' input data processed by thread block.
 // Each thread writes a single output.
+
 __global__ void globalAvgPool_kernel_NHWC_fp16(half* output, const half* input,
                                                const half* prevLayerBias,
                                                int inputSize, int outputSize) {
@@ -987,6 +1113,7 @@ __global__ void globalAvgPool_kernel_NHWC_fp16(half* output, const half* input,
   int opIndex = blockStart + threadIdx.x;
   if (opIndex < outputSize) output[opIndex] = (half)avg;
 }
+
 
 // Each thread reads 2 inputs (8x8/32), and each warp writes a single output.
 template <typename T>
@@ -1027,6 +1154,39 @@ __global__ void globalAvgPool_kernel(T* output, const T* input,
     }
   }
 }
+
+/*
+// ============================================================================
+// UPDATED LAUNCH WRAPPER
+// ============================================================================
+template <typename T>
+void globalAvgPool(int N, int C, T* output, const T* input,
+                   const T* prevLayerBias, bool nhwc, cudaStream_t stream) {
+  const int kPlaneSize = 64;
+  if (nhwc) {
+    assert((std::is_same<half, T>::value));
+    
+    // FIX: Lock threads at 256 to stay well clear of the 1024 limit
+    const int kBlockSize = 256;
+    int total_elements = N * C;
+    int blocks = DivUp(total_elements, kBlockSize);
+
+    globalAvgPool_kernel_NHWC_fp16<<<blocks, kBlockSize, 0, stream>>>(
+        (half*)output, (half*)input, (half*)prevLayerBias, N, C);
+  } else {
+    // NCHW layout remains unchanged as it already uses a safe fixed block size
+    const int kTotalWarps = N * C;
+    const int kWarpsPerBlock = 8;
+    const int kBlockSize = kWarpsPerBlock * 32;
+
+    int blocks = DivUp(kTotalWarps, kWarpsPerBlock);
+    globalAvgPool_kernel<<<blocks, kBlockSize, 0, stream>>>(
+        output, input, prevLayerBias, N * C * kPlaneSize, N * C, C);
+  }
+  ReportCUDAErrors(cudaGetLastError());
+}
+*/
+
 
 template <typename T>
 void globalAvgPool(int N, int C, T* output, const T* input,
@@ -2247,5 +2407,6 @@ template void genOffsetPointers<half>(half** offsets, int heads, int max_batch,
                                       int depth, int d_model, half* k, half* q,
                                       half* b1, half* v, half* b2,
                                       cudaStream_t stream);
+
 }  // namespace cudnn_backend
 }  // namespace lczero

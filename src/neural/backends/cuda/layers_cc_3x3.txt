@@ -362,45 +362,17 @@ template <typename DataType>
 void DepthwiseConvLayer<DataType>::LoadWeights(const std::vector<float>& weights,
                                                float* biases,
                                                void* scratch) {
-  size_t num_weights_cudnn = channels_ * 1 * 5 * 5; 
+  size_t num_weights_cudnn = channels_ * 1 * 3 * 3; 
   size_t num_biases = channels_;
   
   int weights_per_channel = weights.size() / channels_;
-  assert(weights_per_channel == 25 || weights_per_channel == 9);
+  assert(weights_per_channel == 9);
 
   ReportCUDAErrors(cudaMalloc(&weights_, num_weights_cudnn * sizeof(DataType)));
   ReportCUDAErrors(cudaMalloc(&biases_, num_biases * sizeof(DataType)));
 
-  if (weights_per_channel == 25) {
-      ReportCUDAErrors(cudaMemcpy(scratch, weights.data(), num_weights_cudnn * sizeof(float), cudaMemcpyHostToDevice));
-      copyTypeConverted(weights_, (float*)scratch, num_weights_cudnn, 0);
-  } 
-  else {
-      std::vector<float> dense_weights_host(num_weights_cudnn, 0.0f);
-      const int rook_idx[9]   = {2, 7, 10, 11, 12, 13, 14, 17, 22};
-      const int bishop_idx[9] = {0, 4,  6,  8, 12, 16, 18, 20, 24};
-      const int knight_idx[9] = {1, 3,  5,  9, 12, 15, 19, 21, 23};
-
-      for (int o = 0; o < channels_; o++) {
-          const int* active_mask = nullptr;
-          if (o < rook_channels_) {
-              active_mask = rook_idx;
-          } else if (o < (rook_channels_ + bishop_channels_)) {
-              active_mask = bishop_idx;
-          } else {
-              active_mask = knight_idx;
-          }
-
-          for (int i = 0; i < 9; i++) {
-              int src_compressed_idx = (o * 9) + i;
-              int dst_dense_idx = (o * 25) + active_mask[i];
-              dense_weights_host[dst_dense_idx] = weights[src_compressed_idx];
-          }
-      }
-
-      ReportCUDAErrors(cudaMemcpy(scratch, dense_weights_host.data(), num_weights_cudnn * sizeof(float), cudaMemcpyHostToDevice));
-      copyTypeConverted(weights_, (float*)scratch, num_weights_cudnn, 0);
-  }
+  ReportCUDAErrors(cudaMemcpy(scratch, weights.data(), num_weights_cudnn * sizeof(float), cudaMemcpyHostToDevice));
+  copyTypeConverted(weights_, (float*)scratch, num_weights_cudnn, 0);
 
   if (biases != nullptr) {
       ReportCUDAErrors(cudaMemcpy(scratch, biases, num_biases * sizeof(float), cudaMemcpyHostToDevice));
@@ -433,12 +405,12 @@ void DepthwiseConvLayer<DataType>::EnsureGraph(int padded_batch, cudnnHandle_t c
   // Setting Input_channels_per_group to 1 implicitly triggers the depthwise configuration!
   auto W = graph->tensor(cudnn_frontend::graph::Tensor_attributes()
       .set_name("W")
-      .set_dim({channels_, 1, 5, 5})
-      .set_stride({25, 25, 5, 1}));
+      .set_dim({channels_, 1, 3, 3})
+      .set_stride({9, 9, 3, 1}));
 
   // FIX: Clear the non-existent .set_group_count call entirely
   auto conv_options = cudnn_frontend::graph::Conv_fprop_attributes()
-      .set_padding({2, 2})
+      .set_padding({1, 1})
       .set_stride({1, 1})
       .set_dilation({1, 1});
 
@@ -521,34 +493,13 @@ void DepthwiseCustom<DataType>::LoadWeights(const std::vector<float>& pfilter, f
   packed_weights.reserve(c_input_ * 10); 
 
   int weights_per_channel = pfilter.size() / c_input_;
-  assert(weights_per_channel == 25 || weights_per_channel == 9);
+  assert(weights_per_channel == 9);
 
-  if (weights_per_channel == 25) {
-      const int rook_idx[9]   = {2, 7, 10, 11, 12, 13, 14, 17, 22};
-      const int bishop_idx[9] = {0, 4,  6,  8, 12, 16, 18, 20, 24};
-      const int knight_idx[9] = {1, 3,  5,  9, 12, 15, 19, 21, 23};
-
-      for (int o = 0; o < c_input_; o++) {
-          const int* active_mask = nullptr;
-
-          if (o < rook_channels_) active_mask = rook_idx;
-          else if (o < (rook_channels_ + bishop_channels_)) active_mask = bishop_idx;
-          else active_mask = knight_idx;
-
-          for (int i = 0; i < 9; i++) {
-              packed_weights.push_back(pfilter[o * 25 + active_mask[i]]);
-          }
-          packed_weights.push_back(pBias ? pBias[o] : 0.0f);
+  for (int o = 0; o < c_input_; o++) {
+      for (int i = 0; i < 9; i++) {
+          packed_weights.push_back(pfilter[o * 9 + i]);
       }
-  } 
-  else {
-      // COMPRESSED LAYOUT FORMAT (New style: load natively packed weights contiguously)
-      for (int o = 0; o < c_input_; o++) {
-          for (int i = 0; i < 9; i++) {
-              packed_weights.push_back(pfilter[o * 9 + i]);
-          }
-          packed_weights.push_back(pBias ? pBias[o] : 0.0f);
-      }
+      packed_weights.push_back(pBias ? pBias[o] : 0.0f);
   }
 
   // 3. Convert and stage data into standard high-speed register layouts

@@ -177,7 +177,7 @@ void fusedMHA(void* output, void* mha_q, void* mha_k, void* mha_v, void* skip,
               int batch_size, int num_heads, int depth, cudaStream_t stream);
 
 template <typename T>
-void AddAttentionMask(int N, int heads, T* logits, const T* mask, cudaStream_t stream);
+void AddAttentionMask(int N, int heads, T* logits, const T* mask, bool accumulate, cudaStream_t stream);
 
 void convert_float_to_half2_nchw(const float* input, half2* output, int C, int H, int W);
 
@@ -199,15 +199,22 @@ void DepthwiseEvalNHWC(int N, int C_in, half* output, const half* input, void* s
 
 void convert_half_to_half2_nhwc(const half* input, half2* output,
                                 int N, int C, int H, int W);
-/*
-template <typename DataType>
-void ComputeRPELogits_Q(int batch_size, int heads, int head_depth, const DataType* q_in, const DataType* rpe_exp, DataType* out, cudaStream_t stream);
 
-template <typename DataType>
-void ComputeRPELogits_K(int batch_size, int heads, int head_depth, const DataType* k_in, const DataType* rpe_exp, DataType* out, cudaStream_t stream);
+template <typename T>                                
+void globalScale_NoSkip(int, int, T*, const T*, const T*, 
+                                        const T*, bool, ActivationFunction, cudaStream_t);
 
-template <typename DataType>
-void ComputeRPEValue(int batch_size, int heads, int head_depth, const DataType* attn, const DataType* rpe_exp, DataType* out, cudaStream_t stream);
-*/
+void LaunchSELayerNoSkipCooperative(int N, int C, int K, half* output, const half* input,
+                                    const half* w1, const half* b1, const half* w2, const half* b2,
+                                    ActivationFunction act, cudaStream_t stream);
+
+template <typename T>
+void fusedFlatBiasAddResidualNHWC(T*, const T*, const T*, const T*, int, int, int, ActivationFunction, cudaStream_t);
+
+template <typename T>
+void ScatterRPEAndMask(int batch_size, int heads,
+                       const T* rpe_scores_q, const T* rpe_scores_k,
+                       const T* mask, T* out, bool accumulate, cudaStream_t stream);
+
 }  // namespace cudnn_backend
 }  // namespace lczero
