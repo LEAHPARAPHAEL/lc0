@@ -2598,6 +2598,7 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
     input_conv_output_channels_ = current_channels;    
   }
 
+  #ifdef USE_CUDNN
   else if (starts_with_residual_){
     current_channels = weights.input.biases.size();
     auto input_conv = std::make_unique<ConvLayer<DataType>>(
@@ -2615,6 +2616,7 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
 
     input_conv_output_channels_ = current_channels;   
   }
+  #endif
 
   // Iterates over each block of the main backbone tower
   for (size_t i = 0; i < weights.tower.size(); ++i) {
@@ -2711,6 +2713,7 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
           prev_layer = d_conv.get();
           node.cnn_layers.push_back(std::move(d_conv));
         }
+        #ifdef USE_CUDNN
         else {
           auto d_conv = std::make_unique<DepthwiseConvLayer<DataType>>(prev_layer, c_expand, 8, 8, act_, use_gemm_ex,
               min_batch_size, max_batch_size,
@@ -2725,6 +2728,7 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
           prev_layer = d_conv.get();
           node.cnn_layers.push_back(std::move(d_conv));
         }
+        #endif
 
 
 
@@ -2750,6 +2754,7 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
         node.cnn_layers.push_back(std::move(se));
       }
 
+      #ifdef USE_CUDNN
       else if (std::holds_alternative<BaseWeights::Residual>(pb_block.block)) {
         node.type = TowerNode::RESIDUAL;
         const auto& r_weights = std::get<BaseWeights::Residual>(pb_block.block);
@@ -2792,6 +2797,7 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
         prev_layer = se.get();
         node.cnn_layers.push_back(std::move(se));
       }
+      #endif
 
       // ConvNext block
       else if (std::holds_alternative<BaseWeights::ConvNext>(pb_block.block)) {
