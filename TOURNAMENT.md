@@ -89,3 +89,7 @@ fastchess -event 'Sparse VS Dense' -engine name='sparse' args='-w /home/raph/lee
 # 3x3 VS dense
 
 fastchess -event 'Sparse VS 3x3' -engine name='sparse' args='-w /home/raph/leela/networks/MMTx3/MMTx3-100000.pb.gz' cmd=./engines/custom -engine name='3x3' args='-w /home/raph/leela/networks/MMTx3-3x3/MMTx3-3x3-100000.pb.gz' cmd=./engines/dense_3x3 -openings file='/home/raph/leela/books/book-6-ply-unbalanced.pgn' format=pgn order=sequential -each tc=60+0.1 -rounds 200 -concurrency 1 -pgnout file=/home/raph/leela/pgns/sparse_VS_3x3 -config outname=/home/raph/leela/configs/sparse_VS_3x3.json
+
+# V1 vs V2
+
+fastchess -event 'v1 VS v2' -engine name='v1' cmd=./engines/custom_v1 -engine name='v2' cmd=./engines/custom_v2 -openings file='/home/raph/leela/books/book-6-ply-unbalanced.pgn' format=pgn order=sequential -each args='-w /home/raph/leela/networks/MMTx3/MMTx3-100000.pb.gz --minibatch-size=32' tc=60+0.1 -rounds 200 -concurrency 1 -pgnout file=/home/raph/leela/pgns/v1_VS_v2 -config outname=/home/raph/leela/configs/v1_VS_v2.json
