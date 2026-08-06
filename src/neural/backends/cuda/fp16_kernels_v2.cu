@@ -552,96 +552,159 @@ __global__ void DepthwiseKernelNHWC_dense(int total_c_half2, half2* output, cons
 }
 
 
-__global__ void DepthwiseKernelNHWC_fp16(int total_c_half2, half2* output, const half2* input, const half2* weights,
-  ActivationFunction activation, int rook_channels, int bishop_channels, int knight_channels) {
-#if __CUDA_ARCH__ >= 700 
-    int c_half2 = blockIdx.y * blockDim.x + threadIdx.x;
-    if (c_half2 >= total_c_half2) return;
+__device__ __forceinline__ half2 get_input(const half2* input, int n, int h, int w, 
+                                           int c_half2, int total_c_half2) {
+  if (static_cast<unsigned>(h) < 8U && static_cast<unsigned>(w) < 8U) {
+    int index = (n * 64 + h * 8 + w) * total_c_half2 + c_half2;
+    return input[index];
+  }
+  return __float2half2_rn(0.0f);
+}
 
-    int w = threadIdx.y;
-    int h = blockIdx.z;
-    int n = blockIdx.x;
+// Zero-overhead reader for inner board pixels (guaranteed h, w in [0, 7])
+__device__ __forceinline__ half2 get_input_unsafe(const half2* input, int n, int h, int w, 
+                                                  int c_half2, int total_c_half2) {
+  int index = (n * 64 + h * 8 + w) * total_c_half2 + c_half2;
+  return input[index];
+}
 
-    half2 w_h2[9];
+// ============================================================================
+// 2. STENCIL OFFSET TABLES & TEMPLATE DEFINITIONS
+// ============================================================================
+
+enum class PatternType { ROOK, BISHOP, KNIGHT };
+
+struct SpatialOffset {
+  int dh;
+  int dw;
+};
+
+// Compile-time static lookup for spatial stencils
+template <PatternType PATTERN>
+__device__ __forceinline__ const SpatialOffset* get_stencil_offsets() {
+  static constexpr SpatialOffset rook[9] = {
+      {-2, 0}, {-1, 0}, {0, -2}, {0, -1}, {0, 0}, {0, 1}, {0, 2}, {1, 0}, {2, 0}
+  };
+  static constexpr SpatialOffset bishop[9] = {
+      {-2, -2}, {-2, 2}, {-1, -1}, {-1, 1}, {0, 0}, {1, -1}, {1, 1}, {2, -2}, {2, 2}
+  };
+  static constexpr SpatialOffset knight[9] = {
+      {-2, -1}, {-2, 1}, {-1, -2}, {-1, 2}, {0, 0}, {1, -2}, {1, 2}, {2, -1}, {2, 1}
+  };
+
+  if constexpr (PATTERN == PatternType::ROOK) return rook;
+  else if constexpr (PATTERN == PatternType::BISHOP) return bishop;
+  else return knight;
+}
+
+// ============================================================================
+// 3. SPECIALIZED TEMPLATED SPARSE KERNEL
+// ============================================================================
+
+template <PatternType PATTERN>
+__global__ void DepthwiseKernelNHWC_sparse_specialized(
+    int total_c_half2, half2* output, const half2* input, const half2* weights,
+    ActivationFunction activation, int c_offset_half2, int section_c_half2) {
+#if __CUDA_ARCH__ >= 530
+  int local_c_half2 = blockIdx.y * blockDim.x + threadIdx.x;
+  if (local_c_half2 >= section_c_half2) return;
+
+  // Compute global half2 channel index across the whole layer
+  int c_half2 = c_offset_half2 + local_c_half2;
+
+  int w = threadIdx.y;
+  int h = blockIdx.z;
+  int n = blockIdx.x;
+
+  // Load weights & bias into local registers
+  half2 w_h2[9];
+  #pragma unroll
+  for (int i = 0; i < 9; ++i) {
+    w_h2[i] = weights[i * total_c_half2 + c_half2];
+  }
+  half2 b_h2 = weights[9 * total_c_half2 + c_half2];
+
+  const SpatialOffset* offsets = get_stencil_offsets<PATTERN>();
+  half2 in_val[9];
+
+  // Fast/Slow Path Boundary Splitting:
+  // Inner 4x4 grid (h, w in [2, 5]) will never cross border boundaries for a 5x5 stencil
+  bool is_inner = (h >= 2 && h <= 5 && w >= 2 && w <= 5);
+
+  if (is_inner) {
     #pragma unroll
-    for(int i = 0; i < 9; ++i) {
-        w_h2[i] = weights[i * total_c_half2 + c_half2];
+    for (int i = 0; i < 9; ++i) {
+      in_val[i] = get_input_unsafe(input, n, h + offsets[i].dh, w + offsets[i].dw, 
+                                   c_half2, total_c_half2);
     }
-    half2 b_h2 = weights[9 * total_c_half2 + c_half2];
-
-    int abs_h_input = h - 2;
-    int abs_w_input = w - 2;
-
-    half2 sum = __float2half2_rn(0.0f);
-
-    if (2 * c_half2 < rook_channels) { 
-        sum = __hfma2(w_h2[0], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input + 2, c_half2, total_c_half2), sum);
-        sum = __hfma2(w_h2[1], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 2, c_half2, total_c_half2), sum);
-        sum = __hfma2(w_h2[2], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input, c_half2, total_c_half2), sum);
-        sum = __hfma2(w_h2[3], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 1, c_half2, total_c_half2), sum);
-        sum = __hfma2(w_h2[4], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 2, c_half2, total_c_half2), sum);
-        sum = __hfma2(w_h2[5], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 3, c_half2, total_c_half2), sum);
-        sum = __hfma2(w_h2[6], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 4, c_half2, total_c_half2), sum);
-        sum = __hfma2(w_h2[7], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 2, c_half2, total_c_half2), sum);
-        sum = __hfma2(w_h2[8], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input + 2, c_half2, total_c_half2), sum);
+  } else {
+    #pragma unroll
+    for (int i = 0; i < 9; ++i) {
+      in_val[i] = get_input(input, n, h + offsets[i].dh, w + offsets[i].dw, 
+                            c_half2, total_c_half2);
     }
-    else if (2 * c_half2 < bishop_channels) { 
-        sum = __hfma2(w_h2[0], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input, c_half2, total_c_half2), sum);
-        sum = __hfma2(w_h2[1], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input + 4, c_half2, total_c_half2), sum);
-        sum = __hfma2(w_h2[2], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 1, c_half2, total_c_half2), sum);
-        sum = __hfma2(w_h2[3], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 3, c_half2, total_c_half2), sum);
-        sum = __hfma2(w_h2[4], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 2, c_half2, total_c_half2), sum);
-        sum = __hfma2(w_h2[5], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 1, c_half2, total_c_half2), sum);
-        sum = __hfma2(w_h2[6], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 3, c_half2, total_c_half2), sum);
-        sum = __hfma2(w_h2[7], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input, c_half2, total_c_half2), sum);
-        sum = __hfma2(w_h2[8], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input + 4, c_half2, total_c_half2), sum);
-    }
-    else { 
-        sum = __hfma2(w_h2[0], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input + 1, c_half2, total_c_half2), sum);
-        sum = __hfma2(w_h2[1], get_input_half2_nhwc_safe(input, n, abs_h_input, abs_w_input + 3, c_half2, total_c_half2), sum);
-        sum = __hfma2(w_h2[2], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input, c_half2, total_c_half2), sum);
-        sum = __hfma2(w_h2[3], get_input_half2_nhwc_safe(input, n, abs_h_input + 1, abs_w_input + 4, c_half2, total_c_half2), sum);
-        sum = __hfma2(w_h2[4], get_input_half2_nhwc_safe(input, n, abs_h_input + 2, abs_w_input + 2, c_half2, total_c_half2), sum);
-        sum = __hfma2(w_h2[5], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input, c_half2, total_c_half2), sum);
-        sum = __hfma2(w_h2[6], get_input_half2_nhwc_safe(input, n, abs_h_input + 3, abs_w_input + 4, c_half2, total_c_half2), sum);
-        sum = __hfma2(w_h2[7], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input + 1, c_half2, total_c_half2), sum);
-        sum = __hfma2(w_h2[8], get_input_half2_nhwc_safe(input, n, abs_h_input + 4, abs_w_input + 3, c_half2, total_c_half2), sum);
-    }
+  }
 
+  // Issue 9 MAC operations sequentially
+  half2 sum = __float2half2_rn(0.0f);
+  #pragma unroll
+  for (int i = 0; i < 9; ++i) {
+    sum = __hfma2(w_h2[i], in_val[i], sum);
+  }
 
-    sum = __hadd2(sum, b_h2);
-    
-    float2 sum_f32 = __half22float2(sum);
-    sum_f32.x = activate(sum_f32.x, activation);
-    sum_f32.y = activate(sum_f32.y, activation);
-    sum = __float22half2_rn(sum_f32);
+  // Epilogue: Bias + Activation
+  sum = __hadd2(sum, b_h2);
+  float2 sum_f32 = __half22float2(sum);
+  sum_f32.x = activate(sum_f32.x, activation);
+  sum_f32.y = activate(sum_f32.y, activation);
+  sum = __float22half2_rn(sum_f32);
 
-    int out_index = (n * 64 * total_c_half2) + (h * 8 * total_c_half2) + (w * total_c_half2) + c_half2;
-    output[out_index] = sum;
+  // Write coalesced result back to VRAM
+  int out_index = (n * 64 * total_c_half2) + (h * 8 * total_c_half2) + (w * total_c_half2) + c_half2;
+  output[out_index] = sum;
 #endif
 }
+
+// ============================================================================
+// 4. STREAMLINED LAUNCHER
+// ============================================================================
 
 void DepthwiseEvalNHWC(int N, int C_in, half* output, const half* input, void* scratch,
                        const half2* w1, ActivationFunction activation, int rook_channels, 
                        int bishop_channels, int knight_channels, cudaStream_t stream) {
-    
-    const half2* input_half2 = reinterpret_cast<const half2*>(input);
-    half2* output_half2 = reinterpret_cast<half2*>(output);
+  const half2* input_half2 = reinterpret_cast<const half2*>(input);
+  half2* output_half2 = reinterpret_cast<half2*>(output);
 
-    int total_c_half2 = C_in / 2;
+  int total_c_half2 = C_in / 2;
+  int rook_c_half2 = rook_channels / 2;
+  int bishop_c_half2 = bishop_channels / 2;
+  int knight_c_half2 = knight_channels / 2;
 
-    dim3 threads(32, 8, 1);
-    
-    dim3 blocks(N, (total_c_half2 + 31) / 32, 8);
+  dim3 threads(32, 8, 1);
+  int current_c_offset = 0;
 
-    int cum_rook_channels = rook_channels;
-    int cum_bishop_channels = cum_rook_channels + bishop_channels;
-    int cum_knight_channels = cum_bishop_channels + knight_channels;
+  // 1. Launch Rook Specialized Kernel
+  if (rook_c_half2 > 0) {
+    dim3 blocks_rook(N, (rook_c_half2 + 31) / 32, 8);
+    DepthwiseKernelNHWC_sparse_specialized<PatternType::ROOK><<<blocks_rook, threads, 0, stream>>>(
+        total_c_half2, output_half2, input_half2, w1, activation, current_c_offset, rook_c_half2);
+    current_c_offset += rook_c_half2;
+  }
 
-    DepthwiseKernelNHWC_fp16<<<blocks, threads, 0, stream>>>(
-        total_c_half2, output_half2, input_half2, w1, activation,
-      cum_rook_channels, cum_bishop_channels, cum_knight_channels);
+  // 2. Launch Bishop Specialized Kernel
+  if (bishop_c_half2 > 0) {
+    dim3 blocks_bishop(N, (bishop_c_half2 + 31) / 32, 8);
+    DepthwiseKernelNHWC_sparse_specialized<PatternType::BISHOP><<<blocks_bishop, threads, 0, stream>>>(
+        total_c_half2, output_half2, input_half2, w1, activation, current_c_offset, bishop_c_half2);
+    current_c_offset += bishop_c_half2;
+  }
 
+  // 3. Launch Knight Specialized Kernel
+  if (knight_c_half2 > 0) {
+    dim3 blocks_knight(N, (knight_c_half2 + 31) / 32, 8);
+    DepthwiseKernelNHWC_sparse_specialized<PatternType::KNIGHT><<<blocks_knight, threads, 0, stream>>>(
+        total_c_half2, output_half2, input_half2, w1, activation, current_c_offset, knight_c_half2);
+  }
 }
 
 
