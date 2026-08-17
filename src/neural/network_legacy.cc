@@ -188,6 +188,8 @@ BaseWeights::MHA::MHA(const pblczero::Weights::MHA& mha)
       dense_b(LayerAdapter(mha.dense_b()).as_vector()),
       smolgen(Smolgen(mha.smolgen())),
       has_smolgen(mha.has_smolgen()),
+      static_b(LayerAdapter(mha.static_b()).as_vector()),
+      has_static_b(mha.has_static_b()),
       rpe_q(LayerAdapter(mha.rpe_q()).as_vector()),
       rpe_k(LayerAdapter(mha.rpe_k()).as_vector()),
       has_rpe_q(mha.has_rpe_q()),

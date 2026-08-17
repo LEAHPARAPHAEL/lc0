@@ -53,61 +53,6 @@
 #endif
 
 
-namespace {
-std::vector<std::vector<float>> BuildChessFormerMasks(const lczero::WeightsFile& file, int num_heads, int num_layers) {
-    std::vector<std::vector<float>> layer_masks(num_layers);
-    
-    auto network_format = file.format().network_format();
-    for (const auto& am : network_format.attention_masks()) {
-        std::string pattern(am.pattern());
-
-        std::vector<uint32_t> target_layers;
-        if (am.layer_indices_size() == 0) {
-            for (uint32_t i = 0; i < static_cast<uint32_t>(num_layers); ++i) target_layers.push_back(i);
-        } else {
-            for (uint32_t l : am.layer_indices()) target_layers.push_back(l);
-        }
-
-        for (uint32_t l : target_layers) {
-            if (l >= static_cast<uint32_t>(num_layers)) continue;
-
-            for (uint32_t head_idx : am.head_indices()) {
-                if (head_idx >= static_cast<uint32_t>(num_heads)) continue;
-
-                for (int i = 0; i < 64; ++i) {
-                    int r1 = i / 8; int c1 = i % 8;
-                    for (int j = 0; j < 64; ++j) {
-                        int r2 = j / 8; int c2 = j % 8;
-                        int dr = std::abs(r1 - r2); int dc = std::abs(c1 - c2);
-
-                        bool valid = false;
-                        if (i == j) valid = true;
-                        else if (pattern == "rook" && (dr == 0 || dc == 0)) valid = true;
-                        else if (pattern == "bishop" && (dr == dc)) valid = true;
-                        else if (pattern == "knight" && ((dr == 2 && dc == 1) || (dr == 1 && dc == 2))) valid = true;
-                        else if (pattern == "queen" && (dr == 0 || dc == 0 || dr == dc)) valid = true;
-                        else if (pattern == "king" && (dr <= 1 && dc <= 1)) valid = true;
-                        else if (pattern == "pawn" && ((dr == 1 && dc <= 1) || (dr == 2 && dc == 0))) valid = true;
-                        else if (pattern == "color" && ((r1 + c1) % 2 == (r2 + c2) % 2)) valid = true;
-                        else if (pattern == "all" && (dr == 0 || dc == 0 || dr == dc || (dr == 2 && dc == 1) || (dr == 1 && dc == 2))) valid = true;
-                
-                        if (!valid) {
-                            if (layer_masks[l].empty()) {
-                                layer_masks[l].assign(num_heads * 64 * 64, 0.0f);
-                            }
-                            
-                            layer_masks[l][(head_idx * 64 * 64) + (i * 64) + j] = -10000.0f;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    return layer_masks;
-}
-}
-
-
 namespace lczero {
 using namespace cudnn_backend;
 
@@ -528,9 +473,6 @@ class CudaNetwork : public Network {
               : static_cast<ActivationFunction>(ffn_activation);
       activations.default_activation = act;
 
-      std::vector<std::vector<float>> attention_masks = 
-        BuildChessFormerMasks(file, weights.encoder_head_count, encoder_blocks_);
-
       auto backbone = std::make_unique<Backbone<DataType>>(
         weights,
         scratch_mem_,
@@ -552,7 +494,6 @@ class CudaNetwork : public Network {
         l2_cache_size_,
         deviceProp.sharedMemPerBlockOptin,
         custom_depthwise_,
-        attention_masks,
         cudnn_
       );
      

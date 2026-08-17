@@ -177,7 +177,7 @@ void fusedMHA(void* output, void* mha_q, void* mha_k, void* mha_v, void* skip,
               int batch_size, int num_heads, int depth, cudaStream_t stream);
 
 template <typename T>
-void AddAttentionMask(int N, int heads, T* logits, const T* mask, bool accumulate, cudaStream_t stream);
+void AddStaticBias(int N, int heads, T* logits, const T* mask, bool accumulate, cudaStream_t stream);
 
 void convert_float_to_half2_nchw(const float* input, half2* output, int C, int H, int W);
 

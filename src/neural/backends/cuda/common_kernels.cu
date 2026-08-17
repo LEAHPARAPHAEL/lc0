@@ -45,7 +45,7 @@ constexpr int kInputPlanes = 112;
 /////////////////////////////////////////////////////////////////////////////
 
 template <typename T>
-__global__ void AddAttentionMaskKernel(int N, int heads, int board_sq, T* logits, const T* mask, bool accumulate) {
+__global__ void AddStaticBiasKernel(int N, int heads, int board_sq, T* logits, const T* mask, bool accumulate) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total_elements = N * heads * board_sq;
     
@@ -63,18 +63,18 @@ __global__ void AddAttentionMaskKernel(int N, int heads, int board_sq, T* logits
 }
 
 template <typename T>
-void AddAttentionMask(int N, int heads, T* logits, const T* mask, bool accumulate, cudaStream_t stream) {
+void AddStaticBias(int N, int heads, T* logits, const T* mask, bool accumulate, cudaStream_t stream) {
     int board_sq = 64 * 64;
     int total_elements = N * heads * board_sq;
     int threads = 256;
     int blocks = (total_elements + threads - 1) / threads;
     
-    AddAttentionMaskKernel<<<blocks, threads, 0, stream>>>(N, heads, board_sq, logits, mask, accumulate);
+    AddStaticBiasKernel<<<blocks, threads, 0, stream>>>(N, heads, board_sq, logits, mask, accumulate);
 }
 
 // UPDATE INSTANTIATIONS (Typically located at the bottom of common_kernels.cu)
-template void AddAttentionMask<half>(int N, int heads, half* logits, const half* mask, bool accumulate, cudaStream_t stream);
-template void AddAttentionMask<float>(int N, int heads, float* logits, const float* mask, bool accumulate, cudaStream_t stream);
+template void AddStaticBias<half>(int N, int heads, half* logits, const half* mask, bool accumulate, cudaStream_t stream);
+template void AddStaticBias<float>(int N, int heads, float* logits, const float* mask, bool accumulate, cudaStream_t stream);
 
 
 /////////////////////////////////////////////////////////////////////////////

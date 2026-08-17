@@ -1763,7 +1763,7 @@ EncoderBlock<DataType>::EncoderBlock(
     int size, float alpha, DataType* smolgen_global_scratch,
     int smolgen_global_size, int max_batch_size, ActivationFunction smolgen_act,
     ActivationFunction ffn_act, float default_eps, bool prenorm, bool use_gemm_ex,
-    bool fused_mha, const std::vector<float>& attention_mask)
+    bool fused_mha)
     : embedding_op_size_(size),
       encoder_heads_(heads),
       alpha_(alpha),
@@ -1874,9 +1874,9 @@ EncoderBlock<DataType>::EncoderBlock(
     smol_global = smolgen_global_scratch;
   }
 
-  if (!attention_mask.empty()) {
-    has_attention_mask_ = true;
-    allocAndUpload<DataType>(&attention_mask_, attention_mask, scratch);
+  if (!cpu_weights.mha.static_b.empty()) {
+    has_static_bias_ = true;
+    allocAndUpload<DataType>(&static_bias_, cpu_weights.mha.static_b, scratch);
   }
 
 }
@@ -2162,11 +2162,11 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
 
   float factor = 1.0f / sqrt((float)depth);
 
-  bool has_bias = has_smolgen_ || has_attention_mask_;
+  bool has_bias = has_smolgen_ || has_static_bias_;
   bool is_buffer_initialized = has_smolgen_;
 
-  if (has_attention_mask_) {
-      AddAttentionMask<DataType>(N, encoder_heads_, buffer2, attention_mask_, is_buffer_initialized, stream);
+  if (has_static_bias_) {
+      AddStaticBias<DataType>(N, encoder_heads_, buffer2, static_bias_, is_buffer_initialized, stream);
       is_buffer_initialized = true;
   }
 
@@ -2425,7 +2425,7 @@ EncoderBlock<DataType>::~EncoderBlock() {
     ReportCUDAErrors(cudaFree(smol_ln2_gammas));
     ReportCUDAErrors(cudaFree(smol_ln2_betas));
   }
-  if (has_attention_mask_) ReportCUDAErrors(cudaFree(attention_mask_));
+  if (has_static_bias_) ReportCUDAErrors(cudaFree(static_bias_));
 }
 
 template <typename DataType>
@@ -2479,7 +2479,6 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
                             int l2_cache_size,
                             int shared_mem_per_block_optin,
                             bool use_custom_depthwise,
-                            const std::vector<std::vector<float>>& layer_masks,
                             cudnnHandle_t cudnn)     
   : BaseLayer<DataType>(weights.ip_emb_b.size(), 8, 8, nullptr, nhwc, use_gemm_ex),
     embedding_op_size_(weights.ip_emb_b.size()),
@@ -2674,13 +2673,12 @@ Backbone<DataType>::Backbone(const MultiHeadWeights& weights,
       if (std::holds_alternative<BaseWeights::EncoderLayer>(pb_block.block)) {
           node.type = TowerNode::TRANSFORMER;
           const auto& enc_weights = std::get<BaseWeights::EncoderLayer>(pb_block.block);
-          std::vector<float> mask = (encoder_count < layer_masks.size()) ? layer_masks[encoder_count] : std::vector<float>();
           node.encoder = std::make_unique<EncoderBlock<DataType>>(
               enc_weights, scratch, encoder_head_count_, embedding_op_size_, 
               alpha_,
               smolgen_global_, smolgen_global_size_, max_batch_size,
               activations_.smolgen_activation, activations_.ffn_activation,
-              default_epsilon_, prenorm_, use_gemm_ex, use_fused_mha_, mask
+              default_epsilon_, prenorm_, use_gemm_ex, use_fused_mha_
           );
           encoder_count++;
       } 

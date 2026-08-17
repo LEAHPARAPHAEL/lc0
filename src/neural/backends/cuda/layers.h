@@ -532,8 +532,7 @@ class EncoderBlock {
                ActivationFunction ffn_act, float default_eps, 
                bool prenorm,
                bool use_gemm_ex,
-               bool fused_mha,
-              const std::vector<float>& attention_mask = {});
+               bool fused_mha);
   ~EncoderBlock();
 
   void Eval(int N, DataType* inpop, DataType* scratch0, DataType* scratch1,
@@ -594,8 +593,8 @@ class EncoderBlock {
   const bool use_fused_mha_;
   const bool use_gemm_ex_;
 
-  bool has_attention_mask_ = false;
-  DataType* attention_mask_ = nullptr;
+  bool has_static_bias_ = false;
+  DataType* static_bias_ = nullptr;
 };
 
 // The Attention policy head implementation
@@ -775,8 +774,7 @@ class Backbone : public BaseLayer<DataType> {
                 bool allow_cache_opt,
                 int l2_cache_size,
                 int shared_mem_per_block_optin,
-                bool use_custom_depthwise, 
-                const std::vector<std::vector<float>>& layer_masks = {},
+                bool use_custom_depthwise,
                 cudnnHandle_t cudnn = nullptr);
   ~Backbone();
   void Eval(int N, DataType* output, const DataType* input,

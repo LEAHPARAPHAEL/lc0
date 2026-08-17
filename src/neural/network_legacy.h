@@ -106,7 +106,8 @@ struct BaseWeights {
     Vec dense_b;
     Smolgen smolgen;
     bool has_smolgen;
-
+    Vec static_b;
+    bool has_static_b;
     Vec rpe_q;
     Vec rpe_k;
     bool has_rpe_q;
