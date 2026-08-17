@@ -93,3 +93,12 @@ fastchess -event 'Sparse VS 3x3' -engine name='sparse' args='-w /home/raph/leela
 # V1 vs V2
 
 fastchess -event 'v1 VS v2' -engine name='v1' cmd=./engines/custom_v1 -engine name='v2' cmd=./engines/custom_v2 -openings file='/home/raph/leela/books/book-6-ply-unbalanced.pgn' format=pgn order=sequential -each args='-w /home/raph/leela/networks/MMTx3/MMTx3-100000.pb.gz --minibatch-size=32' tc=60+0.1 -rounds 200 -concurrency 1 -pgnout file=/home/raph/leela/pgns/v1_VS_v2 -config outname=/home/raph/leela/configs/v1_VS_v2.json
+
+
+# Tournament mask VS smolgen VS none
+
+fastchess -event 'mask VS smolgen' -engine name='mask' args='-w /home/raph/leela/networks/Tx8-mask2/Tx8-mask2-150000.pb.gz' -engine name='smolgen' args='-w /home/raph/leela/networks/Tx8/Tx8-150000.pb.gz' -openings file='/home/raph/leela/books/book-6-ply-unbalanced.pgn' format=pgn order=sequential -each cmd=./build/release/lc0 tc=60+0.1 -rounds 200 -concurrency 1 -pgnout file=/home/raph/leela/pgns/mask_vs_smolgen -config outname=/home/raph/leela/configs/mask_vs_smolgen.json
+
+fastchess -event 'mask VS none' -engine name='mask' args='-w /home/raph/leela/networks/Tx8-mask2/Tx8-mask2-150000.pb.gz' -engine name='none' args='-w /home/raph/leela/networks/Tx8-plain/Tx8-plain-150000.pb.gz' -openings file='/home/raph/leela/books/book-6-ply-unbalanced.pgn' format=pgn order=sequential -each cmd=./build/release/lc0 tc=60+0.1 -rounds 200 -concurrency 1 -pgnout file=/home/raph/leela/pgns/mask_vs_plain -config outname=/home/raph/leela/configs/mask_vs_plain.json
+
+fastchess -event 'smolgen VS none' -engine name='smolgen' args='-w /home/raph/leela/networks/Tx8/Tx8-150000.pb.gz' -engine name='none' args='-w /home/raph/leela/networks/Tx8-plain/Tx8-plain-150000.pb.gz' -openings file='/home/raph/leela/books/book-6-ply-unbalanced.pgn' format=pgn order=sequential -each cmd=./build/release/lc0 tc=60+0.1 -rounds 200 -concurrency 1 -pgnout file=/home/raph/leela/pgns/smolgen_vs_plain -config outname=/home/raph/leela/configs/smolgen_vs_plain.json
